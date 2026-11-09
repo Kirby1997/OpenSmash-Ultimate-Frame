@@ -259,7 +259,7 @@ preflight() {
         echo "  [MISSING  ] gcc / clang: no compiler on PATH. Fix: the root filesystem is read-only, so either unpack an aarch64 clang release under ~/.local and put its bin on PATH, or (a system change this kit never makes) 'sudo steamos-readonly disable; sudo pacman -S --needed gcc binutils make linux-api-headers'. Without it NO suite can run."
     fi
     if [ -n "$HAVE_KH" ]; then echo "  [ ok      ] kernel headers (linux/userfaultfd.h, linux/fs.h, linux/futex.h)"
-    elif [ -n "$HAVE_CC" ]; then echo "  [MISSING  ] kernel headers: Fix: copy a kernel's exported headers to a folder (make headers_install INSTALL_HDR_PATH=~/ssbu-port/kheaders) and pass --kheaders ~/ssbu-port/kheaders/include, or install linux-api-headers. Skips: fs, boot, plat, threads."; fi
+    elif [ -n "$HAVE_CC" ]; then echo "  [MISSING  ] kernel headers: Fix: copy a kernel's exported headers to a folder (make headers_install INSTALL_HDR_PATH=~/ssbu-port/kheaders) and pass --kheaders ~/ssbu-port/kheaders/include, or install linux-api-headers. Skips: fs, nnfs, boot, winshim, modules, services, io, threads, plat."; fi
     if have make; then echo "  [ ok      ] make: $(first_line make --version)"
     else echo "  [MISSING  ] make: Fix: build GNU make into ~/.local (./configure --prefix=\$HOME/.local && make install) or install it with pacman. Skips: picker."; fi
     if have timeout; then echo "  [ ok      ] timeout (coreutils)"
