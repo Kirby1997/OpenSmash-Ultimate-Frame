@@ -2400,6 +2400,26 @@ BOOL SetFileAttributesA(LPCSTR path, DWORD attr) { (void)path; (void)attr; retur
 BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; char b[PATH_MAX]; P(path, b); plat_ci_pre(b); return mkdir(b, 0777) ? fail_errno() : TRUE; }
 BOOL RemoveDirectoryA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (rmdir(b) && !(plat_ci_retry(b) && !rmdir(b))) return fail_errno(); return TRUE; }
 BOOL DeleteFileA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (unlink(b) && !(plat_ci_retry(b) && !unlink(b))) return fail_errno(); return TRUE; }
+/* rename that fails with EEXIST when `b` exists, in one step (nnfs.c's commit marker relies on it): renameat2 RENAME_NOREPLACE on
+ * Linux (link + unlink for a file where the file system lacks it), renamex_np RENAME_EXCL on macOS. A folder on a file system
+ * with neither falls back to a plain rename after the caller's existence check. */
+static int rename_noreplace(const char *a, const char *b) {
+#if defined(__APPLE__)
+    if (!renamex_np(a, b, RENAME_EXCL) || errno == EEXIST) return errno == EEXIST ? -1 : 0;
+#else
+#if defined(SYS_renameat2) && defined(RENAME_NOREPLACE)
+    if (!syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE)) return 0;
+    if (errno != EINVAL && errno != ENOSYS) return -1;
+#endif
+    struct stat st;
+    if (!lstat(a, &st) && !S_ISDIR(st.st_mode)) {
+        if (link(a, b)) return -1;                        /* EEXIST: the target appeared */
+        unlink(a);
+        return 0;
+    }
+#endif
+    return rename(a, b);
+}
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {      /* rename() replaces the target in one step, as MOVEFILE_REPLACE_EXISTING does */
     char a[PATH_MAX], b[PATH_MAX];
     P(from, a); P(to, b);
@@ -2411,7 +2431,9 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {      /* rename() replace
         int fd = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd >= 0) { if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fsync(fd)) { int e = errno; close(fd); errno = e; return fail_errno(); } close(fd); }
     }
-    if (rename(a, b)) return fail_errno();
+    if (!(flags & MOVEFILE_REPLACE_EXISTING)) {          /* as on Windows, atomically: a target that appears after the check above is not replaced */
+        if (rename_noreplace(a, b)) { if (errno == EEXIST) { t_lasterr = ERROR_ALREADY_EXISTS; return FALSE; } return fail_errno(); }
+    } else if (rename(a, b)) return fail_errno();
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* then both folder entries on disk before returning */
         char da[PATH_MAX], db[PATH_MAX];
         const char *p[2] = {b, a};
@@ -2439,9 +2461,15 @@ BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
     plat_ci_pre(P(to, b));                                                  /* an existing target in another case is the one written */
     int out = open(b, O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
     if (out < 0) { close(in); return fail_errno(); }
-    char buf[1 << 16]; ssize_t k; BOOL ok = TRUE;
-    while ((k = read(in, buf, sizeof buf)) > 0) if (write(out, buf, (size_t)k) != k) { ok = fail_errno(); break; }
-    close(in); close(out);
+    char buf[1 << 16]; ssize_t k; BOOL ok = TRUE;      /* a read error (EIO, EISDIR) or a short write fails the copy, and no partial target is left */
+    while ((k = read(in, buf, sizeof buf)) != 0) {
+        if (k < 0) { if (errno == EINTR) continue; ok = fail_errno(); break; }
+        ssize_t w = write(out, buf, (size_t)k);
+        if (w != k) { if (w >= 0) errno = ENOSPC; ok = fail_errno(); break; }
+    }
+    close(in);
+    if (close(out) && ok) ok = fail_errno();
+    if (!ok) { DWORD e = t_lasterr; unlink(b); t_lasterr = e; }
     return ok;
 }
 DWORD GetTempPathA(DWORD n, LPSTR out) { const char *t = getenv("TMPDIR"); int k = snprintf(out, n, "%s/", t && t[0] ? t : "/tmp"); return (DWORD)k; }
