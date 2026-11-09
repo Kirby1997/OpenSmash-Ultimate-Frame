@@ -235,6 +235,11 @@ static int so_wsa_errno(int e, int sending) {
     case WSAECONNREFUSED: return 111;
     case WSAEHOSTDOWN: return 112;
     case WSAEHOSTUNREACH: return 113;
+#if defined(__linux__) || defined(PLAT_LINUX_PATHS_ON_MAC)   /* errno values the Winsock names do not cover: the guest's numbers are Linux's */
+    case EPIPE: return 32;                                /* send after the peer closed: without this the guest read EIO */
+    case EPERM: return 1;
+    case ENOMEM: return 12;
+#endif
     default: return 5;                                    /* EIO */
     }
 }
