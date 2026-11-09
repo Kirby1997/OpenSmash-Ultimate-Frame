@@ -5,7 +5,8 @@
 #                then with SSBU_TZDIR on slim zone files (zic -b slim) when zic and tzdata.zi are there
 #   test_mii     nnmii.c: GetRegionCode from the locale (GetUserDefaultGeoName: $LC_ALL / $LANG) and SSBU_REGION
 #   test_net     nnnet.c: the nn::socket service over BSD sockets: loopback TCP + UDP, errors, option numbers, SSBU_NET=0
-#   test_applet  nnapplet.c: nn::swkbd answers (SSBU_SWKBD), UTF-16 <-> UTF-32 of the guest's text, MessageBoxW stand-in
+#   test_applet  nnapplet.c: nn::swkbd answers (SSBU_SWKBD), the UTF-16 text of the guest
+#   test_misc    nnmisc.c: nn::oe::GetDesiredLanguage from $LANGUAGE / $LC_ALL / $LC_MESSAGES / $LANG and SSBU_LANGUAGE
 # No game data. SDL3 and OpenSSL are stand-ins (no test reaches them).
 #   tests/port/services/run.sh [mode]
 #     native  (default) build and run here with $CC (cc): on the Frame (aarch64 Linux), or on any Linux
@@ -35,7 +36,7 @@ mac)
 esac
 $CC $F -c runtime/plat_posix.c -o "$OUT/plat_posix.o"
 $CC $(echo "$F" | sed 's#-include runtime/plat/plat_pre.h##; s#-I runtime/plat ##') -std=gnu11 -c runtime/plat_crash.c -o "$OUT/plat_crash.o"
-for t in test_time test_mii test_net test_applet; do
+for t in test_time test_mii test_net test_applet test_misc; do
     $CC $F $GT -I $T -c $T/$t.c -o "$OUT/$t.o"
     nat_stubs "$OUT/$t-stubs.c" "$OUT/plat_posix.o" "$OUT/$t.o"
     $CC $F -c "$OUT/$t-stubs.c" -o "$OUT/$t-stubs.o"
@@ -45,6 +46,7 @@ fail=0
 run() { echo "== $*"; timeout 300 "$@" || { echo "$1: exit $?"; fail=1; }; }
 run "$OUT/test_mii"
 run "$OUT/test_applet"
+run "$OUT/test_misc"
 run "$OUT/test_net"
 run "$OUT/test_time"
 if [ -d /usr/share/zoneinfo ]; then
