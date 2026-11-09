@@ -78,6 +78,23 @@ int main(void) {
         } else { printf("write watch unavailable on this kernel: skipped\n"); ww_ok = -1; }
     }
     if (ww_ok == 0) { g_bad++; printf("FAIL write watch\n"); }
+    {   /* file views (nvn_vk_store.c hands them to the game's zstd decoder): below 2^47 too, and they hold the file */
+        char path[256]; snprintf(path, sizeof path, "%s/c3_view_%d.bin", getenv("TMPDIR") && getenv("TMPDIR")[0] ? getenv("TMPDIR") : "/tmp", (int)getpid());
+        FILE *f = fopen(path, "wb");
+        if (f) { for (int i = 0; i < 70000; i++) fputc((int)(i * 7 + 1) & 0xff, f); fclose(f); }
+        HANDLE fh = f ? CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL) : INVALID_HANDLE_VALUE;
+        HANDLE mh = fh != INVALID_HANDLE_VALUE ? CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL) : NULL;
+        for (int k = 0; mh && k < 40; k++) {                                       /* the whole file, and a piece from a 64 KiB offset */
+            const uint8_t *v = MapViewOfFile(mh, FILE_MAP_READ, 0, k & 1 ? 0x10000 : 0, k & 1 ? 4000 : 0);
+            chk(v, 70000, "MapViewOfFile");
+            if (v && v[k & 1 ? 3 : 100] != (uint8_t)((k & 1 ? 0x10000 + 3 : 100) * 7 + 1)) { g_bad++; printf("FAIL view contents\n"); }
+            if (v) UnmapViewOfFile(v);
+        }
+        if (!mh) { g_bad++; printf("FAIL file mapping\n"); }
+        if (mh) CloseHandle(mh);
+        if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+        remove(path);
+    }
     MEMORY_BASIC_INFORMATION mi; SYSTEM_INFO si; GetSystemInfo(&si);
     if ((uint64_t)(uintptr_t)si.lpMaximumApplicationAddress >= LIM) { g_bad++; printf("FAIL GetSystemInfo max\n"); }
     if (VirtualQuery((void *)LIM, &mi, sizeof mi) != 0) { g_bad++; printf("FAIL VirtualQuery at 2^47 answered\n"); }

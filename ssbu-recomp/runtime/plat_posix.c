@@ -1982,7 +1982,20 @@ LPVOID MapViewOfFile(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n) {
     PlatObj *o = m;
     off_t off = (off_t)(((uint64_t)hi << 32) | lo);
     if (!n) n = o->map_size - (size_t)off;
-    void *p = mmap(NULL, n, (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, o->fd, off);
+    int prot = (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
+#if defined(__aarch64__) && !defined(__APPLE__)
+    /* aarch64 Linux: mmap(NULL) puts the view at 0xffff_xxxx_xxxx, above the 2^47 that every pointer the guest sees stays under, and the
+     * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place reserves the range below 2^47
+     * (as VirtualAlloc does), the file is mapped over it. (linux-arm64 vks_base was placed the same way.) */
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE), rn = (n + pg - 1) & ~(pg - 1);
+    vm_lock();
+    void *res = low_place(rn, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    void *p = res == MAP_FAILED ? MAP_FAILED : mmap(res, n, prot, MAP_SHARED | MAP_FIXED, o->fd, off);
+    if (res != MAP_FAILED && p == MAP_FAILED) { int e = errno; munmap(res, rn); errno = e; }
+    vm_unlock();
+#else
+    void *p = mmap(NULL, n, prot, MAP_SHARED, o->fd, off);
+#endif
     if (p == MAP_FAILED) { fail_errno(); return NULL; }
     for (int i = 0; i < 64; i++) if (!g_views[i].p) { g_views[i].p = p; g_views[i].n = n; break; }
     return p;
