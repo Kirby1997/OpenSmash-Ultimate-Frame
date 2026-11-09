@@ -2,7 +2,8 @@
  * reservations and commits the guest image, the NRO modules, nn::os memory blocks and fiber stacks go through, fixed
  * addresses and collisions, a commit/decommit/recommit cycle (zero pages), the page runs VirtualQuery reports (what the
  * debug and memory walks of debug_mode.c and nvn_vk_m4.c read), host memory seen through it (heap, stack, code, data), a
- * walk of the whole address space, and 8 threads allocating, committing, protecting, querying and releasing in parallel.
+ * walk of the whole address space, 8 threads allocating, committing, protecting, querying and releasing in parallel, and
+ * 8 threads mapping and unmapping file views at once (MapViewOfFile / UnmapViewOfFile, as nvn_vk_store.c's workers do).
  * tests/plat_selftest.c has the single-call checks; this is the rest of what linux-arm64's tests/plat/test_vmem.c (its own
  * vmem.c, not in this tree) tested. Where plat_posix.c is looser than Windows (a size with MEM_RELEASE, a commit's return
  * value is the address asked, not the page below it) nothing is asserted: no caller depends on the Windows answer. */
@@ -11,6 +12,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 static sigjmp_buf g_jb;
 static void on_segv(int sig, siginfo_t *si, void *uc) { (void)sig; (void)si; (void)uc; siglongjmp(g_jb, 1); }
@@ -198,6 +200,53 @@ static void test_threads(void) {
     for (int i = 0; i < 8; i++) { DWORD c; GetExitCodeThread(h[i], &c); CHECKF(c == 0, "thread %d: %u failures", i, c); CloseHandle(h[i]); }
 }
 
+/* file views from 8 threads: before the view table was locked, two threads took one slot and the second view could not be
+ * unmapped any more (20,553 of 160,000 UnmapViewOfFile calls failed, each a leaked view); a torn slot could unmap a neighbour */
+static HANDLE g_map;
+static DWORD WINAPI view_churn(LPVOID arg) {
+    int id = (int)(intptr_t)arg, bad = 0;
+    for (int i = 0; i < 20000; i++) {
+        size_t off = (size_t)((i + id) & 3) * 0x10000;
+        const uint8_t *v = MapViewOfFile(g_map, FILE_MAP_READ, 0, (DWORD)off, 0x10000);
+        if (!v) { bad++; continue; }
+        if (v[0x1234] != (uint8_t)((off + 0x1234) * 7)) bad++;                  /* the view shows its own part of the file */
+        if (!UnmapViewOfFile(v)) bad++;
+    }
+    return (DWORD)bad;
+}
+static void test_views(void) {
+    SECTION("8 threads mapping and unmapping file views (160,000 pairs): every view unmaps, none shows another's bytes");
+    char path[512];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(path, sizeof path, "%s/ssbu_views_%d.bin", tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (!f) return;
+    for (size_t i = 0; i < 0x40000; i++) fputc((int)(uint8_t)(i * 7), f);
+    fclose(f);
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    g_map = fh != INVALID_HANDLE_VALUE ? CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL) : NULL;
+    CHECK(g_map != NULL);
+    if (g_map) {
+        HANDLE h[8];
+        for (int i = 0; i < 8; i++) h[i] = CreateThread(NULL, 0, view_churn, (void *)(intptr_t)i, 0, NULL);
+        CHECK(WaitForMultipleObjects(8, h, TRUE, 120000) == WAIT_OBJECT_0);
+        for (int i = 0; i < 8; i++) { DWORD c; GetExitCodeThread(h[i], &c); CHECKF(c == 0, "thread %d: %u failed map/unmap pairs", i, c); CloseHandle(h[i]); }
+        CHECK(!UnmapViewOfFile((void *)(uintptr_t)0x12340000) && GetLastError() == ERROR_INVALID_ADDRESS);      /* not a view */
+        /* a full table refuses the next map instead of leaking it, and every view taken still unmaps */
+        const void *v[300];
+        int got = 0;
+        while (got < 300 && (v[got] = MapViewOfFile(g_map, FILE_MAP_READ, 0, 0, 0x1000))) got++;
+        CHECKF(got > 16 && got < 300 && GetLastError() == ERROR_NOT_ENOUGH_MEMORY, "%d views, then error %u", got, GetLastError());
+        int unmapped = 0;
+        for (int i = 0; i < got; i++) unmapped += UnmapViewOfFile(v[i]) != 0;
+        CHECK(unmapped == got);
+        CloseHandle(g_map);
+    }
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+    remove(path);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     test_alloc();
@@ -206,5 +255,6 @@ int main(void) {
     test_faults();
     test_query_host();
     test_threads();
+    test_views();
     return tp_done("test_virtual");
 }

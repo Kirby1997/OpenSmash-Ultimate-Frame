@@ -1983,32 +1983,45 @@ HANDLE CreateFileMappingA(HANDLE f, SECURITY_ATTRIBUTES *sa, DWORD prot, DWORD h
     if (!o->map_size) { struct stat st; fstat(o->fd, &st); o->map_size = (size_t)st.st_size; }
     return o;
 }
+/* The views of every thread (nvn_vk_store.c maps them from its workers) in one table, guarded by g_vm_lock: a view is entered
+ * in the same hold that maps it and leaves the table in the same hold that unmaps it, so two threads never take one slot, and
+ * an address mapped again by another thread at once (low_place packs views tightly on aarch64 Linux) cannot be unmapped
+ * through a stale slot. A full table fails the map (ERROR_NOT_ENOUGH_MEMORY) rather than leak a view nobody can unmap. */
 typedef struct { void *p; size_t n; } View;
-static View g_views[64];
+#define VIEW_MAX 256
+static View g_views[VIEW_MAX];
 LPVOID MapViewOfFile(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n) {
     PlatObj *o = m;
     off_t off = (off_t)(((uint64_t)hi << 32) | lo);
     if (!n) n = o->map_size - (size_t)off;
     int prot = (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
+    vm_lock();
+    int slot = -1;
+    for (int i = 0; i < VIEW_MAX && slot < 0; i++) if (!g_views[i].p) slot = i;
+    if (slot < 0) { vm_unlock(); t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
 #if defined(__aarch64__) && !defined(__APPLE__)
     /* aarch64 Linux: mmap(NULL) puts the view at 0xffff_xxxx_xxxx, above the 2^47 that every pointer the guest sees stays under, and the
      * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place reserves the range below 2^47
      * (as VirtualAlloc does), the file is mapped over it. (linux-arm64 vks_base was placed the same way.) */
     size_t pg = (size_t)sysconf(_SC_PAGESIZE), rn = (n + pg - 1) & ~(pg - 1);
-    vm_lock();
     void *res = low_place(rn, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
     void *p = res == MAP_FAILED ? MAP_FAILED : mmap(res, n, prot, MAP_SHARED | MAP_FIXED, o->fd, off);
     if (res != MAP_FAILED && p == MAP_FAILED) { int e = errno; munmap(res, rn); errno = e; }
-    vm_unlock();
 #else
     void *p = mmap(NULL, n, prot, MAP_SHARED, o->fd, off);
 #endif
-    if (p == MAP_FAILED) { fail_errno(); return NULL; }
-    for (int i = 0; i < 64; i++) if (!g_views[i].p) { g_views[i].p = p; g_views[i].n = n; break; }
+    if (p != MAP_FAILED) { g_views[slot].p = p; g_views[slot].n = n; }
+    int e = errno;
+    vm_unlock();
+    if (p == MAP_FAILED) { errno = e; fail_errno(); return NULL; }
     return p;
 }
 BOOL UnmapViewOfFile(LPCVOID p) {
-    for (int i = 0; i < 64; i++) if (g_views[i].p == p) { munmap(g_views[i].p, g_views[i].n); g_views[i].p = NULL; return TRUE; }
+    vm_lock();
+    for (int i = 0; i < VIEW_MAX; i++)
+        if (p && g_views[i].p == p) { munmap(g_views[i].p, g_views[i].n); g_views[i].p = NULL; vm_unlock(); return TRUE; }
+    vm_unlock();
+    t_lasterr = ERROR_INVALID_ADDRESS;
     return FALSE;
 }
 
@@ -2467,17 +2480,30 @@ static int find_wild(const char *p, const char *n) {
         return 0;
     }
 }
-static void find_collect(PlatObj *o) {
+static void find_collect(PlatObj *o) {           /* out of memory: the folder is read as it comes (find_next's readdir), not lost */
     size_t cap = 64;
-    o->fnames = malloc(cap * sizeof *o->fnames);
     struct dirent *e;
-    while ((e = readdir(o->dir))) {
-        if (o->nfn == (int)cap) o->fnames = realloc(o->fnames, (cap *= 2) * sizeof *o->fnames);
-        o->fnames[o->nfn++] = strdup(e->d_name);
+    char **names = malloc(cap * sizeof *names);
+    int n = 0, ok = names != NULL;
+    while (ok && (e = readdir(o->dir))) {
+        if (n == (int)cap) {
+            char **more = realloc(names, cap * 2 * sizeof *names);
+            if (!more) { ok = 0; break; }
+            names = more; cap *= 2;
+        }
+        if (!(names[n] = strdup(e->d_name))) { ok = 0; break; }
+        n++;
+    }
+    if (!ok) {
+        for (int i = 0; i < n; i++) free(names[i]);
+        free(names);
+        rewinddir(o->dir);
+        return;
     }
     closedir(o->dir);
     o->dir = NULL;
-    qsort(o->fnames, (size_t)o->nfn, sizeof *o->fnames, ci_order);
+    qsort(names, (size_t)n, sizeof *names, ci_order);
+    o->fnames = names; o->nfn = n;
 }
 #endif
 static BOOL find_next(PlatObj *o, WIN32_FIND_DATAA *fd) {
