@@ -37,7 +37,7 @@ KIT_VERSION="frame-kit 1"
 SUITE_NAMES="crash fs nnfs boot plat winshim modules services io threads picker lifter"
 suite_desc() {
     case $1 in
-    crash)   echo "crash reports: signal handler, alternate stack, report file (gcc, clang, FORTIFY, PAC)" ;;
+    crash)   echo "crash reports: signal handler, alternate stack, report file (gcc, clang, FORTIFY, PAC); the A64 decoder of the fake audit" ;;
     fs)      echo "file layer of plat_posix.c: case-insensitive paths, write-through rename, Windows error codes" ;;
     nnfs)    echo "nn::fs on the file layer: romfs tree, journaled save data, Commit under kill -9 and failed moves, folder listing order (nnfs.c, nnfsdir.c)" ;;
     boot)    echo "game-data lookup (datapaths.c) and boot.c's launch defaults, with synthetic fixtures" ;;
@@ -46,7 +46,7 @@ suite_desc() {
     modules) echo "nn::ro: NRR hash check, LoadModule through LoadLibraryA, relocation, unload, two modules with the same internal names (fake modules built as build.py does)" ;;
     services) echo "host services: nn::time zones against the C library (also slim tzdata), region code, nn::socket over BSD sockets, swkbd text" ;;
     io)      echo "nnfontll.c's FreeType outlines against FreeType (needs FreeType's headers: says so and skips without them)" ;;
-    threads) echo "thread / fiber stacks and __thread below 2^47, fibers, FLS, critical sections, BTI, TLS hazard check" ;;
+    threads) echo "thread / fiber stacks and __thread below 2^47, fibers, FLS, critical sections, nn::os threads, setjmp on fibers, C++ runtime exception state, BTI, TLS hazard check" ;;
     picker)  echo "data-folder picker: logic, ASan/UBSan, its SDL window offscreen and (in a gamescope session) on the display" ;;
     lifter)  echo "lifter: memory-ordering codegen, litmus tests on lifted code, FP vs the instructions, NEON, software-FP hash" ;;
     esac

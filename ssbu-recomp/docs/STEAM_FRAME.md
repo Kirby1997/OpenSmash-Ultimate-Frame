@@ -110,6 +110,13 @@ host only when given `--ref-hash`; from a PC, `tests/arm_host/run_frame.sh <host
 `tests/cspike/xbuild.sh` and `xcheck.sh` are cross-build checks of the whole runtime (they need the cross toolchain and
 sysroot; `setup.py --target linux-arm64` is the native build), and `gaps.c` is already built and run by `threads`.
 
+Every suite built on `plat_posix.c` (`winshim`, `nnfs`, `modules`, `services`, `io`, `threads`) has a `mac` mode as well, which builds
+the Linux code paths on a development Mac (`PLAT_LINUX_PATHS_ON_MAC`) and runs them there: `sh tests/port/<suite>/run.sh mac`
+(`nnfs` makes a case-sensitive APFS image for itself). A Mac run proves the portable logic, not the Frame: placement below 2^47,
+ELF symbol interposition, glibc and the real SteamOS tzdata are only checked on the device. Not ported from the first Linux port
+because they need SDL3's headers and the device: the SDL3 pad and audio tests (`nnhid.c`, `nnpad_sdl.c`, `nnaudio.c`), the window and
+swapchain test and the headless Vulkan memory-type test.
+
 ## Playing against upstream builds
 
 This fork's lifter matches the Switch more closely in a few edge cases (CLREX, FRECPS / FRSQRTS of 0 and infinity, some
