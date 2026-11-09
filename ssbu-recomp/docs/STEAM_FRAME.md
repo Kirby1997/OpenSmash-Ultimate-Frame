@@ -98,6 +98,7 @@ facts: `uname`, CPU features (BTI, PAC, MTE, SVE2, LSE), glibc, compiler version
 | `plat` | `VirtualAlloc` below 2^47, write watch, `plat_selftest`, Vulkan loader | `tests/cspike/c3_build.sh native` |
 | `winshim` | the Win32 stand-in layer: header order, `VirtualAlloc` / `Query` / `Protect`, `IsBadReadPtr` against the kernel, game library binding, SHA-256 / SHA-1 / MD5 | `tests/port/winshim/run.sh native` |
 | `services` | nn::time zones against the C library (also slim tzdata), region code, nn::socket over BSD sockets, swkbd text | `tests/port/services/run.sh native` |
+| `io` | `nnfontll.c`'s FreeType outlines against FreeType itself (skips, and says so, without FreeType's headers) | `tests/port/io/run.sh native` |
 | `threads` | stacks and `__thread` below 2^47, fibers, FLS, critical sections, nn::os threads, `setjmp` on fibers (also FORTIFY), the C++ runtime's exception state, BTI, TLS hazard | `tests/port/threads/run_frame.sh` |
 | `picker` | the data-folder picker, in an SDL window offscreen and on gamescope | `tests/port/picker/run_frame.sh` |
 | `lifter` | memory-ordering codegen, litmus tests, FP vs the instructions, NEON | `tests/arm_host/run_frame.sh` |

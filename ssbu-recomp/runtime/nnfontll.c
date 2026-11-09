@@ -1261,7 +1261,7 @@ void register_fontll_imports(void) {
     register_imports(fontll_imports, (int)(sizeof fontll_imports / sizeof fontll_imports[0]));
 }
 
-#else
+#elif defined(_WIN32)       /* (tests/port/io/test_font.c includes this file with FONTLL_TEST for its FreeType path and has its own main) */
 /* ---------------------------------------------------------------- offline test: clang -DFONTLL_TEST nnfontll.c -lgdi32
  * fonttest <font file> <pixels> <text or U+hex ...> [outline n]: metrics, advances, glyph maps as text, kerning. */
 int main(int argc, char **argv) {

@@ -34,7 +34,7 @@ KIT_VERSION="frame-kit 1"
 
 # ---------------------------------------------------------------------------------------------------- the suites
 # name | what it checks | timeout seconds (full) | (quick)
-SUITE_NAMES="crash fs nnfs boot plat winshim services threads picker lifter"
+SUITE_NAMES="crash fs nnfs boot plat winshim services io threads picker lifter"
 suite_desc() {
     case $1 in
     crash)   echo "crash reports: signal handler, alternate stack, report file (gcc, clang, FORTIFY, PAC)" ;;
@@ -44,6 +44,7 @@ suite_desc() {
     plat)    echo "platform layer: VirtualAlloc below 2^47, write watch, plat_selftest (interlocked, threads, fibers, Vulkan loader, SHA-256)" ;;
     winshim) echo "Win32 stand-in layer: header order, VirtualAlloc / Query / Protect, IsBadReadPtr vs the kernel, game library binding, hashes (SHA-256 NRR check, SHA-1, MD5)" ;;
     services) echo "host services: nn::time zones against the C library (also slim tzdata), region code, nn::socket over BSD sockets, swkbd text" ;;
+    io)      echo "nnfontll.c's FreeType outlines against FreeType (needs FreeType's headers: says so and skips without them)" ;;
     threads) echo "thread / fiber stacks and __thread below 2^47, fibers, FLS, critical sections, BTI, TLS hazard check" ;;
     picker)  echo "data-folder picker: logic, ASan/UBSan, its SDL window offscreen and (in a gamescope session) on the display" ;;
     lifter)  echo "lifter: memory-ordering codegen, litmus tests on lifted code, FP vs the instructions, NEON, software-FP hash" ;;
@@ -51,9 +52,9 @@ suite_desc() {
 }
 suite_timeout() {
     if [ -n "$QUICK" ]; then
-        case $1 in crash) echo 300 ;; fs) echo 180 ;; nnfs) echo 300 ;; boot) echo 300 ;; plat) echo 300 ;; winshim) echo 300 ;; services) echo 300 ;; threads) echo 600 ;; picker) echo 600 ;; lifter) echo 900 ;; esac
+        case $1 in crash) echo 300 ;; fs) echo 180 ;; nnfs) echo 300 ;; boot) echo 300 ;; plat) echo 300 ;; winshim) echo 300 ;; services) echo 300 ;; io) echo 300 ;; threads) echo 600 ;; picker) echo 600 ;; lifter) echo 900 ;; esac
     else
-        case $1 in crash) echo 900 ;; fs) echo 300 ;; nnfs) echo 900 ;; boot) echo 600 ;; plat) echo 600 ;; winshim) echo 600 ;; services) echo 600 ;; threads) echo 1800 ;; picker) echo 1500 ;; lifter) echo 3600 ;; esac
+        case $1 in crash) echo 900 ;; fs) echo 300 ;; nnfs) echo 900 ;; boot) echo 600 ;; plat) echo 600 ;; winshim) echo 600 ;; services) echo 600 ;; io) echo 600 ;; threads) echo 1800 ;; picker) echo 1500 ;; lifter) echo 3600 ;; esac
     fi
 }
 suite_cmd() {   # what the child runs (for the plan and the report)
@@ -65,6 +66,7 @@ suite_cmd() {   # what the child runs (for the plan and the report)
     plat)    echo "sh tests/cspike/c3_build.sh native; c3_low; plat_selftest  (per compiler)" ;;
     winshim) echo "sh tests/port/winshim/run.sh native  (per compiler)" ;;
     services) echo "sh tests/port/services/run.sh native  (per compiler)" ;;
+    io)      echo "sh tests/port/io/run.sh native  (per compiler)" ;;
     threads) echo "sh tests/port/threads/run_frame.sh --local" ;;
     picker)  echo "sh tests/port/picker/run_frame.sh --local" ;;
     lifter)  echo "sh tests/arm_host/run_frame.sh --local $PAIRS $ITERS" ;;
@@ -125,7 +127,7 @@ child_main() {
     threads) sh tests/port/threads/run_frame.sh --local || rc=$? ;;
     picker) sh tests/port/picker/run_frame.sh --local || rc=$? ;;
     lifter) sh tests/arm_host/run_frame.sh --local "$FK_PAIRS" "$FK_ITERS" || rc=$? ;;
-    fs | nnfs | boot | winshim | services)
+    fs | nnfs | boot | winshim | services | io)
         for cc in $CCS; do
             echo "######## $NAME CC=$cc"
             CC=$cc OUT="$FRAME_WORK/$cc" sh "tests/port/$NAME/run.sh" native 2>&1
@@ -296,7 +298,7 @@ blocked_reason() {   # a reason this suite cannot run here, or nothing
     fi
     if [ -z "$HAVE_CC" ]; then echo "no gcc or clang on PATH"; return 0; fi
     case $s in
-    fs | nnfs | boot | winshim | services | threads) [ -n "$HAVE_KH" ] || echo "no kernel headers (linux/userfaultfd.h); see --kheaders" ;;
+    fs | nnfs | boot | winshim | services | io | threads) [ -n "$HAVE_KH" ] || echo "no kernel headers (linux/userfaultfd.h); see --kheaders" ;;
     plat) if [ -z "$HAVE_KH" ]; then echo "no kernel headers (linux/userfaultfd.h); see --kheaders"; elif [ -z "$HAVE_SSL" ]; then echo "no libcrypto.so.3"; fi ;;
     picker) [ -n "$HAVE_MAKE" ] || echo "no make" ;;
     lifter)
