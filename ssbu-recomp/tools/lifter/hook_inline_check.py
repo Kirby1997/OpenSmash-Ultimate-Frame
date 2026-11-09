@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-POSIX = os.environ.get('RECOMP_TARGET') in ('linux', 'linux-arm64', 'macos')       # ELF / Mach-O objects of a Linux / macOS build
+POSIX = os.environ.get('RECOMP_TARGET') in ('linux', 'macos')       # ELF / Mach-O objects of a Linux / macOS build (x86-64 code only: relift_sites.py skips this on linux-arm64)
 
 
 def find_objdump():

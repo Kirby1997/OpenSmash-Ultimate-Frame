@@ -835,7 +835,9 @@ def main():
     # calling it in the base objects, the base object is kept (the property holds there); else the file is compiled again
     code_buckets = set(rl.bucket_of(e) for a in plan for e in rl.entries_holding(a)) | set(rl.bucket_of(a) for a in new)
     alone = sorted(a for b, s in noinline_by_bucket.items() if b not in code_buckets for a in s)
-    if alone and 'no-prune' not in opts:
+    if alone and os.environ.get('RECOMP_TARGET') == 'linux-arm64':      # hook_inline_check.py reads x86-64 objects only
+        log('  noinline: %d entr%s in files no other site touches: compiled again (no inline check of aarch64 objects)' % (len(alone), 'y' if len(alone) == 1 else 'ies'))
+    elif alone and 'no-prune' not in opts:
         import hook_inline_check
         res = hook_inline_check.check(alone, base_gen, base_obj, base=recomp.BASE)
         # a file is kept only if ALL its noinline entries pass; a file compiled again gets the attribute on all of them

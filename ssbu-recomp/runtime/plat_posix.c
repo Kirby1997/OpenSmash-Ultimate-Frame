@@ -1196,7 +1196,14 @@ int plat_current_fiber_stack(uintptr_t *lo, uintptr_t *hi) {      /* crash repor
 }
 LPVOID GetFiberData(void) { return t_fiber ? t_fiber->param : NULL; }
 /* (r1_state.c) Windows' fiber block: StackBase +0x10, DeallocationStack +0x20, the saved Rsp in its CONTEXT; here the Fiber */
+#ifdef PLAT_LINUX_SYNC
+/* r1 saves and restores this block whole; the FLS pointer stays out of it, as Windows' FlsData lies beyond what r1 copies
+ * (r1 restores the FLS values themselves through os_r1_fiber_fls): a restore must not bring back an older set */
+_Static_assert(__builtin_offsetof(Fiber, fls) + sizeof(void *) == sizeof(Fiber), "Fiber: fls must stay the last member");
+size_t plat_fiber_block_size(void) { return __builtin_offsetof(Fiber, fls); }
+#else
 size_t plat_fiber_block_size(void) { return sizeof(Fiber); }
+#endif
 int plat_fiber_stack_of(const void *fiber, uint64_t *lo, uint64_t *hi, uint64_t *sp) {
     const Fiber *f = fiber;
     if (!f || f->is_thread || !f->stack) return 0;
