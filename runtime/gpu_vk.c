@@ -1507,8 +1507,13 @@ static int wait_makes(void) {
     if (v < 0) v = getenv("SSBU_VK_WAIT") && atoi(getenv("SSBU_VK_WAIT")) != 0;
     return v;
 }
+/* A shader's or pipeline's state, as the drawing thread reads it. A maker writes the module, pipeline or
+ * compute pipeline first and then publishes the state with InterlockedExchange; a reader that sees 1 must
+ * see those writes too, so its load is an acquire. (A plain volatile load orders so on x86-64 and compiles
+ * to the same instruction there; on arm64 it does not, and a draw could read a handle not yet written.) */
+static inline LONG made_state(volatile LONG *state) { return __atomic_load_n(state, __ATOMIC_ACQUIRE); }
 static void wait_for(volatile LONG *state) {
-    while (!*state) SwitchToThread();
+    while (!made_state(state)) SwitchToThread();
 }
 
 /* What each stage's constant buffer slot was given last in this frame, with a copy of the bytes (gpu_d3d11.c's
@@ -1817,7 +1822,7 @@ static VShader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
      * owner's report 2026-11-09), a skipped launch leaves its outputs (skinned vertices) unwritten for a frame.
      * Compute programs were waited for already; every stage now. One compiled from scratch (fxc) is not waited for. */
     if (cached || stage == SHADER_COMPUTE)
-        for (u64 until = GetTickCount64() + 250; s->state == 0 && GetTickCount64() < until;) SwitchToThread();
+        for (u64 until = GetTickCount64() + 250; made_state(&s->state) == 0 && GetTickCount64() < until;) SwitchToThread();
     return s;
 }
 static VShader *find_shader(u64 g, int stage, u32 vs_outputs, const CbBinding *stage_cb, int alpha_tested) {
@@ -2453,8 +2458,8 @@ static VkPipeline get_pipeline(const PipeKey *k) {
     u32 h = desc_hash(k, sizeof *k) & (PIPE_SLOTS - 1);
     for (u32 n = 0; n < PIPE_SLOTS && pipes[h]; n++, h = (h + 1) & (PIPE_SLOTS - 1))
         if (!memcmp(&pipes[h]->key, k, sizeof *k)) {
-            if (pipes[h]->state == 0 && wait_makes()) wait_for(&pipes[h]->state);
-            return pipes[h]->state == 1 ? pipes[h]->pipe : VK_NULL_HANDLE;
+            if (made_state(&pipes[h]->state) == 0 && wait_makes()) wait_for(&pipes[h]->state);
+            return made_state(&pipes[h]->state) == 1 ? pipes[h]->pipe : VK_NULL_HANDLE;
         }
     if (npipes >= PIPE_SLOTS * 3 / 4) return VK_NULL_HANDLE;   /* (full: 24,576 pipelines) */
     Pipe *e = calloc(1, sizeof *e);
@@ -2467,8 +2472,8 @@ static VkPipeline get_pipeline(const PipeKey *k) {
     if (wait_makes()) wait_for(&e->state);
     /* a new pipeline is waited for a little (its shaders are ready: the driver makes it in milliseconds, less with the
      * pipeline cache warm), rather than its first draws skipped - an effect missing the first time (2026-11-09) */
-    for (u64 until = GetTickCount64() + 100; e->state == 0 && GetTickCount64() < until;) SwitchToThread();
-    return e->state == 1 ? e->pipe : VK_NULL_HANDLE;
+    for (u64 until = GetTickCount64() + 100; made_state(&e->state) == 0 && GetTickCount64() < until;) SwitchToThread();
+    return made_state(&e->state) == 1 ? e->pipe : VK_NULL_HANDLE;
 }
 
 /* ---- the draw -------------------------------------------------------------------------------------- */
@@ -2693,14 +2698,14 @@ static void vk_draw_(const u32 *regs, const CbBinding cb[STAGES][18], int indexe
     u64 ps_g = regs[M_PIPELINE(5)] & 1 ? gpu_va_to_guest(region + regs[M_PIPELINE(5) + 1]) : 0;
     VShader *vs = vs_g ? find_shader(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], 0) : NULL;
     /* (the pixel shader asked for once the vertex shader is translated: both are made at the same time) */
-    VShader *ps_e = vs && vs->state != 2 && ps_g ? find_shader(ps_g, SHADER_PIXEL, vs->info.outputs, cb[STAGE_FRAGMENT], 0) : NULL;
+    VShader *ps_e = vs && made_state(&vs->state) != 2 && ps_g ? find_shader(ps_g, SHADER_PIXEL, vs->info.outputs, cb[STAGE_FRAGMENT], 0) : NULL;
     /* alpha to coverage on targets of one sample: the alpha test >= 0.5 (gpu_d3d11.c) */
     int a2c = (regs[M_ANTI_ALIAS_ALPHA_CONTROL] & 1) && !(regs[M_ALPHA_TEST] & 1) && !(vk_debug() & 64);
     u32 alpha_func = regs[M_ALPHA_TEST] & 1 && !(vk_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : a2c ? 7 : 8;
-    VShader *pa_e = alpha_func != 8 && ps_e && ps_e->state != 2 && (ps_e->info.color_mask & 1)
+    VShader *pa_e = alpha_func != 8 && ps_e && made_state(&ps_e->state) != 2 && (ps_e->info.color_mask & 1)
                   ? find_shader(ps_g, SHADER_PIXEL, vs->info.outputs, cb[STAGE_FRAGMENT], 1) : NULL;
-    VShader *ps = pa_e && pa_e->state == 1 ? pa_e : ps_e && ps_e->state == 1 ? ps_e : NULL;
-    if (!vs || vs->state != 1 || (ps_g && !ps) || topo < 0) {
+    VShader *ps = pa_e && made_state(&pa_e->state) == 1 ? pa_e : ps_e && made_state(&ps_e->state) == 1 ? ps_e : NULL;
+    if (!vs || made_state(&vs->state) != 1 || (ps_g && !ps) || topo < 0) {
         if (topo < 0) vk_stat_skip_topology++; else vk_stat_skip_shader++;
         leave();
         return;
@@ -3107,7 +3112,7 @@ static void vk_dispatch_(const u32 *regs, const u32 *q) {
         if (q[20] >> i & 1) { cb[i].address = (u64)(q[30 + 2 * i] & 0xFF) << 32 | q[29 + 2 * i]; cb[i].size = q[30 + 2 * i] >> 15; }
     if (!g || !grid[0] || !grid[1] || !grid[2] || !local[0]) { leave(); return; }
     VShader *cs = find_shader_ex(g, SHADER_COMPUTE, 0, cb, 0, local, shared);
-    if (!cs || cs->state != 1 || !cs->compute) { vk_stat_skip_compute++; leave(); return; }
+    if (!cs || made_state(&cs->state) != 1 || !cs->compute) { vk_stat_skip_compute++; leave(); return; }
 
     VkBufferView cbv[18] = {0};
     for (u32 b = 0; b < 18; b++) {
