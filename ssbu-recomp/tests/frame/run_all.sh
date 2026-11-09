@@ -39,7 +39,7 @@ suite_desc() {
     case $1 in
     crash)   echo "crash reports: signal handler, alternate stack, report file (gcc, clang, FORTIFY, PAC); the A64 decoder of the fake audit" ;;
     fs)      echo "file layer of plat_posix.c: case-insensitive paths, write-through rename, Windows error codes" ;;
-    nnfs)    echo "nn::fs on the file layer: romfs tree, journaled save data, Commit under kill -9 and failed moves, folder listing order (nnfs.c, nnfsdir.c)" ;;
+    nnfs)    echo "nn::fs on the file layer: romfs tree, journaled save data, Commit under kill -9, failed moves / deletions / marker removals, two processes, folder listing order (nnfs.c, nnfsdir.c)" ;;
     boot)    echo "game-data lookup (datapaths.c) and boot.c's launch defaults, with synthetic fixtures" ;;
     plat)    echo "platform layer: VirtualAlloc below 2^47, write watch, plat_selftest (interlocked, threads, fibers, Vulkan loader, SHA-256)" ;;
     winshim) echo "Win32 stand-in layer: header order, VirtualAlloc / Query / Protect, IsBadReadPtr vs the kernel, game library binding, hashes (SHA-256 NRR check, SHA-1, MD5)" ;;

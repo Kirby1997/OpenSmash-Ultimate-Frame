@@ -93,7 +93,7 @@ facts: `uname`, CPU features (BTI, PAC, MTE, SVE2, LSE), glibc, compiler version
 |---|---|---|
 | `crash` | crash reports: gcc, clang, FORTIFY, PAC; the A64 decoder of the fake audit | `tests/port/crash/run_frame.sh` |
 | `fs` | file layer: case-insensitive paths, write-through rename | `tests/port/fs/run.sh native` |
-| `nnfs` | nn::fs on the file layer: romfs tree, journaled save data, `Commit` under kill -9 and failed moves, folder listing order | `tests/port/nnfs/run.sh native` |
+| `nnfs` | nn::fs on the file layer: romfs tree, journaled save data, `Commit` under kill -9, failed moves / deletions / marker removals, two processes, folder listing order | `tests/port/nnfs/run.sh native` |
 | `boot` | game data lookup and launch defaults (synthetic fixtures) | `tests/port/boot/run.sh native` |
 | `plat` | `VirtualAlloc` below 2^47, write watch, `plat_selftest`, Vulkan loader | `tests/cspike/c3_build.sh native` |
 | `winshim` | the Win32 stand-in layer: header order, `VirtualAlloc` / `Query` / `Protect`, `IsBadReadPtr` against the kernel, game library binding, SHA-256 / SHA-1 / MD5 | `tests/port/winshim/run.sh native` |

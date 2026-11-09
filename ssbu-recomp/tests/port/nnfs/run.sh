@@ -1,12 +1,12 @@
 #!/bin/sh
 # The game's file services on the rebuilt Linux layer (test_nnfs.c): nnfs.c (nn::fs: romfs-like tree, journaled save data, Commit
-# and its recovery after kill -9, failed moves), nnfsdir.c, nnpl.c (shared fonts) and gfx_options.c on plat_posix.c's Win32 file
+# and its recovery after kill -9, failed moves / deletions / marker removals, two processes), nnfsdir.c, nnpl.c (shared fonts) and gfx_options.c on plat_posix.c's Win32 file
 # layer. No game data. SDL3 and OpenSSL are stand-ins (no test reaches them).
 #   tests/port/nnfs/run.sh [mode]
 #     native  (default) build and run here with $CC (cc): on the Frame (aarch64 Linux), or on any Linux
 #     mac     macOS arm64: the Linux code paths (PLAT_LINUX_PATHS_ON_MAC); the file layer is POSIX either way
 #   OUT (default ${TMPDIR:-/tmp}/ssbu-nnfs-<mode>), CC, CFLAGS_EXTRA; the scratch folder is made under $TMPDIR (argument 2 of test_nnfs).
-#   FS_NO_KILL=1 leaves out the kill -9 runs (about 2 minutes on a Mac, more on a slow disk).
+#   FS_NO_KILL=1 leaves out the kill -9 runs (about 1 minute on a Mac, more on a slow disk).
 set -eu
 cd "$(dirname "$0")/../../.."
 MODE=${1:-native}

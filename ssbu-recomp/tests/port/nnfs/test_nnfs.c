@@ -4,8 +4,11 @@
  * SetEndOfFile, MoveFileExA, CopyFileA, FindFirstFileA in NTFS order), the case-insensitive lookup (host_path_resolve), and
  * the config and font paths (gfx_options.c, nnpl.c). The real handlers run, through their import tables.
  * Save commit crash safety: a child process is SIGKILLed before every mutating file call of Commit (and of the roll-forward at
- * the next mount); the committed folder must then be the complete old or the complete new state. A Commit whose file move fails
- * is finished by Commit again, by the next mount after a SIGKILL, or at Unmount (else at the next mount).
+ * the next mount); the committed folder must then be the complete old or the complete new state. A Commit whose apply fails after
+ * the decision (a move, a deletion, the marker's removal) stays pending: the game sees the decided state at once, and Commit
+ * again, SIGKILL, Unmount, uncommitted changes, or more changes and a Commit (each also SIGKILLed before every call) end in the
+ * decided state or a later decided one, never with an uncommitted change. Two processes: A's apply fails and A dies, B mounts
+ * while it still fails and commits (B SIGKILLed before every call). Markers written by earlier builds are still applied.
  * The calls nnfs.c makes are renamed to fi_* in that one unit (fault.h, forced in with -include) and fault_wrap.c passes them on
  * after telling a hook: linux-arm64's hostpath.c had the hook inside its file layer, plat_posix.c has none.
  * Everything happens in a fresh folder under argv[1], else $TMPDIR, else /tmp (removed when all checks pass).
@@ -122,7 +125,8 @@ static long get(const char *path, char *buf, size_t cap) {
 }
 static long fsize(const char *path) { struct stat st; return stat(path, &st) == 0 ? (long)st.st_size : -1; }
 static int rm_one(const char *p, const struct stat *s, int f, struct FTW *w) { (void)s; (void)f; (void)w; chmod(p, 0777); return remove(p); }
-static void rm_rf(const char *p) { nftw(p, rm_one, 16, FTW_DEPTH | FTW_PHYS); }
+static int rw_one(const char *p, const struct stat *s, int f, struct FTW *w) { (void)s; (void)f; (void)w; chmod(p, 0777); return 0; }
+static void rm_rf(const char *p) { nftw(p, rw_one, 16, FTW_PHYS); nftw(p, rm_one, 16, FTW_DEPTH | FTW_PHYS); }   /* (a folder left read-only by a test first) */
 static void snap(const char *dir, const char *rel, char *out, size_t cap) {  /* "rel/;" per folder, "rel=content;" per file, sorted */
     char p[2048], r[1024], buf[256];
     struct dirent **nl;
@@ -394,6 +398,7 @@ static void t_writethrough(void) {
 }
 
 /* ================================================================ 6. save commit with kill -9 */
+static int in_child(int (*fn)(void));
 static char g_old[2048], g_new[2048];
 static void old_state(void) {
     rm_rf(tp("ud"));
@@ -475,8 +480,17 @@ static void t_commit_kill(void) {
     }
     CHECKF(dec > 0 && !strncmp(g_log[dec - 1], "fsync ", 6) && nops > dec + 1, "the deciding move is at %d of %d, after a flush", dec, nops);
     CHECKF(moves == 4, "%d file moves after the decision (a.bin, dir1/c.bin, D.bin, re/y.bin)", moves);
-    CHECKF(nops >= 2 && !strncmp(g_log[nops - 2], "unlink ", 7) && strstr(g_log[nops - 2], ".commit") && !strncmp(g_log[nops - 1], "fsync-dir ", 10), "the marker is removed last, then its folder fsynced: %s | %s", nops >= 2 ? g_log[nops - 2] : "", nops >= 1 ? g_log[nops - 1] : "");
-    printf("    one commit = %d mutating file calls (%d before the decision)\n", nops, dec);
+    int unmark = -1, touched_root = 0, cleanup_ok = 1;
+    for (int i = 0; i < nops; i++) {
+        if (!strncmp(g_log[i], "unlink ", 7) && strstr(g_log[i], ".commit")) unmark = i;
+        if (i < dec && (strstr(g_log[i], "ud\\save\\") || strstr(g_log[i], "ud/save/"))) touched_root = 1;       /* R before the decision */
+    }
+    for (int i = unmark + 2; unmark >= 0 && i < nops; i++)            /* after the marker: only the stage folder goes, the working folder is emptied */
+        if (!(strstr(g_log[i], ".stage.") || strstr(g_log[i], ".work.")) || !(!strncmp(g_log[i], "unlink ", 7) || !strncmp(g_log[i], "rmdir ", 6) || !strncmp(g_log[i], "mkdir ", 6))) cleanup_ok = 0;
+    CHECKF(!touched_root, "the committed folder was changed before the decision");
+    CHECKF(unmark > dec && unmark + 1 < nops && !strncmp(g_log[unmark + 1], "fsync-dir ", 10) && cleanup_ok,
+           "the marker is removed after the moves, then its folder fsynced, then only the stage and working folders are cleaned (marker at %d of %d)", unmark, nops);
+    printf("    one commit = %d mutating file calls (%d before the decision, the marker removed at %d)\n", nops, dec, unmark);
     /* kill before op k; then recover (if the commit was decided, also kill the recovery before each of its ops, then recover) */
     int runs = 0, as_old = 0, as_new = 0, rolled = 0, bad = 0;
     for (int k = 1; k <= nops; k++) {
@@ -500,60 +514,266 @@ static void t_commit_kill(void) {
     CHECKF(as_old > 0 && rolled > 0, "both outcomes reached (old %d, rolled forward %d)", as_old, rolled);
     printf("    %d crash runs: %d ended in the old state, %d in the new state (%d kill points after the decision), %d bad\n", runs, as_old, as_new, rolled, bad);
 }
-/* ---- a Commit whose k-th file move fails (MoveFileExA -> journal_apply -2): the destination folder is made read-only just
- * before that rename. Then: 0 Commit again, 1 SIGKILL, 2 Unmount, 3 Unmount while the move still fails. After the next
- * mount the committed folder must hold the new state, with nothing left over. */
-static int g_fail_at, g_moves;
+/* ---- a Commit whose apply fails after the decision: the k-th file move, the k-th deletion, or the removal of the marker
+ * (the folder that holds the target is made read-only just before that call; on Windows: a full disk, a read-only file,
+ * an antivirus holding the file). The commit is then PENDING (see nnfs.c, "THE COMMIT PROTOCOL"): the game must see the
+ * decided state at once, and every way on must end in exactly that state, never the old one, a mix, or a write made after
+ * the failed Commit without a Commit of its own. */
+enum { FAIL_MOVE, FAIL_DELETE, FAIL_MARKER };
+static const char *const k_fail_kind[] = {"move", "deletion", "marker removal"};
+static int g_fail_kind, g_fail_at, g_fail_n, g_skip_fail;
 static char g_ro[2048];
 static void fail_hook(const char *op, const char *path) {
     char hp[2048];
-    if (strcmp(op, "move") || !path) return;
+    if (!path) return;
     host_path_resolve(path, hp, sizeof hp);              /* (0 when the target is not there yet: the path is the same) */
-    if (!strstr(hp, "/ud/save/")) return;
-    if (++g_moves == g_fail_at) { snprintf(g_ro, sizeof g_ro, "%s", hp); *strrchr(g_ro, '/') = 0; chmod(g_ro, 0555); }
+    int hit = g_fail_kind == FAIL_MOVE ? !strcmp(op, "move") && strstr(hp, "/ud/save/") != NULL
+            : g_fail_kind == FAIL_DELETE ? (!strcmp(op, "unlink") || !strcmp(op, "rmdir")) && strstr(hp, "/ud/save/") != NULL
+            : !strcmp(op, "unlink") && strlen(hp) > 12 && !strcmp(hp + strlen(hp) - 12, "/save.commit");
+    if (hit && ++g_fail_n == g_fail_at) { snprintf(g_ro, sizeof g_ro, "%s", hp); *strrchr(g_ro, '/') = 0; chmod(g_ro, 0555); }
 }
-static int run_fail_child(int k, int then) {
+static int fail_commit(int kind, int k) {          /* in a child, after changes(): 1 = Commit failed at that call */
+    g_fail_kind = kind; g_fail_at = k; g_fail_n = 0; g_ro[0] = 0; fi_hook = fail_hook;
+    uint32_t r = COMMIT("save");
+    fi_hook = NULL;
+    return r && g_ro[0];
+}
+static int rd_is(const char *guest, const char *want) {   /* the guest's view of one file (want NULL: it does not exist) */
+    uint64_t g = 0, got = 0;
+    char buf[64];
+    if (OPEN(&g, guest, 1)) return want == NULL;
+    READN(&got, g, 0, buf, sizeof buf - 1);
+    CLOSE(g);
+    buf[got] = 0;
+    return want && !strcmp(buf, want);
+}
+static int view_is_new(void) {                     /* the decided state of changes(), as the game reads it */
+    return rd_is("save:/a.bin", "new-a-longer") && rd_is("save:/b.bin", NULL) && rd_is("save:/d.bin", "new-d") && rd_is("save:/dir1/c.bin", "new-c")
+        && rd_is("save:/re/y.bin", "new-y") && rd_is("save:/re/x.bin", NULL) && rd_is("save:/olddir/o1.bin", NULL) && rd_is("save:/keep.bin", "keep");
+}
+static void more_changes(void) {                   /* after a failed Commit: delete a file that exists only in the pending commit, change another */
+    if (DELETE("save:/dir1/c.bin")) _exit(4);
+    wr("save:/keep.bin", "keep3");
+}
+static void uncommitted(void) {                    /* after a failed Commit: changes that are never committed */
+    wr("save:/A.BIN", "UNCOMMITTED");
+    if (CREATE("save:/unc.bin", 0)) _exit(4);
+    wr("save:/unc.bin", "unc");
+    if (DELETE("save:/re/y.bin")) _exit(4);
+}
+static const char *const k_new = "D.bin=new-d;RE/;RE/y.bin=new-y;a.bin=new-a-longer;dir1/;dir1/c.bin=new-c;keep.bin=keep;";
+static const char *const k_more = "D.bin=new-d;RE/;RE/y.bin=new-y;a.bin=new-a-longer;dir1/;keep.bin=keep3;";
+enum { THEN_COMMIT, THEN_KILL, THEN_UNMOUNT, THEN_UNMOUNT_FAILING, THEN_UNCOMMITTED_UNMOUNT, THEN_UNCOMMITTED_KILL, THEN_MORE_COMMIT, THEN_N };
+static const char *const k_then[] = {"Commit again", "SIGKILL", "Unmount", "Unmount while it still fails", "uncommitted changes, Unmount",
+                                     "uncommitted changes, SIGKILL", "more changes (one deletes a file only the pending commit has), Commit"};
+/* changes, a Commit that fails at the k-th call of `kind`, then `then`; with kill_at, the follow-up is SIGKILLed before its
+ * kill_at-th mutating call (-1: count them into "opcount"). Exit 5: the failure could not be made (root?), 6: the game's view
+ * after the failed Commit is not the decided state, 7: no pending marker. */
+static int run_fail_child(int kind, int k, int then, int kill_at) {
     fflush(NULL);
     pid_t pid = fork();
     if (pid == 0) {
         if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
         changes();
-        g_fail_at = k; g_moves = 0; g_ro[0] = 0; fi_hook = fail_hook;
-        uint32_t r = COMMIT("save");
-        fi_hook = NULL;
-        if (!r || !g_ro[0]) _exit(5);                      /* the move did not fail (run as root?) */
-        if (then != 3) chmod(g_ro, 0777);
-        if (then == 0) _exit(COMMIT("save") ? 3 : 0);
-        if (then == 1) kill(getpid(), SIGKILL);
-        UNMOUNT("save");
-        if (then == 3) chmod(g_ro, 0777);
-        _exit(0);
+        if (!fail_commit(kind, k)) _exit(5);
+        if (fsize(tp("ud/save.commit")) < 0) _exit(7);
+        if (then != THEN_UNMOUNT_FAILING) chmod(g_ro, 0777);
+        if (!view_is_new()) _exit(6);
+        if (kill_at) hook_on(kill_at < 0 ? 0 : kill_at);
+        uint32_t r = 0;
+        switch (then) {
+        case THEN_COMMIT: r = COMMIT("save"); break;
+        case THEN_KILL: kill(getpid(), SIGKILL); break;
+        case THEN_UNMOUNT: UNMOUNT("save"); break;
+        case THEN_UNMOUNT_FAILING: UNMOUNT("save"); chmod(g_ro, 0777); break;
+        case THEN_UNCOMMITTED_UNMOUNT: uncommitted(); UNMOUNT("save"); break;
+        case THEN_UNCOMMITTED_KILL: uncommitted(); hook_off(); kill(getpid(), SIGKILL); break;
+        case THEN_MORE_COMMIT: more_changes(); r = COMMIT("save"); if (!r && !rd_is("save:/dir1/c.bin", NULL)) r = 8; break;
+        }
+        hook_off();
+        if (kill_at < 0) { FILE *f = fopen(tp("opcount"), "w"); if (f) { fprintf(f, "%d\n", g_ops); fclose(f); } }
+        _exit(r ? 3 : 0);
     }
     int st = 0;
     waitpid(pid, &st, 0);
     return st;
 }
 static void t_commit_fail(void) {
-    SECTION("save Commit whose k-th move fails, then Commit again / SIGKILL / Unmount (also while it still fails), next mount: new state");
-    const char *want = "D.bin=new-d;RE/;RE/y.bin=new-y;a.bin=new-a-longer;dir1/;dir1/c.bin=new-c;keep.bin=keep;";
-    const char *then[] = {"Commit again", "SIGKILL", "Unmount", "Unmount while the move still fails"};
+    SECTION("save Commit whose apply fails (a move, a deletion, the marker's removal), then 7 ways on, next mount: the decided state");
+    static const int ks[3][3] = {{1, 2, 4}, {1, 5, 7}, {1, 0, 0}};     /* move 1..4; deletion 1 = b.bin, 5 = rmdir olddir, 7 = rmdir re; the marker */
     int runs = 0, bad = 0;
-    for (int t = 0; t < 4; t++)
-        for (int k = 1; k <= 4; k++) {
-            char s[2048] = "";
+    if (geteuid() == 0) { printf("    root: a read-only folder does not make a call fail: skipped\n"); g_skip_fail = 1; return; }
+    for (int kind = 0; kind < 3; kind++)
+        for (int ki = 0; ki < 3 && ks[kind][ki]; ki++)
+            for (int t = 0; t < THEN_N; t++) {
+                char s[2048] = "";
+                const char *want = t == THEN_MORE_COMMIT ? k_more : k_new;
+                old_state();
+                int st = run_fail_child(kind, ks[kind][ki], t, 0);
+                int st2 = run_child(1, 0);
+                snap(tp("ud/save"), "", s, sizeof s);
+                runs++;
+                int killed = t == THEN_KILL || t == THEN_UNCOMMITTED_KILL;
+                if (!(killed ? KILLED(st) : DONE(st)) || !DONE(st2) || leftovers() || strcmp(s, want)) {
+                    bad++;
+                    CHECKF(0, "%s %d fails, then %s: status %x/%x%s, %d leftovers, state %s", k_fail_kind[kind], ks[kind][ki], k_then[t], st, st2,
+                           WIFEXITED(st) && WEXITSTATUS(st) == 5 ? " (Commit reported success)" : WIFEXITED(st) && WEXITSTATUS(st) == 6 ? " (the game's view after the failed Commit was not the decided state)" : "", leftovers(), s);
+                }
+            }
+    CHECKF(bad == 0, "%d of %d failed-apply runs bad", bad, runs);
+    printf("    %d failed-apply runs, %d bad\n", runs, bad);
+}
+/* the same, with the follow-up SIGKILLed before each of its mutating calls (the pending commit's APPLY inside Commit, inside
+ * Unmount, the new commit's stage / decision / apply), then the next mount */
+static void t_commit_fail_kill(void) {
+    SECTION("pending commit: SIGKILL before each call of Commit again / uncommitted changes + Unmount / more changes + Commit");
+    static const int kinds[3][2] = {{FAIL_MOVE, 2}, {FAIL_DELETE, 1}, {FAIL_MARKER, 1}};
+    static const int thens[3] = {THEN_COMMIT, THEN_UNCOMMITTED_UNMOUNT, THEN_MORE_COMMIT};
+    int runs = 0, bad = 0, as_more = 0;
+    for (int ki = 0; ki < 3; ki++)
+        for (int ti = 0; ti < 3; ti++) {
+            int kind = kinds[ki][0], k = kinds[ki][1], t = thens[ti], nops = 0;
+            char s[2048];
             old_state();
-            int st = run_fail_child(k, t);
-            if (WIFEXITED(st) && WEXITSTATUS(st) == 5) { printf("    a read-only folder does not make rename fail here (root?): skipped\n"); return; }
-            int st2 = run_child(1, 0);
-            snap(tp("ud/save"), "", s, sizeof s);
-            runs++;
-            if (!(t == 1 ? KILLED(st) : DONE(st)) || !DONE(st2) || leftovers() || strcmp(s, want)) {
-                bad++;
-                CHECKF(0, "move %d fails, then %s: status %x/%x, %d leftovers, state %s", k, then[t], st, st2, leftovers(), s);
+            if (!DONE(run_fail_child(kind, k, t, -1))) { CHECKF(0, "%s %d, then %s: the counting run failed", k_fail_kind[kind], k, k_then[t]); continue; }
+            FILE *f = fopen(tp("opcount"), "r");
+            if (f) { if (fscanf(f, "%d", &nops) != 1) nops = 0; fclose(f); }
+            CHECKF(nops > 3, "%s, then %s: %d calls", k_fail_kind[kind], k_then[t], nops);
+            for (int kk = 1; kk <= nops; kk++) {
+                old_state();
+                int st = run_fail_child(kind, k, t, kk);
+                chmod(tp("ud/save"), 0777); chmod(tp("ud"), 0777);
+                int st2 = run_child(1, 0);
+                s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+                runs++;
+                int ok = KILLED(st) && DONE(st2) && !leftovers() && (!strcmp(s, k_new) || (t == THEN_MORE_COMMIT && !strcmp(s, k_more)));
+                as_more += !strcmp(s, k_more);
+                if (!ok) { bad++; CHECKF(0, "%s %d fails, then %s killed before call %d: status %x/%x, %d leftovers, state %s", k_fail_kind[kind], k, k_then[t], kk, st, st2, leftovers(), s); }
             }
         }
-    CHECKF(bad == 0, "%d of %d failed-move runs bad", bad, runs);
-    printf("    %d failed-move runs, %d bad\n", runs, bad);
+    CHECKF(bad == 0 && as_more > 0, "%d of %d runs bad, %d reached the later commit", bad, runs, as_more);
+    printf("    %d crash runs after a failed apply: %d bad (%d ended in the later commit's state, the rest in the pending one's)\n", runs, bad, as_more);
+}
+/* Two processes: A's Commit fails and A dies; B mounts while the APPLY still fails (the save folder read-only), must see A's
+ * decided state, deletes a file that exists only in it, changes another and commits. B is SIGKILLed before each of its
+ * mutating calls (its mount's APPLY attempt and copy, its Commit's APPLY of A's commit, its own stage, decision and apply).
+ * Before this was fixed B's Commit replaced A's marker and A's unmoved files were dropped: the save was neither state. */
+static int g_twoproc_kind;
+static int child_a(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    changes();
+    if (!fail_commit(g_twoproc_kind, 1)) return 5;
+    chmod(g_ro, 0777);
+    kill(getpid(), SIGKILL);
+    return 0;
+}
+static int run_b(int kill_at) {
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+        hook_on(kill_at < 0 ? 0 : kill_at);
+        chmod(tp("ud/save"), 0555);
+        uint32_t r = MOUNT_SAVE("save");
+        chmod(tp("ud/save"), 0777);
+        if (r) _exit(3);
+        if (fsize(tp("ud/save.commit")) < 0) _exit(7);                   /* (the APPLY at the mount must have failed) */
+        if (!view_is_new()) _exit(6);
+        more_changes();
+        r = COMMIT("save");
+        if (!r && !rd_is("save:/dir1/c.bin", NULL)) r = 8;
+        UNMOUNT("save");
+        hook_off();
+        if (kill_at < 0) { FILE *f = fopen(tp("opcount"), "w"); if (f) { fprintf(f, "%d\n", g_ops); fclose(f); } }
+        _exit(r ? 3 : 0);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+static void t_two_process(void) {
+    SECTION("two processes: A's apply fails and A dies, B mounts (its APPLY fails too), sees A's state, commits; SIGKILL B before each call");
+    int runs = 0, bad = 0, as_more = 0;
+    for (int kind = FAIL_MOVE; kind <= FAIL_DELETE; kind++) {
+        char s[2048];
+        int nops = 0;
+        g_twoproc_kind = kind;
+        old_state();
+        if (in_child(child_a) != 99) { CHECKF(0, "%s: A did not fail and die", k_fail_kind[kind]); continue; }
+        int st = run_b(-1);
+        s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+        CHECKF(DONE(st) && !strcmp(s, k_more), "%s: B status %x, state %s", k_fail_kind[kind], st, s);
+        FILE *f = fopen(tp("opcount"), "r");
+        if (f) { if (fscanf(f, "%d", &nops) != 1) nops = 0; fclose(f); }
+        for (int kk = 1; kk <= nops; kk++) {
+            old_state();
+            if (in_child(child_a) != 99) { bad++; continue; }
+            st = run_b(kk);
+            chmod(tp("ud/save"), 0777);
+            int st2 = run_child(1, 0);
+            s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+            runs++;
+            as_more += !strcmp(s, k_more);
+            if (!KILLED(st) || !DONE(st2) || leftovers() || (strcmp(s, k_new) && strcmp(s, k_more))) {
+                bad++;
+                CHECKF(0, "%s: B killed before call %d: status %x/%x, %d leftovers, state %s", k_fail_kind[kind], kk, st, st2, leftovers(), s);
+            }
+        }
+    }
+    CHECKF(bad == 0 && as_more > 0, "%d of %d two-process runs bad", bad, runs);
+    printf("    %d two-process crash runs: %d bad (%d ended in B's state, the rest in A's)\n", runs, bad, as_more);
+}
+/* Markers of earlier builds name their own working folder (R.work.<pid>) as W. They are applied as before; one still
+ * pending is started from by a mount; and when its pid is this process's own (a reused pid) the mount works elsewhere and
+ * leaves that folder alone. */
+static void old_marker(const char *wpid) {         /* the decided commit of changes() as an earlier build wrote it */
+    char w[2048], m[4096];
+    snprintf(w, sizeof w, "ud/save.work.%s", wpid);
+    char p[2048];
+    snprintf(p, sizeof p, "%s/a.bin", w); put(tp(p), "new-a-longer");
+    snprintf(p, sizeof p, "%s/D.bin", w); put(tp(p), "new-d");
+    snprintf(p, sizeof p, "%s/dir1/c.bin", w); put(tp(p), "new-c");
+    snprintf(p, sizeof p, "%s/RE/y.bin", w); put(tp(p), "new-y");
+    snprintf(m, sizeof m, "W\t%s\\save.work.%s\nR\t%s\\save\nD\tb.bin\nD\td.bin\nD\tolddir\nD\tre\nF\ta.bin\nF\tD.bin\nM\tdir1\nF\tdir1\\c.bin\nM\tRE\nF\tRE\\y.bin\n",
+             tp("ud"), wpid, tp("ud"));
+    put(tp("ud/save.commit"), m);
+}
+static int child_old_reused(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    char pid[32];
+    snprintf(pid, sizeof pid, "%d", (int)getpid());
+    old_marker(pid);
+    chmod(tp("ud/save"), 0555);                                  /* its APPLY fails at the mount */
+    uint32_t r = MOUNT_SAVE("save");
+    chmod(tp("ud/save"), 0777);
+    if (r || !view_is_new()) return 6;
+    char w[2048]; snprintf(w, sizeof w, "ud/save.work.%s/dir1/c.bin", pid);
+    if (fsize(tp(w)) < 0) return 7;                              /* the pending commit's folder was not wiped by the mount */
+    more_changes();
+    r = COMMIT("save");
+    UNMOUNT("save");
+    return r ? 3 : 0;
+}
+static void t_old_marker(void) {
+    SECTION("markers of earlier builds (W = their working folder): applied at the mount, started from while pending, a reused pid");
+    char s[2048];
+    old_state(); old_marker("4294967290");                       /* a dead process */
+    CHECK(DONE(run_child(1, 0)) && !leftovers());
+    s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+    CHECKF(!strcmp(s, k_new), "applied at the mount: %s", s);
+    old_state(); old_marker("4294967290");
+    chmod(tp("ud/save"), 0555);
+    CHECK(DONE(run_child(1, 0)));                                /* APPLY fails: the marker and its folder stay */
+    chmod(tp("ud/save"), 0777);
+    CHECK(fsize(tp("ud/save.commit")) >= 0 && fsize(tp("ud/save.work.4294967290/dir1/c.bin")) == 5);
+    CHECK(DONE(run_child(1, 0)) && !leftovers());
+    s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+    CHECKF(!strcmp(s, k_new), "applied at the next mount: %s", s);
+    old_state();
+    CHECK(in_child(child_old_reused) == 0);
+    CHECK(DONE(run_child(1, 0)) && !leftovers());
+    s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+    CHECKF(!strcmp(s, k_more), "a reused pid: %s", s);
 }
 
 /* ================================================================ 7. config and font paths, exe dir, the built-in self-tests */
@@ -628,6 +848,8 @@ int main(int argc, char **argv) {
     t_writethrough();
     if (!getenv("FS_NO_KILL")) t_commit_kill();
     t_commit_fail();
+    if (!getenv("FS_NO_KILL") && !g_skip_fail) { t_commit_fail_kill(); t_two_process(); }
+    if (!g_skip_fail) t_old_marker();
     t_misc();
     if (!mt_fail && !getenv("FS_KEEP")) rm_rf(T); else printf("test_fs: kept %s\n", T);
     return mt_done("test_fs");

@@ -247,7 +247,8 @@ with JKSV or Checkpoint, from yuzu / Eden / suyu (right-click the game, "Open Sa
 (right-click the game, "Open User Save Directory"). Rename `build\saves\save` to `save_old` as a backup, create a new
 empty `build\saves\save` and copy your `save_data` folder into it (you should have
 `build\saves\save\save_data\system_data.bin`), then start the game. Folders named `save.work.<number>` are temporary
-session files: leave them or delete them while the game is closed.
+session files: leave them or delete them while the game is closed. Leave a `save.commit` file and the `save.stage.<number>`
+folder it names alone: they hold a save the game could not finish writing (a full disk, say) and it completes it at its next start.
 
 **"ssbu_game_eh_o1.dll is missing" when I start the game?** The game DLL (about 500 MB, built on your PC and not signed) was removed after the installation, usually by an antivirus, or the installation stopped before the end. Open Windows Security > Virus & threat protection > Protection history and restore/allow the file if it is there (adding your install folder to the exclusions stops it happening again), then double-click `Install SSBU.bat` and press **Resume**: it links the missing files again in a few minutes, without compiling everything again.
 
