@@ -16,7 +16,8 @@ elif [ -z "${1:-}" ] && [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = aarch64 ]
 if [ "$MODE" = remote ]; then
     HOST=${1:-steamos@frame}
     cd "$ROOT"
-    tar -cf - runtime/plat_crash.h runtime/plat_crash.c tests/port/crash/run.sh tests/port/crash/run_frame.sh tests/port/crash/test_crash.c |
+    tar -cf - runtime/plat_crash.h runtime/plat_crash.c runtime/a64_trivial.h tests/port/crash/run.sh tests/port/crash/run_frame.sh tests/port/crash/test_crash.c \
+        tests/port/crash/test_a64.c tests/port/crash/a64_funcs.c |
         ssh -o BatchMode=yes "$HOST" 'rm -rf ~/ssbu-port/crash && mkdir -p ~/ssbu-port/crash && cd ~/ssbu-port/crash && tar -xf -'
     exec ssh -o BatchMode=yes "$HOST" 'cd ~/ssbu-port/crash && sh tests/port/crash/run_frame.sh --local'
 fi
