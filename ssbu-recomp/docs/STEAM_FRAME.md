@@ -97,6 +97,7 @@ facts: `uname`, CPU features (BTI, PAC, MTE, SVE2, LSE), glibc, compiler version
 | `boot` | game data lookup and launch defaults (synthetic fixtures) | `tests/port/boot/run.sh native` |
 | `plat` | `VirtualAlloc` below 2^47, write watch, `plat_selftest`, Vulkan loader | `tests/cspike/c3_build.sh native` |
 | `winshim` | the Win32 stand-in layer: header order, `VirtualAlloc` / `Query` / `Protect`, `IsBadReadPtr` against the kernel, game library binding, SHA-256 / SHA-1 / MD5 | `tests/port/winshim/run.sh native` |
+| `modules` | nn::ro: NRR hash check, `LoadModule` through `LoadLibraryA`, relocation, unload and reload, two modules with the same internal names (fake modules built as `build.py` builds them) | `tests/port/modules/run.sh native` |
 | `services` | nn::time zones against the C library (also slim tzdata), region code, nn::socket over BSD sockets, swkbd text | `tests/port/services/run.sh native` |
 | `io` | `nnfontll.c`'s FreeType outlines against FreeType itself (skips, and says so, without FreeType's headers) | `tests/port/io/run.sh native` |
 | `threads` | stacks and `__thread` below 2^47, fibers, FLS, critical sections, nn::os threads, `setjmp` on fibers (also FORTIFY), the C++ runtime's exception state, BTI, TLS hazard | `tests/port/threads/run_frame.sh` |
