@@ -145,10 +145,12 @@ BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user);
 BOOL GetProcessTimes(HANDLE p, FILETIME *create, FILETIME *exit_, FILETIME *kernel, FILETIME *user);
 void Sleep(DWORD ms);
 #define SwitchToThread() (sched_yield(), 1)
-#ifdef __aarch64__                                      /* macOS on Apple Silicon */
-#define YieldProcessor() __builtin_arm_yield()
-#else
+#if defined(__x86_64__) || defined(__i386__)
 #define YieldProcessor() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define YieldProcessor() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define YieldProcessor() __asm__ __volatile__("" ::: "memory")
 #endif
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define TIMERR_NOERROR 0
@@ -191,6 +193,29 @@ void Sleep(DWORD ms);
     ({ void *plat_c_ = (void *)(c); __atomic_compare_exchange_n((void *volatile *)(p), &plat_c_, (void *)(x), 0, PLAT_SC, PLAT_SC); (PVOID)plat_c_; })
 
 /* ---- locks and condition variables ---- */
+/* Linux: a CRITICAL_SECTION as Windows has it (plat_posix.c): it belongs to a thread id with a recursion count, and
+ * LeaveCriticalSection does not check the caller, so a guest fiber that took a lock on one host thread and was resumed
+ * by another releases it there (a glibc recursive mutex refused that: the lock stayed held). A zeroed one is free.
+ * PLAT_LINUX_PATHS_ON_MAC: tests/port/threads/run.sh mac builds these Linux paths on macOS arm64, as a check only. */
+#if defined(__linux__) || defined(PLAT_LINUX_PATHS_ON_MAC)
+#define PLAT_LINUX_SYNC 1
+#endif
+#ifdef PLAT_LINUX_SYNC
+typedef struct {
+    volatile uint32_t Lock;                              /* futex: 0 free, 1 held, 2 held with waiters */
+    LONG RecursionCount;
+    HANDLE OwningThread;                                 /* the owner's thread id, as Windows keeps it */
+    ULONG_PTR SpinCount;
+} CRITICAL_SECTION;
+typedef CRITICAL_SECTION *LPCRITICAL_SECTION;
+void InitializeCriticalSection(CRITICAL_SECTION *cs);
+#define InitializeCriticalSectionAndSpinCount(cs, n) (InitializeCriticalSection(cs), TRUE)
+#define InitializeCriticalSectionEx(cs, n, f) (InitializeCriticalSection(cs), TRUE)
+void EnterCriticalSection(CRITICAL_SECTION *cs);
+void LeaveCriticalSection(CRITICAL_SECTION *cs);
+BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs);
+#define DeleteCriticalSection(cs) ((void)(cs))
+#else
 typedef pthread_mutex_t CRITICAL_SECTION;                /* recursive, like the Windows one */
 typedef CRITICAL_SECTION *LPCRITICAL_SECTION;
 void InitializeCriticalSection(CRITICAL_SECTION *cs);
@@ -200,6 +225,10 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs);
 #define LeaveCriticalSection(cs) pthread_mutex_unlock(cs)
 #define TryEnterCriticalSection(cs) (pthread_mutex_trylock(cs) == 0)
 #define DeleteCriticalSection(cs) pthread_mutex_destroy(cs)
+#endif
+/* An SRWLOCK is a pthread rwlock: it must be released by the thread that acquired it (glibc tells a writer's unlock
+ * from a reader's by the thread), so none may be held across a SwitchToFiber. The runtime holds them only around
+ * host-side tables. */
 typedef pthread_rwlock_t SRWLOCK;
 typedef SRWLOCK *PSRWLOCK;
 #define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
@@ -295,12 +324,20 @@ DWORD TlsAlloc(void);
 BOOL TlsFree(DWORD i);
 LPVOID TlsGetValue(DWORD i);
 BOOL TlsSetValue(DWORD i, LPVOID v);
+/* Linux: FLS values belong to the fiber (or to the thread while it is not one) and go where the fiber goes; the callback
+ * runs on DeleteFiber, FlsFree and the end of the thread. Elsewhere: pthread keys (per thread). */
+#ifdef PLAT_LINUX_SYNC
+#define FLS_MAXIMUM_AVAILABLE 128
+#endif
 DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION cb);
 BOOL FlsFree(DWORD i);
 PVOID FlsGetValue(DWORD i);
 BOOL FlsSetValue(DWORD i, PVOID v);
 
-/* fibers (ucontext) */
+/* fibers (ucontext; aarch64 Linux and macOS: a switch of the callee-saved registers). A fiber can be resumed by another
+ * thread than the one it left: a function that can switch (SwitchToFiber, or a guest call) must not keep the address
+ * of a __thread variable across that point; read and write it through a noinline function (hostrt.c set_cur_ctx,
+ * os_threads.c fiber_cur). */
 typedef void (*LPFIBER_START_ROUTINE)(LPVOID);
 LPVOID ConvertThreadToFiber(LPVOID param);
 BOOL ConvertFiberToThread(void);
@@ -613,6 +650,7 @@ BOOL FindNextFileW(HANDLE h, WIN32_FIND_DATAW *fd);
 /* stack walking for the diagnostics: PCs of the calling thread, innermost first (_Unwind_Backtrace) */
 int plat_backtrace(uintptr_t *pcs, int max);
 int plat_current_stack(uintptr_t *lo, uintptr_t *hi);    /* the stack this thread runs on now (a fiber's or the thread's) */
+uint32_t plat_exe_stamp(void);       /* rb_net.c: the PE header's link time stamp on Windows; on Linux 4 bytes of the exe's ELF build id */
 
 /* OpenGL renderer: extension entry points from the current context (SDL) */
 void *wglGetProcAddress(const char *name);

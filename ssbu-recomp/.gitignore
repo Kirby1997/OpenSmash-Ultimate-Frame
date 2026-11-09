@@ -65,6 +65,8 @@ trace_*.txt
 build/
 build-linux/
 build-macos/
+# tests/frame/run_all.sh: build outputs, logs and the report of a run on the Steam Frame
+build-frame-tests/
 deps/
 # scripts/make_release.py: its scratch folder and the runtime package (a Release asset, never committed)
 build_release/

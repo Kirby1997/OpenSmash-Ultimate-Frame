@@ -3,6 +3,8 @@
 
     python scripts/setup.py --dump <folder> [--jobs N] [tool locations ...]
     python scripts/setup.py --target linux --dump <folder> [--jobs N]      a native Linux build, in <repo>/build-linux
+    python scripts/setup.py --target linux-arm64 --dump <folder>           the Steam Frame (aarch64), in <repo>/build-linux-arm64:
+                                        cross from an x86-64 host (--sysroot, toolchain/sync_sysroot.sh) or native on the device
                                                                             (BUILDING_LINUX.md; scripts/linux/install_deps.sh first)
     python scripts/setup.py --target macos --dump <folder> [--jobs N]      a native macOS build (Apple Silicon, macOS 14.4+), in
                                                                             <repo>/build-macos (BUILDING_MAC.md; scripts/macos/install_mac.sh)
@@ -41,6 +43,8 @@ suyu (RECOMP_NOCRT, tools/lifter/build.py). The package is used only by the tree
 import argparse
 import json
 import os
+import platform
+import shlex
 import shutil
 import struct
 import subprocess
@@ -129,12 +133,19 @@ def default_jobs():
 class Ctx:
     def __init__(self, a):
         self.a = a
-        self.linux = getattr(a, 'target', 'windows') == 'linux'
-        self.mac = getattr(a, 'target', 'windows') == 'macos'
+        self.target = getattr(a, 'target', 'windows')
+        if self.target == 'linux' and sys.platform.startswith('linux') and platform.machine() in ('aarch64', 'arm64'):
+            self.target = 'linux-arm64'      # an aarch64 Linux host (the Frame itself): the tuned arm64 flags, never the x86-64 list
+        self.linux = self.target in ('linux', 'linux-arm64')
+        self.arm64 = self.target == 'linux-arm64'
+        self.mac = self.target == 'macos'
         self.posix = self.linux or self.mac          # "not Windows": a POSIX host build with clang and pkg-config
+        self.native = self.arm64 and sys.platform.startswith('linux') and platform.machine() in ('aarch64', 'arm64')
+        self.sysroot = ''
+        self.target_flags = []      # the driver flags of the aarch64 target, set by deps_linux
         # --build, else the install location chosen in the installer window (build_location.txt), else <repo>/build;
-        # --target linux: <repo>/build-linux; --target macos: <repo>/build-macos
-        self.build = os.path.abspath(a.build or (os.path.join(REPO, 'build-linux') if self.linux else
+        # --target linux: <repo>/build-linux; --target linux-arm64: <repo>/build-linux-arm64; --target macos: <repo>/build-macos
+        self.build = os.path.abspath(a.build or (os.path.join(REPO, 'build-linux-arm64' if self.arm64 else 'build-linux') if self.linux else
                                                  os.path.join(REPO, 'build-macos') if self.mac else build_location.get()))
         self.work = os.path.join(self.build, 'work')
         self.logs = os.path.join(self.build, 'logs')
@@ -188,6 +199,13 @@ class Ctx:
             env['PKG_CONFIG_PATH'] = t['pkg_config_path']
         if self.nocrt:
             env['RECOMP_NOCRT'] = '1'
+        if self.arm64:
+            env['RECOMP_TARGET'] = 'linux-arm64'
+            env['RECOMP_TARGET_FLAGS'] = ' '.join(shlex.quote(f) for f in self.target_flags)
+            if self.sysroot:
+                env['PKG_CONFIG_SYSROOT_DIR'] = self.sysroot
+                env['PKG_CONFIG_LIBDIR'] = os.environ.get('PKG_CONFIG_LIBDIR') or ':'.join(
+                    os.path.join(self.sysroot, p) for p in ('usr/lib/pkgconfig', 'usr/share/pkgconfig', 'opt/ssbu-deps/sdl3/lib/pkgconfig'))
         env.update(extra)
         return env
 
@@ -608,9 +626,39 @@ def deps_linux(cx):
     if missing:
         raise Fail('missing Python packages: %s (run setup.py with deps/venv/bin/python)%s' % (', '.join(missing), LINUX_HINT))
     say('  python packages: numpy lz4 zstandard Pillow unicorn: ok')
-    clang = os.path.join(a.llvm, 'bin', 'clang') if a.llvm else shutil.which('clang')
-    if not clang or not os.path.exists(clang):
-        raise Fail('clang not found (install clang, or --llvm <folder with bin/clang>)' + LINUX_HINT)
+    if cx.arm64:
+        # The Steam Frame (aarch64, Snapdragon 8 Gen 3). Native on the device: the system's clang and /usr. Cross from
+        # this host: an LLVM with bin/clang + bin/ld.lld and a sysroot copied from the Frame (toolchain/sync_sysroot.sh).
+        cx.native = cx.native or (sys.platform.startswith('linux') and platform.machine() in ('aarch64', 'arm64'))
+        sdl_pc = os.path.expanduser('~/ssbu-port/deps/sdl3/lib/pkgconfig')      # toolchain/build_deps_on_device.sh: SteamOS ships no SDL3 development files
+        if cx.native and os.path.isdir(sdl_pc) and sdl_pc not in os.environ.get('PKG_CONFIG_PATH', '').split(':'):
+            os.environ['PKG_CONFIG_PATH'] = sdl_pc + (':' + os.environ['PKG_CONFIG_PATH'] if os.environ.get('PKG_CONFIG_PATH') else '')
+        llvm = None if cx.native else find_first([a.llvm, os.environ.get('LLVM_ROOT'), os.path.join(REPO, 'deps', 'llvm'),
+                                                 os.path.expanduser('~/.local/llvm-19.1.7')], lambda d: os.path.exists(os.path.join(d, 'bin', 'clang')))
+        clang = os.path.join(llvm, 'bin', 'clang') if llvm else shutil.which('clang')
+        if not clang or not os.path.exists(clang):
+            raise Fail('clang for the aarch64 target not found (install clang 19+, or --llvm <LLVM folder with bin/clang and bin/ld.lld>)' + LINUX_HINT)
+        flags = ['--target=aarch64-linux-gnu', '-fuse-ld=lld']
+        if not cx.native:
+            cx.sysroot = os.path.abspath(os.path.expanduser(a.sysroot or os.environ.get('SYSROOT') or '~/sysroots/steam-frame'))
+            for need in (os.path.join('usr', 'lib', 'crt1.o'), os.path.join('usr', 'include', 'stdio.h')):
+                if not os.path.exists(os.path.join(cx.sysroot, need)):
+                    raise Fail('sysroot %s is incomplete (%s missing): run toolchain/sync_sysroot.sh -d %s' % (cx.sysroot, need, cx.sysroot))
+            flags.insert(1, '--sysroot=' + cx.sysroot)
+        if not (os.path.exists(os.path.join(os.path.dirname(clang), 'ld.lld')) or shutil.which('ld.lld')):
+            raise Fail('ld.lld not found next to clang (the LLVM release tarballs ship it; native on the Frame: install lld)' + LINUX_HINT)
+        # -mcpu for the Frame's cores; a clang without them (LLVM < 18) builds with -march=armv8.2-a+lse and says so
+        if subprocess.run([clang] + flags + ['-mcpu=cortex-x4', '-fsyntax-only', '-x', 'c', '/dev/null'], capture_output=True, text=True).returncode == 0:
+            flags.append('-mcpu=cortex-x4')
+        else:
+            say('  note: %s has no -mcpu for the Frame (Cortex-X4); using -march=armv8.2-a+lse' % clang)
+            flags.append('-march=armv8.2-a+lse')
+        cx.target_flags = flags
+        say('  target: %s   %s' % ('native on the Frame' if cx.native else 'cross from %s' % platform.machine(), ' '.join(flags)))
+    else:
+        clang = os.path.join(a.llvm, 'bin', 'clang') if a.llvm else shutil.which('clang')
+        if not clang or not os.path.exists(clang):
+            raise Fail('clang not found (install clang, or --llvm <folder with bin/clang>)' + LINUX_HINT)
     ver = subprocess.run([clang, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
     say('  clang: %s   [%s]' % (ver, clang))
     try:
@@ -620,14 +668,21 @@ def deps_linux(cx):
     if major and major < 19:
         raise Fail('clang %d is too old: the Linux build needs clang 19 or newer (C23 typeof_unqual)' % major)
     cx.tools['clang'] = clang
+    pkg_env = dict(os.environ)
+    if cx.sysroot:
+        # cross build: let pkg-config read the sysroot's .pc files and prefix every path it returns
+        pkg_env['PKG_CONFIG_SYSROOT_DIR'] = cx.sysroot
+        pkg_env['PKG_CONFIG_LIBDIR'] = pkg_env.get('PKG_CONFIG_LIBDIR') or ':'.join(
+            os.path.join(cx.sysroot, p) for p in ('usr/lib/pkgconfig', 'usr/share/pkgconfig', 'opt/ssbu-deps/sdl3/lib/pkgconfig'))
     if not shutil.which('pkg-config'):
         raise Fail('pkg-config not found' + LINUX_HINT)
     for pc, name in LINUX_PKGS:
-        r = subprocess.run(['pkg-config', '--modversion', pc], capture_output=True, text=True)
+        r = subprocess.run(['pkg-config', '--modversion', pc], capture_output=True, text=True, env=pkg_env)
         if r.returncode:
             raise Fail('development files of %s (%s) not found by pkg-config%s' % (name, pc, LINUX_HINT))
         say('  %-13s %s' % (pc, r.stdout.strip()))
-    for h, name in (('/usr/include/glslang/Include/glslang_c_interface.h', 'glslang'), ('/usr/include/GL/gl.h', 'OpenGL (libGL)')):
+    prefix = cx.sysroot + '/usr/include' if cx.sysroot else '/usr/include'
+    for h, name in ((os.path.join(prefix, 'glslang/Include/glslang_c_interface.h'), 'glslang'), (os.path.join(prefix, 'GL/gl.h'), 'OpenGL (libGL)')):
         if not os.path.exists(h):
             raise Fail('%s headers not found (%s)%s' % (name, h, LINUX_HINT))
     # one program linked against every library of the build, and run: a missing library shows here, not after an hour
@@ -641,32 +696,40 @@ def deps_linux(cx):
                 '    if (!avcodec_find_decoder(AV_CODEC_ID_VP9)) { puts("noVP9"); return 0; }\n'
                 '    if (!avcodec_find_decoder(AV_CODEC_ID_VORBIS)) { puts("noVorbis"); return 0; }\n'
                 '    puts("ok");\n    return 0;\n}\n')
-    flags = subprocess.run(['pkg-config', '--cflags', '--libs'] + [p for p, _ in LINUX_PKGS], capture_output=True, text=True).stdout.split()
+    flags = subprocess.run(['pkg-config', '--cflags', '--libs'] + [p for p, _ in LINUX_PKGS], capture_output=True, text=True, env=pkg_env).stdout.split()
     err = ''
     for libs in GLSLANG_LIBS:
-        r = subprocess.run([clang, os.path.join(probe, 'p.c'), '-o', os.path.join(probe, 'p')] + flags + libs + ['-lGL', '-lm'], capture_output=True, text=True)
+        r = subprocess.run([clang] + cx.target_flags + [os.path.join(probe, 'p.c'), '-o', os.path.join(probe, 'p')] + flags + libs + ['-lGL', '-lm'], capture_output=True, text=True)
         if not r.returncode:
             cx.tools['glslang_libs'] = libs
             break
         err = r.stderr
     else:
         raise Fail('a test program using SDL3, FreeType, OpenSSL, FFmpeg, glslang and OpenGL does not build:\n%s%s' % (err[-1200:], LINUX_HINT))
-    out = subprocess.run([os.path.join(probe, 'p')], capture_output=True, text=True).stdout.strip().splitlines()
+    if cx.arm64 and not cx.native:
+        say('  cross build: the test program is aarch64, so its run (and the FFmpeg decoder check) happens on the Frame; '
+            'linking it here already proves the sysroot is complete')
+        out = ['ok']
+    else:
+        out = subprocess.run([os.path.join(probe, 'p')], capture_output=True, text=True).stdout.strip().splitlines()
     if out and out[-1].startswith('no'):
         raise Fail('this FFmpeg has no %s decoder: the game\'s movies are VP9 video with Vorbis audio (install the full FFmpeg of your distribution)' % out[-1][2:])
     if not out or out[-1] != 'ok':
         raise Fail('the test program built against the libraries does not run (output %r)' % out)
-    say('  test program with SDL3, FreeType, OpenSSL, FFmpeg (VP9 + Vorbis), glslang, OpenGL: builds and runs')
+    say('  test program with SDL3, FreeType, OpenSSL, FFmpeg (VP9 + Vorbis), glslang, OpenGL: builds%s' % ('' if cx.arm64 and not cx.native else ' and runs'))
     import ctypes.util
     for lib, name in (('vulkan', 'the Vulkan loader (libvulkan.so.1)'), ('opus', 'the Opus library (libopus.so.0)')):
-        if not ctypes.util.find_library(lib):
+        if cx.sysroot:          # cross: the Frame's libraries in the sysroot, not this host's
+            if not os.path.exists(os.path.join(cx.sysroot, 'usr', 'lib', 'lib%s.so.%s' % (lib, '1' if lib == 'vulkan' else '0'))):
+                raise Fail('%s not found in the sysroot %s: run toolchain/sync_sysroot.sh' % (name, cx.sysroot))
+        elif not ctypes.util.find_library(lib):
             raise Fail('%s not found: the game loads it at run time%s' % (name, LINUX_HINT))
     say('  run-time libraries: libvulkan, libopus: ok')
     deps = os.path.join(REPO, 'deps')
     for key, opt, envv, sub, probe_rel in (
             ('vulkan', a.vulkan_headers, 'VULKAN_HEADERS', 'Vulkan-Headers', os.path.join('include', 'vulkan', 'vulkan.h')),
             ('suyu', a.suyu, 'SUYU_ROOT', 'suyu', os.path.join('src', 'core', 'hle', 'service', 'mii', 'types', 'raw_data.cpp'))):
-        found = find_first([opt, os.environ.get(envv), os.path.join(deps, sub), '/usr' if key == 'vulkan' else None], lambda d, p=probe_rel: os.path.exists(os.path.join(d, p)))
+        found = find_first([opt, os.environ.get(envv), os.path.join(deps, sub), ((cx.sysroot + '/usr') if cx.sysroot else '/usr') if key == 'vulkan' else None], lambda d, p=probe_rel: os.path.exists(os.path.join(d, p)))
         if not found:
             raise Fail('%s not found (--%s <folder containing %s>)%s' % (sub, {'vulkan': 'vulkan-headers', 'suyu': 'suyu'}[key], probe_rel, LINUX_HINT))
         cx.tools[key] = found
@@ -1024,7 +1087,7 @@ def inline_flag(cx):
 
 def build_env(cx):
     if cx.linux:
-        return cx.env(RECOMP_GEN='gen_eh_o2', RECOMP_OBJ='obj_eh_o1', RECOMP_DLL=game_lib(cx), RECOMP_NRO_SUFFIX='_eh_o2', RECOMP_TARGET='linux', RECOMP_INLINE=inline_flag(cx),
+        return cx.env(RECOMP_GEN='gen_eh_o2', RECOMP_OBJ='obj_eh_o1', RECOMP_DLL=game_lib(cx), RECOMP_NRO_SUFFIX='_eh_o2', RECOMP_TARGET=('linux-arm64' if cx.arm64 else 'linux'), RECOMP_INLINE=inline_flag(cx),
                       RECOMP_LIFT_JOBS=str(cx.lift_jobs))
     if cx.mac:
         return cx.env(RECOMP_GEN='gen_eh_o2', RECOMP_OBJ='obj_eh_o1', RECOMP_DLL=game_lib(cx), RECOMP_NRO_SUFFIX='_eh_o2', RECOMP_TARGET='macos', RECOMP_INLINE=inline_flag(cx),
@@ -1121,7 +1184,7 @@ def step_link(cx):
 
 
 def link_linux(cx):
-    cx.run('link', [cx.tools['clang'], '-O2', '-shared', '-fPIC', 'vk_glslang_shim.c', '-o', 'ssbu_glslang.so'] + cx.tools.get('glslang_libs', GLSLANG_LIBS[0]))
+    cx.run('link', [cx.tools['clang']] + cx.target_flags + ['-O2', '-shared', '-fPIC', 'vk_glslang_shim.c', '-o', 'ssbu_glslang.so'] + cx.tools.get('glslang_libs', GLSLANG_LIBS[0]))
     cx.run('link', [sys.executable, 'build.py', 'link'], env=cx.env(**{k: v for k, v in build_env(cx).items() if k != 'RECOMP_NRO_SUFFIX'}, RECOMP_EXE=LINUX_EXE))
     for f in (LINUX_EXE, 'ssbu_glslang.so', game_lib(cx)):
         if not os.path.exists(os.path.join(cx.work, f)):
@@ -1160,6 +1223,9 @@ def game_env(cx, **extra):
 
 
 def step_check(cx):
+    if cx.arm64 and not cx.native:                       # a cross build: this host cannot run the aarch64 exe
+        say('  self-tests: skipped (aarch64 exe: run them on the Frame)')
+        return
     exe = os.path.join(cx.work, exe_name(cx))
     main_elf = os.path.join(cx.bin, 'main.elf')
     scratch = os.path.join(cx.build, 'selftest_userdata')
@@ -1222,10 +1288,13 @@ def _difftest(cx):
     if not cx.tools.get('msvc', True):
         say('  differential test: skipped (it needs the MSVC Build Tools and the Windows SDK, which this PC does not have)')
         return
+    if cx.arm64 and not cx.native:
+        say('  differential test: skipped (the test program is aarch64: run this step on the Frame itself)')
+        return
     cx.run('check', [py, 'difftest.py', 'sample'], log='check_difftest')
     cx.run('check', [py, 'difftest.py', 'gen'], log='check_difftest')
     dt = 'difftest' if cx.posix else 'difftest.exe'
-    cx.run('check', [cx.tools['clang'], '-O0', '-w', '-fno-strict-aliasing', '-I', '.', 'difftest_gen.c', 'difftest_host.c', '-o', dt] + (['-lm'] if cx.posix else []), log='check_difftest')
+    cx.run('check', [cx.tools['clang']] + cx.target_flags + ['-O0', '-w', '-fno-strict-aliasing'] + (['-ffp-contract=off'] if cx.arm64 else []) + ['-I', '.', 'difftest_gen.c', 'difftest_host.c', '-o', dt] + (['-lm'] if cx.posix else []), log='check_difftest')
     out = cx.run('check', [py, 'difftest.py', 'check'], env=cx.env(DIFFTEST_EXE=os.path.join(w, dt)), log='check_difftest')
     line = next((l for l in out.splitlines() if l.startswith('tests:')), '')
     if not line:
@@ -1246,7 +1315,7 @@ def how_to_run(cx):
     say('')
     say('Start the game (from a shell; the window opens at once, the first run compiles shaders and is slow):')
     if cx.linux:
-        say('  deps/venv/bin/python scripts/run.py --linux        (saves in ~/.local/share/ssbu-recomp/userdata)')
+        say('  deps/venv/bin/python scripts/run.py %s        (saves in ~/.local/share/ssbu-recomp/userdata)' % ('--linux-arm64' if cx.arm64 else '--linux'))
         say('  scripts/linux/install_desktop.sh                   adds a launcher to your application menu')
         say('or by hand:   cd %s   and run   ./%s ../binaries/%s/main.elf 0' % (cx.work, LINUX_EXE, cx.state.get('game_version', '13.0.4')))
         say('with the environment variables SSBU_ROMFS=%s  SSBU_USERDATA=<saves>' % d.get('romfs', '<romfs>'))
@@ -1267,12 +1336,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dump', help='folder with exefs\\ and romfs\\ (and optionally sysdata\\) dumped from your console')
     ap.add_argument('--exefs'), ap.add_argument('--romfs'), ap.add_argument('--sysdata')
-    ap.add_argument('--target', choices=('windows', 'linux', 'macos'), default='windows', help='windows (default: the Windows exe), linux (a native Linux build: BUILDING_LINUX.md) or macos (Apple Silicon: BUILDING_MAC.md)')
-    ap.add_argument('--tools-only', action='store_true', help='only check the tools (step deps, no dump needed; --target linux / macos)')
-    ap.add_argument('--build', help='build folder (default: the install location of build_location.txt, else <repo>/build; <repo>/build-linux for --target linux, <repo>/build-macos for --target macos)')
+    ap.add_argument('--target', choices=('windows', 'linux', 'linux-arm64', 'macos'), default='windows', help='windows (default: the Windows exe), linux (a native x86-64 Linux build: BUILDING_LINUX.md), linux-arm64 (the Steam Frame: cross from this host with --sysroot, or native on the device) or macos (Apple Silicon: BUILDING_MAC.md)')
+    ap.add_argument('--sysroot', help='linux-arm64 cross: the sysroot copied from the Frame (toolchain/sync_sysroot.sh; default $SYSROOT or ~/sysroots/steam-frame). Native on the Frame: ignored')
+    ap.add_argument('--tools-only', action='store_true', help='only check the tools (step deps, no dump needed; --target linux / linux-arm64 / macos)')
+    ap.add_argument('--build', help='build folder (default: the install location of build_location.txt, else <repo>/build; <repo>/build-linux for --target linux, <repo>/build-linux-arm64 for --target linux-arm64, <repo>/build-macos for --target macos)')
     ap.add_argument('--jobs', type=int, help='parallel compiler jobs (default min(24, cpus); on Windows also at most one per 4 GB of RAM; on Linux / macOS the '
                                                   'compilers share RAM - 4 GB by reservations instead)')
-    ap.add_argument('--llvm', help='LLVM 9.0.0 folder (bin\\clang.exe)')
+    ap.add_argument('--llvm', help='LLVM 9.0.0 folder (bin\\clang.exe); --target linux-arm64: any LLVM folder with bin/clang and bin/ld.lld (cross), or the system clang (native on the Frame)')
     ap.add_argument('--sdl3', help='SDL3 development package (VC) folder: include\\, lib\\x64\\')
     ap.add_argument('--vulkan-headers', help='Khronos Vulkan-Headers folder (include\\vulkan\\)')
     ap.add_argument('--glslang', help='glslang windows-x86_64 release folder (include\\, lib\\)')

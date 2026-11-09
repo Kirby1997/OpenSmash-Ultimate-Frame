@@ -74,6 +74,16 @@ void vk_fatal(const char *what, VkResult r) {
     /* (2026-10-21, tester: Quadro M1200, the device lost at the 4th frame, every start) a device lost in the first 20 s: this
      * driver cannot run the game's Vulkan; graphics.ini gets renderer = opengl (F1 > Graphics switches back) and the game
      * starts again with OpenGL (vk_unavailable) */
+#ifdef __linux__
+    /* Steam Frame (Adreno / Turnip): the OpenGL renderer needs NVIDIA's OpenGL (GL_ARB_bindless_texture, GL_NV_gpu_shader5).
+     * On Linux this process does not start again by itself, and graphics.ini = opengl would make every later start
+     * of a GPU without that OpenGL fail; so on a non-NVIDIA GPU the setting is left alone and the loss is only reported. */
+    if (r == VK_ERROR_DEVICE_LOST && nvn_front_frame_next() < 1200 && !getenv("SSBU_RENDERER") && V.props.vendorID != 0x10DE) {
+        printf("nvn_vk: the device was lost at frame %lld, at the start; graphics.ini is NOT switched to OpenGL (that renderer needs NVIDIA's OpenGL): send this log\n", nvn_front_frame_next());
+        fflush(stdout);
+        ExitProcess(5);
+    }
+#endif
     if (r == VK_ERROR_DEVICE_LOST && nvn_front_frame_next() < 1200 && !getenv("SSBU_RENDERER")) {
         printf("nvn_vk: the device was lost at frame %lld, at the start: graphics.ini now says renderer = opengl\n", nvn_front_frame_next());
         fflush(stdout);

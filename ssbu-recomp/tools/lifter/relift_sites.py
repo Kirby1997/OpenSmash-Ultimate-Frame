@@ -67,8 +67,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # files, compiled with build.py's PLAT_FLAGS and linked by build.link_dll as the base set was; the runtime still names
 # them .dll and plat_posix.c maps the name. Windows keeps its own path (lld / link.exe, /MAP and the PE check).
 TARGET = os.environ.get('RECOMP_TARGET', '')
-POSIX = TARGET in ('linux', 'macos')
-LIB_EXT = {'linux': '.so', 'macos': '.dylib'}.get(TARGET, '.dll')
+POSIX = TARGET in ('linux', 'linux-arm64', 'macos')
+LIB_EXT = {'linux': '.so', 'linux-arm64': '.so', 'macos': '.dylib'}.get(TARGET, '.dll')
 KINDS ={'patch': 1, 'inline': 2, 'midhook': 3, 'dynimm': 4, 'jtable': 5, 'noinline': 6}
 LOCK = os.environ.get('RECOMP_HEAVY_LOCK')      # optional: a lock file shared with other heavy builds of the machine
 
@@ -1065,7 +1065,8 @@ def main():
         if data_objs is None:
             return 1
         o = os.path.join(obj, '_sky_sites.obj')
-        r = subprocess.run([comp.clang, '-c', '-O1', '-w', '-I', HERE, '-I', gen] + comp.plat + [os.path.join(gen, 'sky_sites.c'), '-o', o],
+        arm = build.PLAT_FLAGS + build.CODEGEN_FLAGS if getattr(build, 'TARGET_ARM64', False) else []    # linux-arm64: the target / sysroot (cross) and -fPIC, as compile_game_data
+        r = subprocess.run([comp.clang, '-c', '-O1', '-w', '-I', HERE, '-I', gen] + comp.plat + arm + [os.path.join(gen, 'sky_sites.c'), '-o', o],
                            capture_output=True, text=True)
         if r.returncode:
             log('could not compile sky_sites.c:\n%s' % (r.stdout + r.stderr)[-2000:])
@@ -1088,7 +1089,8 @@ def main():
             objs.append(o)
     # link.exe through clang, or lld-link alone under RECOMP_NOCRT (a build made with a runtime package: no MSVC): build.py link_dll;
     # Linux / macOS: the .so / .dylib the way the base set was linked (no link map there)
-    r = build.link_dll(objs, dll, rsp, implib=False, fltused=bool(rl.module), mapfile=None if POSIX else mapfile)      # fltused as build_nro.py / build_game_dll link
+    r = build.link_dll(objs, dll, rsp, implib=False, fltused=bool(rl.module), mapfile=None if POSIX else mapfile,
+                       symbolic=True)      # fltused as build_nro.py / build_game_dll link; symbolic (-Bsymbolic, linux-arm64 only) as both link there
     t_link = time.time() - t2
     log((r.stdout + r.stderr)[-3000:])
     log('link %s: exit %d, %d objects (%d re-compiled), %.0f MB, %.0fs' % (os.path.basename(dll), r.returncode, len(objs), len(mine & set(base)),

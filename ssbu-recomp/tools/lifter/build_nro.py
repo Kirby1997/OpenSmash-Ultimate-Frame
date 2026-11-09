@@ -13,6 +13,7 @@ nnro.c loads nro_bin\\<module>.dll when the game calls nn::ro::LoadModule for th
 import concurrent.futures
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -21,9 +22,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 RO = os.path.join(HERE, 'ro_study')
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-8.0.0\bin\clang.exe')
-TARGET_LINUX = os.environ.get('RECOMP_TARGET') == 'linux'      # see build.py
-TARGET_MACOS = os.environ.get('RECOMP_TARGET') == 'macos'
-PLAT_FLAGS = (['-fPIC', '-fvisibility=hidden', '-include', os.path.join(HERE, 'plat', 'plat_pre.h')] + (['-mmacosx-version-min=14.4'] if TARGET_MACOS else ['-mcx16'])
+TARGET = os.environ.get('RECOMP_TARGET', '')                    # see build.py: 'linux' (x86-64), 'linux-arm64' (Frame) or 'macos'
+TARGET_LINUX = TARGET in ('linux', 'linux-arm64')
+TARGET_ARM64 = TARGET == 'linux-arm64'
+TARGET_MACOS = TARGET == 'macos'
+CODEGEN_FLAGS = shlex.split(os.environ.get('RECOMP_TARGET_FLAGS', '')) + ['-ffp-contract=off', '-fno-math-errno', '-fno-omit-frame-pointer'] if TARGET_ARM64 else []   # empty for windows and x86-64 linux; aarch64 needs the contraction off even native
+# -mcx16: Linux x86-64 only (an x86 option; aarch64 has LDXP/STXP / CASP itself)
+PLAT_FLAGS = (['-fPIC', '-fvisibility=hidden', '-include', os.path.join(HERE, 'plat', 'plat_pre.h')] + (['-mmacosx-version-min=14.4'] if TARGET_MACOS else [] if TARGET_ARM64 else ['-mcx16'])
               if TARGET_LINUX or TARGET_MACOS else [])
 LIB_EXT = '.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'     # nnro.c asks for <name>.dll; plat_posix.c maps it
 GEN_HEADERS = ['runtime.h', 'neon.h', 'fpexact.h']
@@ -108,7 +113,7 @@ def build_module(e, jobs, relift, opt):
     newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in GEN_HEADERS)
     sources = sorted(n for n in os.listdir(gen) if n.endswith('.c'))
     import build                                            # NOCRT_FLAGS / link_dll: RECOMP_NOCRT (build.py)
-    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + build.NOCRT_FLAGS + PLAT_FLAGS
+    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + build.NOCRT_FLAGS + PLAT_FLAGS + build.CODEGEN_FLAGS      # build.py: same list, plus its -mcpu probe when RECOMP_TARGET_FLAGS is unset
     todo = []
     for n in sources:
         src, o = os.path.join(gen, n), os.path.join(obj, n[:-2] + '.obj')
@@ -138,7 +143,7 @@ def build_module(e, jobs, relift, opt):
     objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith('.obj'))
     linked = False
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(o) for o in objs):
-        r = build.link_dll(objs, dll, os.path.join(obj, 'link.rsp'), implib=False, fltused=True)
+        r = build.link_dll(objs, dll, os.path.join(obj, 'link.rsp'), implib=False, fltused=True, symbolic=True)
         if r.returncode:
             print((r.stdout + r.stderr)[-4000:])
             print('could not link %s (is a game exe still running and holding it open?)' % dll)

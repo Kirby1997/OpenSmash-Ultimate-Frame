@@ -3,7 +3,7 @@ tables, nn::hid ids) out of the real `sdk` binary, and emit them as C arrays in 
 import os
 import struct
 
-SDK = os.path.join(os.environ['RECOMP_BIN'], 'sdk.elf') if os.environ.get('RECOMP_BIN') else r'..\binaries\13.0.4\sdk.elf'   # RECOMP_BIN: scripts/setup.py
+SDK = os.path.join(os.environ['RECOMP_BIN'], 'sdk.elf') if os.environ.get('RECOMP_BIN') else os.path.join('..', 'binaries', '13.0.4', 'sdk.elf')   # RECOMP_BIN: scripts/setup.py; else relative to the current directory, as before
 d = open(SDK, 'rb').read()
 OFF = 0x1000
 # locate .dynsym / .dynstr through the section headers nso2elf wrote

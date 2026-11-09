@@ -40,7 +40,7 @@ LOCK = os.environ.get('RECOMP_HEAVY_LOCK')      # optional: a lock file shared w
 # RECOMP_TARGET=linux / macos (scripts/setup.py sets it for those builds): the plugins become .so / .dylib files, compiled
 # with build.py's PLAT_FLAGS and linked by build.link_dll like the game's modules (build_nro.py). The runtime still asks for
 # plugin_bin\<name>.dll; plat_posix.c's LoadLibraryA maps the name, as for nro_bin.
-LIB_EXT = {'linux': '.so', 'macos': '.dylib'}.get(os.environ.get('RECOMP_TARGET'), '.dll')
+LIB_EXT = {'linux': '.so', 'linux-arm64': '.so', 'macos': '.dylib'}.get(os.environ.get('RECOMP_TARGET'), '.dll')
 
 
 def take_lock(what):
@@ -182,7 +182,7 @@ def build_one(name, nro, base, jobs, relift, flags_local):
     dll = os.path.join(bindir, name + LIB_EXT)
     objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith('.obj'))
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(o) for o in objs):
-        r = build.link_dll(objs, dll, os.path.join(obj, 'link.rsp'), implib=False, fltused=True)      # lld-link alone under RECOMP_NOCRT (no MSVC)
+        r = build.link_dll(objs, dll, os.path.join(obj, 'link.rsp'), implib=False, fltused=True, symbolic=True)      # lld-link alone under RECOMP_NOCRT (no MSVC); symbolic: linux-arm64 only, as build_nro.py's modules
         if r.returncode:
             print((r.stdout + r.stderr)[-4000:])
             print('could not link %s (is a game exe still running and holding it open?)' % dll)

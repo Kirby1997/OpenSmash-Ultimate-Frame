@@ -17,6 +17,9 @@
 #include <setjmp.h>
 #include <windows.h>
 #include <wincrypt.h>
+#ifdef __linux__
+#include "datapaths.h"
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -612,6 +615,7 @@ static int aoc_parse(const char *p) {
 }
 static void aoc_load(void) {
     char exe[MAX_PATH], path[MAX_PATH + 32];
+#ifndef __linux__
     const char *e = getenv("SSBU_DLC_LIST");
     if (e && e[0]) snprintf(path, sizeof path, "%s", e);
     else {
@@ -622,6 +626,15 @@ static void aoc_load(void) {
     }
     int n = 0, bad = 0, line = 0;
     FILE *fp = fopen(path, "r");
+#else
+    /* datapaths.c (WP-U5a): --dlc, SSBU_DLC_LIST, the saved choice, <exe>/../config/dlc.txt, $XDG_CONFIG_HOME/ssbu-recomp/dlc.txt.
+     * A file is the list above; a folder holds the player's DLC dumps, whose names carry the ids (as dlc_list.py reads them). */
+    (void)exe;
+    int n = 0, bad = 0, line = 0, dir = 0;
+    if (!dp_resolve(DP_DLC, path, sizeof path, NULL)) path[0] = 0;
+    else if ((dir = dp_is_dir(path)) != 0) n = dp_dlc_scan(path, g_aoc, (int)(sizeof g_aoc / sizeof g_aoc[0]));
+    FILE *fp = path[0] && !dir ? fopen(path, "r") : NULL;
+#endif
     char ln[128];
     while (fp && fgets(ln, sizeof ln, fp) && n < (int)(sizeof g_aoc / sizeof g_aoc[0])) {
         char *p = ln;
@@ -636,7 +649,11 @@ static void aoc_load(void) {
         }
     }
     if (fp) fclose(fp);
+#ifndef __linux__
     printf("nn::aoc: %d add-on content(s) owned (%s)\n", n, fp ? path : "no config\\dlc.txt");
+#else
+    printf("nn::aoc: %d add-on content(s) owned (%s%s)\n", n, dir ? "the DLC dump names in " : "", fp || dir ? path : "no dlc.txt");
+#endif
     if (bad > 5) printf("nn::aoc: %d more lines ignored\n", bad - 5);
     if (n) {                                         /* the indices read, runs of consecutive ones as a-b */
         char list[512];

@@ -423,6 +423,7 @@ VkBlendOp blend_op(unsigned e);
 extern CRITICAL_SECTION g_gpl_lock;
 extern DWORD g_vk_render_tid;
 extern LONG64 g_gpl_dlink;
+extern LONG64 g_sb_cut;                                  /* Frame bring-up: storage buffer ranges cut to maxStorageBufferRange (nvn_vk_draw.c sb_range) */
 extern VkDescriptorSetLayout g_udl[2];
 void gpl_destroy(void);
 void piperec_append(const PKey *k, VStage *vs, VStage *fs, int compute);

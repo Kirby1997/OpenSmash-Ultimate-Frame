@@ -10,6 +10,9 @@
 #include <time.h>
 #include "runtime.h"
 #include "hostrt.h"
+#ifdef __linux__
+#include "datapaths.h"
+#endif
 
 #define NNINIT_STARTUP GA(GUEST_BASE + 0x2c55e0ULL)
 #define NN_MAIN GA(GUEST_BASE + 0x2c5620ULL)
@@ -330,6 +333,7 @@ static DWORD WINAPI crash_test(LPVOID arg) {
     return 0;
 }
 
+#ifndef __linux__
 /* A launch without scripts/run.py (the exe started by itself, from build\work): the RomFS folder that run.py would pass is
  * taken from ..\state.json ("romfs", written by scripts/setup.py) when that folder has data.arc. A variable that is set is
  * left alone. Without this a direct start looked for ..\romfs, found no data.arc, and the game crashed reading the file it
@@ -454,8 +458,63 @@ static void check_romfs(void) {
     }
     romfs_fail(msg);
 }
+#else
+/* Linux (WP-U5a): the player's own game data are found by datapaths.c, first found wins: --data/--fonts/--dlc/--userdata,
+ * SSBU_DATA / SSBU_ROMFS / SSBU_FONTS / SSBU_DLC_LIST / SSBU_USERDATA, the saved choice ($XDG_CONFIG_HOME/ssbu-recomp/config),
+ * then the build folder's own layout (<exe>/../state.json "romfs", <exe>/../romfs, ../sysdata/fonts) as on Windows.
+ * launch_defaults exports what it found (SSBU_ROMFS, SSBU_FONTS, SSBU_USERDATA, SSBU_TZDIR: nnfs.c, nnpl.c and nntime.c read
+ * them); --check-data prints the result and exits (0, or 9). check_romfs refuses a start that cannot work (no data.arc, no
+ * .nrr, a dump of the other game build, no system fonts): the reason on the console and exit code 9 (DP_EXIT_DATA), or, when
+ * the run is attended and the picker of WP-U5b is linked (dp_picker_hook, datapicker_sdl.c), the player chooses a folder and
+ * it is checked again. --pick-data / SSBU_PICK_DATA=1 open the picker with usable data too (to change the saved choice).
+ * There is no message box: a Linux start without a picker is a console or Steam launch whose log has the reason. */
+static dp_result g_dp;
+static void launch_defaults(void) {
+    dp_check(dp_elf_build(g_elf), &g_dp);
+    if (dp_check_only()) {                            /* before dp_apply: the sources as found (not SSBU_USERDATA we export), nothing created */
+        dp_report(stdout, &g_dp);
+        exit(g_dp.status == DP_OK ? 0 : DP_EXIT_DATA);
+    }
+    dp_apply(&g_dp);
+}
+static void check_romfs(void) {
+    static const char *const no_data[] = {"SSBU_SDK_SELFTEST", "SSBU_VK_SELFTEST", "SSBU_CXXRT_SELFTEST", "SSBU_MISC_SELFTEST", "SSBU_EH_MAIN_TEST"};
+    for (size_t i = 0; i < sizeof no_data / sizeof no_data[0]; i++) if (getenv(no_data[i])) return;
+    int pick = dp_pick_requested();                   /* --pick-data / SSBU_PICK_DATA=1: the picker opens with usable data too */
+    for (int asked = 0; g_dp.status != DP_OK || pick; asked++) {
+        int h = !dp_unattended() && dp_picker_hook && asked < 16 ? dp_picker_hook(&g_dp) : 0;
+        pick = 0;
+        if (h <= 0 && g_dp.status == DP_OK) {          /* usable data: start with them, unless the player quit */
+            if (h < 0) { printf("game data: the player quit in the data picker\n"); exit(0); }
+            break;
+        }
+        if (h <= 0) {
+            printf("\n%s\n", g_dp.message);
+            fprintf(stderr, "%s\n", g_dp.message);
+            exit(DP_EXIT_DATA);
+        }
+        dp_picked(&g_dp);                              /* the picker saved the player's choice: it wins over --data / SSBU_* now */
+        dp_check(dp_elf_build(g_elf), &g_dp);          /* from the top again */
+        dp_apply(&g_dp);
+    }
+    if (g_dp.warnings & DP_WARN_NO_EXEFS)
+        printf("game data: no exefs/main beside the RomFS: the dump's build was not checked (this exe is %s)\n", g_dp.expected);
+    printf("%s (%s)\n", g_dp.message, dp_source_name(g_dp.source));
+}
+#endif
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+    if (dp_take_args(&argc, argv) < 0) return 1;     /* datapaths.c: --data/--fonts/--dlc/--userdata/--check-data leave argv */
+    __argc = argc;
+    if (argc == 1) {                         /* no main.elf named: the build's own (state.json game_version), not ..\binaries\13.0.4 */
+        static char elf[DP_PATH], *args[3];
+        dp_default_elf(elf, sizeof elf);
+        args[0] = argv[0]; args[1] = elf; args[2] = NULL;
+        argv = args; argc = 2;
+        __argc = 2; __argv = args;           /* sdklift_rt.c and nvn_vk_store.c take main.elf's folder from __argv[1] */
+    }
+#endif
     if (argc > 1 && !strcmp(argv[1], "--write-dump")) { int diag_dump_helper(int, char **); return diag_dump_helper(argc, argv); }   /* hostrt.c: minidump of the crashed game, written from outside */
     g_elf = argc > 1 ? argv[1] : "..\\binaries\\13.0.4\\main.elf";
     setvbuf(stdout, NULL, _IONBF, 0);

@@ -1,3 +1,11 @@
+> [!NOTE]
+> **This is OpenSmash-Ultimate Frame**, a fork of [OpenSmash-Ultimate/OpenSmash-Ultimate](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate)
+> that targets the **Valve Steam Frame**: a native aarch64 Linux build, no emulator and no x86 translation. The work lives
+> in [`ssbu-recomp/`](ssbu-recomp/) on branch `frame` (`setup.py --target linux-arm64`); everything below this note is
+> upstream's README.
+> **Status: in progress, not yet run on the device.** The game does not boot on the Frame yet, and the checks this branch
+> still owes the device are listed, with the build, in [ssbu-recomp/docs/STEAM_FRAME.md](ssbu-recomp/docs/STEAM_FRAME.md).
+
 # OpenSmash-Ultimate
 
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/pkgyYGf3YB)

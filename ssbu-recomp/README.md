@@ -18,6 +18,44 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 
 </div>
 
+> [!NOTE]
+> **OpenSmash-Ultimate Frame targets the Valve Steam Frame: a native aarch64 Linux build, no emulator, no x86 translation.**
+> This folder is the fork's work, on branch `frame` of [Kirby1997/OpenSmash-Ultimate-Frame](https://github.com/Kirby1997/OpenSmash-Ultimate-Frame)
+> (`setup.py --target linux-arm64`), a fork of [OpenSmash-Ultimate/OpenSmash-Ultimate](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate)
+> (see the note in the [root README](../README.md)). It builds on upstream's Linux layer and adds what an ARM host needs.
+> **Status: in progress, not yet run on the device; the game does not boot on the Frame yet.**
+>
+> | | Steam Frame (as measured on the device) |
+> |---|---|
+> | SoC | Qualcomm Snapdragon 8 Gen 3: 1 × Cortex-X4, 5 × Cortex-A720, 2 × Cortex-A520 |
+> | ISA | AArch64, Armv9-A with LSE atomics and SVE2 on every core; builds use `-mcpu=cortex-x4 -O2` |
+> | GPU | Adreno 750, Mesa Turnip, Vulkan 1.4 (BC / ASTC, graphics pipeline library) |
+> | OS | SteamOS (Arch based), Linux 6.18, glibc 2.39, 4 KiB pages, 48-bit virtual addresses |
+> | RAM | 16 GB (15 GiB usable) |
+>
+> What the port changes, besides the build target:
+> - **Memory ordering:** the Switch's acquire / release and exclusive accesses map to ARM's own (`ldar` / `stlr` /
+>   `casal`); on x86 they could rely on the CPU's strong ordering, on ARM they can't.
+> - **Addresses below 2^47:** the game assumes 47-bit pointers, but the kernel hands out memory above that on aarch64;
+>   heap, `VirtualAlloc` and thread and fiber stacks are kept low.
+> - **Threads and fibers:** a fiber switch is a register save (no system call); fiber-local storage and critical
+>   sections behave as on Windows when another thread resumes a fiber.
+> - **Files:** case-insensitive paths and crash-safe save renames. **Game data:** found the same way on every start,
+>   with an in-game picker for Game Mode.
+> - **Crash reports:** written without malloc or stdio, on a stack of their own, to `<exe>_crash.txt` in the user data
+>   folder (host and guest call stacks as module+offset); the process then dies of the original signal, core dump included.
+> - The thread and fiber work, the picker and the crash reports are written and tested on macOS arm64 only, not yet run
+>   on the Frame (the device runs are listed in [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)). The move onto
+>   OpenSmash-Ultimate's tree (upstream's 82 newer commits merged in) was checked on macOS arm64 only as well. Still to do
+>   before the first boot: those runs. Then performance work: the Frame has far less headroom than the PCs upstream is
+>   tested on.
+>
+> Frame-specific notes: [docs/STEAM_FRAME.md](docs/STEAM_FRAME.md).
+>
+> Build from an x86-64 PC (`source toolchain/env.sh`, sysroot from `toolchain/sync_sysroot.sh`) or natively on the
+> Frame. As upstream: everything is generated from **your own dump** of the game; nothing of the game is in this
+> repository.
+
 > The project is called **OpenSmash-Ultimate**. The repository is still named `Denkishi/ssbu-recomp`.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**

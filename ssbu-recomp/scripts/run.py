@@ -7,6 +7,8 @@
                                                                            the window stays off-screen and muted when the exe
                                                                            is not named ssbu_native.exe / ssbu_user.exe
 
+--linux-arm64 is the same for the Steam Frame build (scripts/setup.py --target linux-arm64): build folder build-linux-arm64; it is picked
+by itself on an aarch64 Linux host when build-linux-arm64 exists and build-linux does not.
 --linux runs the native Linux build (scripts/setup.py --target linux): build folder build-linux, exe ssbu_native. On Linux
 it is the default when build-linux exists and build (a Windows cross build) does not; --userdata then defaults to
 $XDG_DATA_HOME/ssbu-recomp/userdata (~/.local/share/ssbu-recomp/userdata).
@@ -21,6 +23,7 @@ Options go to the game as environment variables (listed in BUILDING.md); --env N
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -52,6 +55,7 @@ def main():
     ap.add_argument('--build', default=None, help='build folder (default: the install location of build_location.txt, else <repo>/build; <repo>/build-linux with --linux)')
     ap.add_argument('--linux', action='store_true', help='the native Linux build (default build folder build-linux, exe ssbu_native, '
                                                         'saves in ~/.local/share/ssbu-recomp/userdata unless --userdata)')
+    ap.add_argument('--linux-arm64', action='store_true', dest='linux_arm64', help='the Steam Frame (aarch64) Linux build: as --linux with the build folder build-linux-arm64')
     ap.add_argument('--seconds', type=int, default=0, help='stop after this many seconds (0 = play until you quit)')
     ap.add_argument('--seq', help='input sequence file (tests/seq_*.txt): lines starting with # are comments')
     ap.add_argument('--exe', help='exe name inside build/work (default ssbu_native.exe, ssbu_native with --linux); a copy of it is made if missing')
@@ -62,6 +66,12 @@ def main():
     ap.add_argument('--mac', action='store_true', help='the native macOS build (default build folder build-macos, exe ssbu_native, '
                                                       'saves in ~/Library/Application Support/ssbu-recomp/userdata unless --userdata)')
     a = ap.parse_args()
+    if a.linux_arm64:
+        a.linux = True
+    elif (sys.platform.startswith('linux') and not a.linux and not a.build and not os.path.exists(os.path.join(REPO, 'build', 'state.json'))
+          and platform.machine() in ('aarch64', 'arm64') and os.path.exists(os.path.join(REPO, 'build-linux-arm64', 'state.json'))
+          and not os.path.exists(os.path.join(REPO, 'build-linux', 'state.json'))):
+        a.linux = a.linux_arm64 = True
     if sys.platform.startswith('linux') and not a.linux and not a.build and not os.path.exists(os.path.join(REPO, 'build', 'state.json')):
         a.linux = True
     if sys.platform == 'darwin' and not a.mac and not a.linux and not a.build and os.path.exists(os.path.join(REPO, 'build-macos', 'state.json')):
@@ -85,11 +95,11 @@ def main():
                     pass
             print('Playing. The game log goes to %s. Close the game window to quit.' % a.log)
     elif a.linux:
-        a.build = os.path.abspath(a.build or os.path.join(REPO, 'build-linux'))
+        a.build = os.path.abspath(a.build or os.path.join(REPO, 'build-linux-arm64' if a.linux_arm64 else 'build-linux'))
         if not a.userdata:
             a.userdata = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ssbu-recomp', 'userdata')
         if not os.path.exists(os.path.join(a.build, 'state.json')):
-            print('no build in %s: run scripts/setup.py --target linux first (BUILDING_LINUX.md)' % a.build)
+            print('no build in %s: run scripts/setup.py --target %s first (BUILDING_LINUX.md)' % (a.build, 'linux-arm64' if a.linux_arm64 else 'linux'))
             return 1
     else:
         a.build = os.path.abspath(a.build or build_location.get())   # the game runs in build\work: a relative --build would point elsewhere there

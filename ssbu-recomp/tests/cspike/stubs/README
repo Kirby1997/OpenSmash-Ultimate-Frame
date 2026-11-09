@@ -1,0 +1,4 @@
+Placeholder versions of headers that scripts/setup.py generates from game data or reference sources
+(sdktest_data.h, eh_tests.h, sdklift_install.h, fake_*.h). Used ONLY by tests/port/check_host.sh so every
+runtime file can be compile-checked without a dump. quad_tests.h is the real output of gen_quad_tests.py.
+Never put these on a real build's include path.

@@ -148,8 +148,8 @@ static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
     (void)cs; (void)tb;
     if (o) wdp("  lock %s: owned\n", name);
 #else
-    DWORD o = (DWORD)cs->__data.__owner;                                   /* glibc: the owner's tid */
-    if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %ld\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (long)cs->__data.__count);
+    DWORD o = (DWORD)(uintptr_t)cs->OwningThread;                          /* Linux: plat's CRITICAL_SECTION keeps the owner's tid */
+    if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %ld\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (long)cs->RecursionCount);
 #endif
     else wdp("  lock %s: free\n", name);
 }

@@ -37,6 +37,7 @@
 #include <signal.h>
 #include <pwd.h>
 #include <unwind.h>
+#include "plat_crash.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -81,6 +82,11 @@ static int dyld_image_of(void *m, const char **path, uintptr_t *base) {
 }
 #else
 #define PLAT_SO_EXT ".so"
+#endif
+/* aarch64 Linux (the Steam Frame): fibers switch with fiber_switch_a64 below, thread and fiber stacks are placed below
+ * 2^47 (low_stack). PLAT_LINUX_PATHS_ON_MAC (tests/port/threads/run.sh mac) compiles the same code on macOS arm64. */
+#if defined(__aarch64__) && (defined(__linux__) || defined(PLAT_LINUX_PATHS_ON_MAC))
+#define PLAT_A64_LINUX 1
 #endif
 static pid_t os_tid(void) {                    /* the kernel's id of the calling thread */
 #ifdef __APPLE__
@@ -221,8 +227,70 @@ static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), vo
     if (r == -1 && (e == ETIMEDOUT || e == EINVAL)) { t_lasterr = 1460; return FALSE; }      /* ERROR_TIMEOUT */
     return TRUE;
 }
+#ifdef PLAT_LINUX_SYNC
+/* CRITICAL_SECTION (plat/windows.h): a futex word (0 free, 1 held, 2 held and maybe waited on) under Windows' owner and
+ * recursion fields. The owner is a thread id, as on Windows: a thread that enters while it is the owner only counts up
+ * (also when the entering code is another fiber than the one that took it, as on Windows), and LeaveCriticalSection
+ * releases whoever calls it, so a fiber that took the lock on one host thread can leave it on another. Before it waits
+ * the lock spins a while on a free word (the game's mutexes are held for short stretches). */
+static inline void cs_relax(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+static int cs_try(CRITICAL_SECTION *cs) {
+    uint32_t z = 0;
+    return __atomic_compare_exchange_n(&cs->Lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE);
+}
+static void cs_wait(CRITICAL_SECTION *cs) {                /* the word is taken: spin a while, then the futex */
+    for (int i = 0; i < 100; i++) {
+        cs_relax();
+        if (__atomic_load_n(&cs->Lock, __ATOMIC_RELAXED) == 0 && cs_try(cs)) return;
+    }
+    while (__atomic_exchange_n(&cs->Lock, 2, __ATOMIC_ACQUIRE) != 0) futex(&cs->Lock, FUTEX_WAIT_PRIVATE, 2, NULL);
+}
+/* As Windows' RtlEnterCriticalSection: the word first, the owner (an acquire load) only when the word is taken. A thread
+ * whose old id is still in OwningThread (a fiber took the lock here, moved, and left it on another thread) takes a free
+ * lock afresh instead of counting up on a stale owner. */
+void InitializeCriticalSection(CRITICAL_SECTION *cs) { memset(cs, 0, sizeof *cs); }
+void EnterCriticalSection(CRITICAL_SECTION *cs) {
+    HANDLE me = (HANDLE)(uintptr_t)GetCurrentThreadId();
+    if (!cs_try(cs)) {
+        if (__atomic_load_n(&cs->OwningThread, __ATOMIC_ACQUIRE) == me) { cs->RecursionCount++; return; }
+        cs_wait(cs);
+    }
+    __atomic_store_n(&cs->OwningThread, me, __ATOMIC_RELAXED);
+    cs->RecursionCount = 1;
+}
+BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) {
+    HANDLE me = (HANDLE)(uintptr_t)GetCurrentThreadId();
+    if (!cs_try(cs)) {
+        if (__atomic_load_n(&cs->OwningThread, __ATOMIC_ACQUIRE) == me) { cs->RecursionCount++; return TRUE; }
+        return FALSE;
+    }
+    __atomic_store_n(&cs->OwningThread, me, __ATOMIC_RELAXED);
+    cs->RecursionCount = 1;
+    return TRUE;
+}
+void LeaveCriticalSection(CRITICAL_SECTION *cs) {
+    if (cs->RecursionCount <= 0) {                        /* not entered: Windows corrupts the section; here it is said once */
+        static volatile int said;
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) fprintf(stderr, "plat: LeaveCriticalSection(%p) of a section nobody entered\n", (void *)cs);
+        return;
+    }
+    if (--cs->RecursionCount) return;
+    __atomic_store_n(&cs->OwningThread, (HANDLE)0, __ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&cs->Lock, 0, __ATOMIC_RELEASE) == 2) futex(&cs->Lock, FUTEX_WAKE_PRIVATE, 1, NULL);
+}
+/* As on Windows the section is left once for the wait (callers have entered it once) and entered again after it. */
+static void cs_unlock(void *l) { LeaveCriticalSection(l); }
+static void cs_lock(void *l) { EnterCriticalSection(l); }
+#else
 static void cs_unlock(void *l) { pthread_mutex_unlock(l); }
 static void cs_lock(void *l) { pthread_mutex_lock(l); }
+#endif
 static void srw_unlock(void *l) { pthread_rwlock_unlock(l); }
 static void srw_lock_x(void *l) { pthread_rwlock_wrlock(l); }
 static void srw_lock_s(void *l) { pthread_rwlock_rdlock(l); }
@@ -232,6 +300,7 @@ BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULO
 }
 void WakeConditionVariable(CONDITION_VARIABLE *cv) { __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST); futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL); }
 void WakeAllConditionVariable(CONDITION_VARIABLE *cv) { __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST); futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL); }
+#ifndef PLAT_LINUX_SYNC                           /* (Linux: above) */
 void InitializeCriticalSection(CRITICAL_SECTION *cs) {         /* a CRITICAL_SECTION is re-entrant on Windows: a recursive mutex */
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
@@ -239,6 +308,7 @@ void InitializeCriticalSection(CRITICAL_SECTION *cs) {         /* a CRITICAL_SEC
     pthread_mutex_init(cs, &a);
     pthread_mutexattr_destroy(&a);
 }
+#endif
 BOOL InitOnceExecuteOnce(INIT_ONCE *once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx) {
     /* 0 not run, 1 running, 2 done. Per object (a callback may start another init-once); a failed callback lets the next caller retry. */
     for (;;) {
@@ -288,6 +358,9 @@ typedef struct PlatObj {
 #if defined(__linux__) && defined(__x86_64__)
     volatile uint32_t sus_ack, sus_gen; LONG sus_count; CONTEXT sus_ctx;    /* SuspendThread */
 #endif
+#ifdef PLAT_A64_LINUX
+    void *stack_map; size_t stack_map_size;      /* the thread's own stack (low_stack), guard page included */
+#endif
     /* files, finds, mappings */
     int fd;
     DIR *dir; char dir_path[MAX_PATH]; char pattern[MAX_PATH];
@@ -325,10 +398,60 @@ static int is_tagged(HANDLE h, uint64_t tag) { return ((uint64_t)(uintptr_t)h & 
 static int is_obj(HANDLE h) { return h && h != INVALID_HANDLE_VALUE && h != PSEUDO_THREAD && h != PSEUDO_PROCESS && !is_tagged(h, FD_TAG) && !is_tagged(h, PID_TAG); }
 
 /* threads */
+#ifdef PLAT_LINUX_SYNC
+static void fls_thread_end(void);
+#endif
+#ifdef PLAT_A64_LINUX
+/* aarch64 Linux: glibc maps a thread's stack at the top of the address space (above 2^47 on the Frame) and puts the
+ * thread's TLS block (the __thread variables; the guest is handed some of their addresses: errno, h_errno,
+ * gethostbyname's result) in that mapping. CreateThread gives every thread a stack from low_stack instead, below 2^47
+ * with a 64 KB guard under it, and glibc then puts the TLS block there too. glibc does not free a stack it was given:
+ * a thread that ends puts its stack on g_dead as its last step, and a later CreateThread joins those that have ended
+ * and unmaps their stacks. */
+#define STACK_GUARD 0x10000u
+static void *low_stack(size_t size, size_t guard);
+typedef struct DeadStack { struct DeadStack *next; pthread_t th; void *map; size_t size; } DeadStack;
+static DeadStack *g_dead;
+static pthread_mutex_t g_dead_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Joins only threads that have ended (pthread_tryjoin_np: no waiting on another thread's exit destructors, which may want a
+ * lock the caller holds); the others stay listed for a later call. Never the calling thread's own entry (a destructor that
+ * runs after the thread listed itself, an FLS callback say, may call CreateThread). The macOS check has no tryjoin: there
+ * it joins, which waits. */
+static void dead_reap(void) {
+    pthread_mutex_lock(&g_dead_lock);
+    DeadStack *d = g_dead, *keep = NULL, *last = NULL;
+    g_dead = NULL;
+    pthread_mutex_unlock(&g_dead_lock);
+    while (d) {
+        DeadStack *n = d->next;
+#ifdef __APPLE__
+        int done = !pthread_equal(d->th, pthread_self()) && pthread_join(d->th, NULL) == 0;
+#else
+        int done = !pthread_equal(d->th, pthread_self()) && pthread_tryjoin_np(d->th, NULL) == 0;
+#endif
+        if (done) { munmap(d->map, d->size); free(d); }
+        else { d->next = keep; keep = d; if (!last) last = d; }
+        d = n;
+    }
+    if (!keep) return;
+    pthread_mutex_lock(&g_dead_lock);
+    last->next = g_dead; g_dead = keep;
+    pthread_mutex_unlock(&g_dead_lock);
+}
+/* An ending thread hands back the pages of its stack below where it runs now (they read as zeros if touched again), so
+ * the stacks of the last threads to end hold no memory while no CreateThread comes to unmap them; the address range stays. */
+static void stack_trim(void *map, size_t size) {
+    uintptr_t lo = (uintptr_t)map + STACK_GUARD, top = ((uintptr_t)__builtin_frame_address(0) - 0x4000) & ~(uintptr_t)0xfff;
+    if (top > lo && top < (uintptr_t)map + size) madvise((void *)lo, top - lo, MADV_DONTNEED);
+}
+#endif
 static __thread PlatObj *t_self;
 static PlatObj *g_thr[1024]; static int g_nthr; static pthread_mutex_t g_thr_lock = PTHREAD_MUTEX_INITIALIZER;   /* live threads of CreateThread */
 static void *thread_tramp(void *p) {
     PlatObj *o = p;
+#ifdef SSBU_ASYNC_CRASH
+    crash_thread_init();                       /* alternate signal stack: a stack overflow on this thread still gets its crash report (plat_crash.c) */
+#endif
     t_self = o;
     plat_current_stack(&o->stk_lo, &o->stk_hi);
     pthread_mutex_lock(&g_thr_lock); if (g_nthr < 1024) g_thr[g_nthr++] = o; pthread_mutex_unlock(&g_thr_lock);
@@ -337,12 +460,29 @@ static void *thread_tramp(void *p) {
     while (!o->started) pthread_cond_wait(&o->cv, &o->m);     /* CREATE_SUSPENDED: held until ResumeThread */
     pthread_mutex_unlock(&o->m);
     DWORD r = o->fn(o->arg);
+#ifdef PLAT_LINUX_SYNC
+    fls_thread_end();                                         /* FLS callbacks before the handle is signalled, as on Windows */
+#endif
     pthread_mutex_lock(&g_thr_lock); for (int i = 0; i < g_nthr; i++) if (g_thr[i] == o) { g_thr[i] = g_thr[--g_nthr]; break; } pthread_mutex_unlock(&g_thr_lock);
+#ifdef PLAT_A64_LINUX
+    void *map = o->stack_map;
+    size_t map_size = o->stack_map_size;
+#endif
     pthread_mutex_lock(&o->m);
     o->exit_code = r; o->signaled = 1;
     pthread_cond_broadcast(&o->cv);
     pthread_mutex_unlock(&o->m);
     obj_release(o);
+#ifdef PLAT_A64_LINUX
+    stack_trim(map, map_size);
+    DeadStack *d = malloc(sizeof *d);                         /* (no memory: the stack stays mapped) */
+    if (d) {
+        d->th = pthread_self(); d->map = map; d->size = map_size;
+        pthread_mutex_lock(&g_dead_lock);
+        d->next = g_dead; g_dead = d;
+        pthread_mutex_unlock(&g_dead_lock);
+    }
+#endif
     return NULL;
 }
 HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags, DWORD *tid) {
@@ -351,10 +491,23 @@ HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTIN
     o->fn = fn; o->arg = arg; o->refs = 2; o->started = !(flags & CREATE_SUSPENDED); o->exit_code = STILL_ACTIVE;
     pthread_attr_t a;
     pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, stack ? (stack < (1 << 20) ? (1 << 20) : stack) : (SIZE_T)8 << 20);   /* Windows default: 1 MB; ours: 8 MB */
+    SIZE_T size = stack ? (stack < (1 << 20) ? (1 << 20) : stack) : (SIZE_T)8 << 20;   /* Windows default: 1 MB; ours: 8 MB */
+#ifdef PLAT_A64_LINUX
+    dead_reap();
+    size = (size + 0xffff) & ~(SIZE_T)0xffff;
+    o->stack_map = low_stack(size, STACK_GUARD);
+    if (!o->stack_map) { pthread_attr_destroy(&a); free(o); t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
+    o->stack_map_size = size + STACK_GUARD;
+    pthread_attr_setstack(&a, (uint8_t *)o->stack_map + STACK_GUARD, size);   /* joinable: dead_reap joins it */
+#else
+    pthread_attr_setstacksize(&a, size);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+#endif
     int e = pthread_create(&o->th, &a, thread_tramp, o);
     pthread_attr_destroy(&a);
+#ifdef PLAT_A64_LINUX
+    if (e) munmap(o->stack_map, o->stack_map_size);
+#endif
     if (e) { free(o); t_lasterr = err_from_errno(e); return NULL; }
     if (tid) { while (!__atomic_load_n(&o->tid, __ATOMIC_ACQUIRE)) sched_yield(); *tid = (DWORD)o->tid; }
     return o;
@@ -511,30 +664,49 @@ DWORD GetThreadId(HANDLE h) { if (h == PSEUDO_THREAD) return GetCurrentThreadId(
 BOOL GetExitCodeThread(HANDLE h, DWORD *code) { if (!is_obj(h)) return FALSE; *code = ((PlatObj *)h)->exit_code; return TRUE; }
 BOOL SetThreadPriority(HANDLE h, int prio) { (void)h; (void)prio; return TRUE; }   /* no real-time scheduling without privileges */
 int GetThreadPriority(HANDLE h) { (void)h; return THREAD_PRIORITY_NORMAL; }
+/* A thread handle's pthread_t is used only under the object's lock and while the thread has not ended: after that it
+ * names memory that is gone (aarch64 Linux: the stack dead_reap unmapped, glibc's struct pthread inside it; a detached
+ * thread's elsewhere). Returns the object locked, or NULL (not a live thread; nothing locked). */
+static PlatObj *thread_live_lock(HANDLE h) {
+    if (!is_obj(h) || ((PlatObj *)h)->kind != PO_THREAD) return NULL;
+    PlatObj *o = h;
+    pthread_mutex_lock(&o->m);
+    if (!o->signaled) return o;
+    pthread_mutex_unlock(&o->m);
+    return NULL;
+}
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
-    pthread_t th = h == PSEUDO_THREAD ? pthread_self() : is_obj(h) ? ((PlatObj *)h)->th : 0;
-    if (!th || !mask) return 0;
+    if (!mask) return 0;
+    PlatObj *o = h == PSEUDO_THREAD ? NULL : thread_live_lock(h);
+    if (h != PSEUDO_THREAD && !o) return 0;
 #ifndef __APPLE__                                 /* macOS has no thread affinity: the mask is accepted, not applied */
     cpu_set_t set; CPU_ZERO(&set);
     for (int i = 0; i < 64; i++) if (mask >> i & 1) CPU_SET(i, &set);
-    if (pthread_setaffinity_np(th, sizeof set, &set)) return 0;
+    int bad = pthread_setaffinity_np(o ? o->th : pthread_self(), sizeof set, &set);
+    if (o) pthread_mutex_unlock(&o->m);
+    if (bad) return 0;
+#else
+    if (o) pthread_mutex_unlock(&o->m);
 #endif
     return ~(DWORD_PTR)0 >> (64 - (get_nprocs() < 64 ? get_nprocs() : 64));
 }
 /* The kernel's thread name: at most 15 characters (Windows keeps the whole description); non-ASCII becomes '?'. */
 HRESULT SetThreadDescription(HANDLE h, LPCWSTR name) {
-    pthread_t th = h == PSEUDO_THREAD ? pthread_self() : is_obj(h) ? ((PlatObj *)h)->th : 0;
     char s[16];
     int i = 0;
-    if (!th || !name) return E_FAIL;
+    if (!name) return E_FAIL;
     for (; i < 15 && name[i]; i++) s[i] = name[i] < 128 ? (char)name[i] : '?';
     s[i] = 0;
+    PlatObj *o = h == PSEUDO_THREAD ? NULL : thread_live_lock(h);
+    if (h != PSEUDO_THREAD && !o) return E_FAIL;
+    pthread_t th = o ? o->th : pthread_self();
 #ifdef __APPLE__                                  /* macOS names the calling thread only */
-    if (!pthread_equal(th, pthread_self())) return E_FAIL;
-    return pthread_setname_np(s) ? E_FAIL : S_OK;
+    int bad = !pthread_equal(th, pthread_self()) || pthread_setname_np(s);
 #else
-    return pthread_setname_np(th, s) ? E_FAIL : S_OK;
+    int bad = pthread_setname_np(th, s) != 0;
 #endif
+    if (o) pthread_mutex_unlock(&o->m);
+    return bad ? E_FAIL : S_OK;
 }
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     (void)p;
@@ -700,18 +872,62 @@ DWORD TlsAlloc(void) { pthread_key_t k; return pthread_key_create(&k, NULL) ? TL
 BOOL TlsFree(DWORD i) { return pthread_key_delete((pthread_key_t)i) == 0; }
 LPVOID TlsGetValue(DWORD i) { return pthread_getspecific((pthread_key_t)i); }
 BOOL TlsSetValue(DWORD i, LPVOID v) { return pthread_setspecific((pthread_key_t)i, v) == 0; }
+#ifndef PLAT_LINUX_SYNC                           /* (Linux: with the fibers below) */
 /* FLS: the callback runs when a thread ends (pthread key destructor); Windows also runs it when a fiber is deleted. */
 DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION cb) { pthread_key_t k; return pthread_key_create(&k, cb) ? FLS_OUT_OF_INDEXES : (DWORD)k; }
 BOOL FlsFree(DWORD i) { return pthread_key_delete((pthread_key_t)i) == 0; }
 PVOID FlsGetValue(DWORD i) { return pthread_getspecific((pthread_key_t)i); }
 BOOL FlsSetValue(DWORD i, PVOID v) { return pthread_setspecific((pthread_key_t)i, v) == 0; }
+#endif
 
 /* ================================================================ fibers
  * As on Windows a fiber can be resumed on another thread than the one it last ran on (the running fiber is per thread:
- * t_fiber). A switch saves and loads the callee-saved registers by hand (Linux x86-64, macOS on Apple Silicon), elsewhere
- * on ucontext (swapcontext also saves and restores the signal mask, one system call per switch). The stack is reserved
- * whole at creation (MAP_NORESERVE: pages are used as touched), not grown from a commit size. */
-#if defined(__APPLE__) && defined(__aarch64__)
+ * t_fiber). A switch saves and loads the callee-saved registers by hand (Linux x86-64, Linux aarch64, macOS on Apple
+ * Silicon), elsewhere on ucontext (swapcontext also saves and restores the signal mask, one system call per switch). The
+ * stack is reserved whole at creation (MAP_NORESERVE: pages are used as touched), not grown from a commit size; on Linux
+ * aarch64 it lies below 2^47 (low_stack). */
+#ifdef PLAT_LINUX_SYNC
+typedef struct PlatFls PlatFls;
+#define FIBER_FLS PlatFls *fls;                          /* the fiber's FLS values (NULL until one is set) */
+#else
+#define FIBER_FLS
+#endif
+#if defined(PLAT_A64_LINUX)
+/* aarch64 Linux: no ucontext (swapcontext is a system call per switch, for the signal mask). The switch saves exactly
+ * what AAPCS64 asks a callee to keep: x19-x28, fp, lr, sp and d8-d15 (the low halves of v8-v15; SVE / SME state is not
+ * callee-saved for an ordinary call), and FPCR, which is per fiber: saved on every switch, written back only when it
+ * differs (the msr is the costly part), so a fiber's rounding / flush-to-zero mode does not leak into the next one on
+ * the thread. x18 is a temporary on Linux (no shadow call stack here). `bti c` is a landing pad (a NOP without BTI);
+ * the switch never signs lr itself: callers' paciasp / autiasp pairs stay balanced because sp comes back with lr. A
+ * new fiber's first switch "returns" into fiber_entry on its own stack, with fp = 0 (the end of a frame-chain walk).
+ * The signal mask is not switched. No GCS (guarded control stack) switch: the Frame's cores have no GCS. The stack lies
+ * below 2^47 (low_stack) above a 64 KB guard. */
+typedef struct { uint64_t r[13]; uint64_t d[8]; uint64_t fpcr; } FiberRegs;    /* r: x19..x28, fp, lr, sp */
+void fiber_switch_a64(FiberRegs *from, FiberRegs *to);
+#ifdef __APPLE__                                  /* the macOS check (PLAT_LINUX_PATHS_ON_MAC): Mach-O spelling */
+#define FIBER_SYM "_fiber_switch_a64"
+#define FIBER_SYM_HEAD ".private_extern " FIBER_SYM "\n"
+#define FIBER_SYM_TAIL ""
+#else
+#define FIBER_SYM "fiber_switch_a64"
+#define FIBER_SYM_HEAD ".hidden " FIBER_SYM "\n.type " FIBER_SYM ", %function\n"
+#define FIBER_SYM_TAIL ".size " FIBER_SYM ", .-" FIBER_SYM "\n"
+#endif
+__asm__(".text\n.globl " FIBER_SYM "\n" FIBER_SYM_HEAD ".p2align 4\n" FIBER_SYM ":\n"
+        "  hint #34\n"                                                                  /* bti c */
+        "  mov x9, sp\n"
+        "  stp x19, x20, [x0, #0]\n  stp x21, x22, [x0, #16]\n  stp x23, x24, [x0, #32]\n  stp x25, x26, [x0, #48]\n"
+        "  stp x27, x28, [x0, #64]\n  stp x29, x30, [x0, #80]\n  str x9, [x0, #96]\n"
+        "  stp d8, d9, [x0, #104]\n  stp d10, d11, [x0, #120]\n  stp d12, d13, [x0, #136]\n  stp d14, d15, [x0, #152]\n"
+        "  mrs x10, fpcr\n  str x10, [x0, #168]\n"
+        "  ldp x19, x20, [x1, #0]\n  ldp x21, x22, [x1, #16]\n  ldp x23, x24, [x1, #32]\n  ldp x25, x26, [x1, #48]\n"
+        "  ldp x27, x28, [x1, #64]\n  ldp x29, x30, [x1, #80]\n  ldr x9, [x1, #96]\n  mov sp, x9\n"
+        "  ldp d8, d9, [x1, #104]\n  ldp d10, d11, [x1, #120]\n  ldp d12, d13, [x1, #136]\n  ldp d14, d15, [x1, #152]\n"
+        "  ldr x11, [x1, #168]\n  cmp x10, x11\n  b.eq 1f\n  msr fpcr, x11\n"
+        "1: ret\n" FIBER_SYM_TAIL);
+_Static_assert(__builtin_offsetof(FiberRegs, d) == 104 && __builtin_offsetof(FiberRegs, fpcr) == 168, "fiber_switch_a64 offsets");
+typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; FIBER_FLS } Fiber;
+#elif defined(__APPLE__) && defined(__aarch64__)
 /* macOS on Apple Silicon has no working ucontext: a switch of the callee-saved registers instead (x19-x28, fp, lr, sp,
  * d8-d15; everything else is the caller's to keep across a call). A new fiber's first switch "returns" into fiber_entry
  * on its own stack. The signal mask is not switched (ucontext did that with one system call per switch). */
@@ -741,26 +957,168 @@ __asm__(".text\n.globl plat_fiber_switch\n.hidden plat_fiber_switch\n.type plat_
         "  movq 8(%rsi), %rbx\n  movq 16(%rsi), %rbp\n  movq 24(%rsi), %r12\n  movq 32(%rsi), %r13\n  movq 40(%rsi), %r14\n  movq 48(%rsi), %r15\n"
         "  ldmxcsr 56(%rsi)\n  fldcw 60(%rsi)\n"
         "  ret\n.size plat_fiber_switch, .-plat_fiber_switch\n");
-typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; } Fiber;
+typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; FIBER_FLS } Fiber;
 #else
-typedef struct { ucontext_t uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; } Fiber;
+typedef struct { ucontext_t uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; FIBER_FLS } Fiber;
 #endif
 static __thread Fiber *t_fiber;
+#ifdef PLAT_LINUX_SYNC
+/* ---- fiber-local storage (Linux)
+ * One value set (PlatFls) per fiber (Fiber.fls) and per thread (t_fls_own, used while no fiber is current on it), made
+ * at the first non-NULL FlsSetValue. FlsGetValue / FlsSetValue use the set of the calling thread's current fiber
+ * (t_fiber), so the values go with the fiber when another thread resumes it (the game's fiber jobs: nncxxrt.c's
+ * exception state, nnunwind.c's records, fighter_host.c's per-fiber block). Only the thread running a fiber touches its
+ * set, without a lock; the slots are atomics because FlsFree and the end of a set take values out of them under
+ * g_fls_lock, which also holds the list of all sets. Callbacks run with no lock held: on DeleteFiber, on FlsFree, and
+ * at the end of a thread for the current fiber's set and the thread's own (CreateThread threads before the handle is
+ * signalled, other threads from a pthread key destructor; up to 4 rounds when a callback sets values again). */
+struct PlatFls { PlatFls *prev, *next; void *v[FLS_MAXIMUM_AVAILABLE]; };
+static pthread_mutex_t g_fls_lock = PTHREAD_MUTEX_INITIALIZER;
+static PlatFls g_fls_all = {&g_fls_all, &g_fls_all, {0}};
+static uint8_t g_fls_used[FLS_MAXIMUM_AVAILABLE];          /* 0 free, 1 allocated, 2 FlsFree running (written under the lock) */
+static PFLS_CALLBACK_FUNCTION g_fls_cb[FLS_MAXIMUM_AVAILABLE];
+static __thread PlatFls *t_fls_own;
+static __thread int t_fls_armed;
+static pthread_key_t g_fls_key;
+static pthread_once_t g_fls_once = PTHREAD_ONCE_INIT;
+static void fls_key_dtor(void *p) { (void)p; t_fls_armed = 0; fls_thread_end(); }
+static void fls_key_init(void) { if (pthread_key_create(&g_fls_key, fls_key_dtor)) { fprintf(stderr, "plat: FLS: no pthread key\n"); ExitProcess(3); } }
+static void fls_arm(void) {                               /* the end of this thread frees the sets it has then */
+    if (t_fls_armed) return;
+    pthread_once(&g_fls_once, fls_key_init);
+    t_fls_armed = 1;
+    pthread_setspecific(g_fls_key, (void *)1);
+}
+static PlatFls **fls_cur(void) { Fiber *f = t_fiber; return f ? &f->fls : &t_fls_own; }
+static void fls_set_free(PlatFls *s) {                    /* off the list, then the callbacks of its values, then freed */
+    if (!s) return;
+    PFLS_CALLBACK_FUNCTION cb[FLS_MAXIMUM_AVAILABLE];
+    void *val[FLS_MAXIMUM_AVAILABLE];
+    int n = 0;
+    pthread_mutex_lock(&g_fls_lock);
+    s->prev->next = s->next; s->next->prev = s->prev;
+    for (int i = 0; i < FLS_MAXIMUM_AVAILABLE; i++) {
+        void *v = __atomic_exchange_n(&s->v[i], NULL, __ATOMIC_RELAXED);
+        if (v && g_fls_used[i] && g_fls_cb[i]) { cb[n] = g_fls_cb[i]; val[n] = v; n++; }
+    }
+    pthread_mutex_unlock(&g_fls_lock);
+    free(s);
+    for (int k = 0; k < n; k++) cb[k](val[k]);
+}
+static void fls_thread_end(void) {
+    for (int round = 0; round < 4; round++) {
+        Fiber *f = t_fiber;
+        PlatFls *a = f ? f->fls : NULL, *b = t_fls_own;
+        if (f) f->fls = NULL;
+        t_fls_own = NULL;
+        if (!a && !b) return;
+        fls_set_free(a);
+        fls_set_free(b);
+    }
+}
+DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION cb) {               /* index 0 is not handed out: a zeroed index is never valid */
+    pthread_mutex_lock(&g_fls_lock);
+    for (DWORD i = 1; i < FLS_MAXIMUM_AVAILABLE; i++) {
+        if (g_fls_used[i]) continue;
+        g_fls_cb[i] = cb;
+        __atomic_store_n(&g_fls_used[i], 1, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_fls_lock);
+        return i;
+    }
+    pthread_mutex_unlock(&g_fls_lock);
+    t_lasterr = 259;                                      /* ERROR_NO_MORE_ITEMS */
+    return FLS_OUT_OF_INDEXES;
+}
+/* Every set's value in the slot goes to the callback (the lock is let go around each call, and the scan starts over);
+ * the index is handed out again only after that. */
+BOOL FlsFree(DWORD i) {
+    pthread_mutex_lock(&g_fls_lock);
+    if (i >= FLS_MAXIMUM_AVAILABLE || g_fls_used[i] != 1) { pthread_mutex_unlock(&g_fls_lock); t_lasterr = ERROR_INVALID_PARAMETER; return FALSE; }
+    PFLS_CALLBACK_FUNCTION cb = g_fls_cb[i];
+    __atomic_store_n(&g_fls_used[i], 2, __ATOMIC_RELAXED);    /* Get / Set fail from here on */
+    for (;;) {
+        void *v = NULL;
+        for (PlatFls *s = g_fls_all.next; s != &g_fls_all && !v; s = s->next) v = __atomic_exchange_n(&s->v[i], NULL, __ATOMIC_RELAXED);
+        if (!v) break;
+        if (!cb) continue;
+        pthread_mutex_unlock(&g_fls_lock);
+        cb(v);
+        pthread_mutex_lock(&g_fls_lock);
+    }
+    g_fls_cb[i] = NULL;
+    __atomic_store_n(&g_fls_used[i], 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_fls_lock);
+    return TRUE;
+}
+PVOID FlsGetValue(DWORD i) {
+    if (i >= FLS_MAXIMUM_AVAILABLE || __atomic_load_n(&g_fls_used[i], __ATOMIC_ACQUIRE) != 1) { t_lasterr = ERROR_INVALID_PARAMETER; return NULL; }
+    PlatFls *s = *fls_cur();
+    return s ? __atomic_load_n(&s->v[i], __ATOMIC_RELAXED) : NULL;
+}
+BOOL FlsSetValue(DWORD i, PVOID v) {
+    if (i >= FLS_MAXIMUM_AVAILABLE || __atomic_load_n(&g_fls_used[i], __ATOMIC_ACQUIRE) != 1) { t_lasterr = ERROR_INVALID_PARAMETER; return FALSE; }
+    PlatFls **ref = fls_cur(), *s = *ref;
+    if (!s) {
+        if (!v) return TRUE;
+        if (!(s = calloc(1, sizeof *s))) { t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return FALSE; }
+        pthread_mutex_lock(&g_fls_lock);
+        s->prev = &g_fls_all; s->next = g_fls_all.next;
+        g_fls_all.next->prev = s; g_fls_all.next = s;
+        pthread_mutex_unlock(&g_fls_lock);
+        *ref = s;
+        fls_arm();
+    }
+    __atomic_store_n(&s->v[i], v, __ATOMIC_RELAXED);
+    return TRUE;
+}
+/* tests (tests/port/threads): FLS value sets alive now */
+size_t plat_fls_sets(void) {
+    size_t n = 0;
+    pthread_mutex_lock(&g_fls_lock);
+    for (PlatFls *s = g_fls_all.next; s != &g_fls_all; s = s->next) n++;
+    pthread_mutex_unlock(&g_fls_lock);
+    return n;
+}
+#endif
 LPVOID ConvertThreadToFiber(LPVOID param) {
     if (t_fiber) return t_fiber;
     Fiber *f = calloc(1, sizeof *f);
     f->param = param; f->is_thread = 1;
+#ifdef PLAT_LINUX_SYNC
+    f->fls = t_fls_own;                                   /* the thread's FLS values become the fiber's, as on Windows */
+    t_fls_own = NULL;
+    fls_arm();
+#endif
     t_fiber = f;
     if (t_self) t_self->fiber = f;
     return f;
 }
-BOOL ConvertFiberToThread(void) { if (t_fiber && t_fiber->is_thread) free(t_fiber); t_fiber = NULL; return TRUE; }
+BOOL ConvertFiberToThread(void) {
+#ifdef PLAT_LINUX_SYNC
+    if (t_fiber && !t_fls_own) { t_fls_own = t_fiber->fls; t_fiber->fls = NULL; }    /* the values stay with the thread */
+    else if (t_fiber && t_fiber->is_thread) { PlatFls *s = t_fiber->fls; t_fiber->fls = NULL; fls_set_free(s); }   /* (it has its own already) */
+#endif
+    if (t_fiber && t_fiber->is_thread) free(t_fiber);
+    t_fiber = NULL;
+    return TRUE;
+}
 static void fiber_entry(void) { Fiber *f = t_fiber; f->fn(f->param); fprintf(stderr, "plat: a fiber returned\n"); ExitProcess(3); }
 LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_ROUTINE fn, LPVOID param) {
     (void)commit; (void)flags;
     Fiber *f = calloc(1, sizeof *f);
     f->fn = fn; f->param = param;
     f->stack_size = reserve ? reserve : (SIZE_T)1 << 20;
+#if defined(PLAT_A64_LINUX)
+    f->stack_size = (f->stack_size + 0xffff) & ~(size_t)0xffff;
+    uint8_t *m = low_stack(f->stack_size, STACK_GUARD);
+    if (!m) { free(f); return NULL; }
+    f->stack = m + STACK_GUARD;
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    f->uc.r[11] = (uint64_t)(uintptr_t)fiber_entry;                                     /* lr */
+    f->uc.r[12] = ((uint64_t)(uintptr_t)f->stack + f->stack_size) & ~(uint64_t)15;      /* sp */
+    f->uc.fpcr = fpcr;                                                                  /* the creator's mode */
+#else
     f->stack = mmap(NULL, f->stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
     if (f->stack == MAP_FAILED) { free(f); return NULL; }
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -779,14 +1137,22 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     f->uc.uc_stack.ss_sp = f->stack; f->uc.uc_stack.ss_size = f->stack_size; f->uc.uc_link = NULL;
     makecontext(&f->uc, fiber_entry, 0);
 #endif
+#endif
     return f;
 }
+/* Nothing here touches a thread variable after the switch: it may return on another thread (the one that resumed the
+ * fiber has set t_fiber for itself). */
 void SwitchToFiber(LPVOID fiber) {
     Fiber *from = t_fiber, *to = fiber;
     if (from == to) return;
     t_fiber = to;
     if (t_self) t_self->fiber = to;
-#if (defined(__APPLE__) && defined(__aarch64__)) || (defined(__linux__) && defined(__x86_64__))
+#ifdef PLAT_LINUX_SYNC
+    if (to->fls && !t_fls_armed) fls_arm();               /* this thread may end while running it: its values are freed then */
+#endif
+#if defined(PLAT_A64_LINUX)
+    fiber_switch_a64(&from->uc, &to->uc);
+#elif (defined(__APPLE__) && defined(__aarch64__)) || (defined(__linux__) && defined(__x86_64__))
     plat_fiber_switch(&from->uc, &to->uc);
 #else
     swapcontext(&from->uc, &to->uc);
@@ -796,7 +1162,16 @@ void DeleteFiber(LPVOID fiber) {
     Fiber *f = fiber;
     if (!f) return;
     if (f == t_fiber) { fprintf(stderr, "plat: DeleteFiber of the running fiber\n"); ExitProcess(3); }
+#ifdef PLAT_LINUX_SYNC
+    PlatFls *s = f->fls;
+    f->fls = NULL;
+    fls_set_free(s);                                      /* DeleteFiber runs the fiber's FLS callbacks, as on Windows */
+#endif
+#if defined(PLAT_A64_LINUX)
+    if (f->stack) munmap((uint8_t *)f->stack - STACK_GUARD, f->stack_size + STACK_GUARD);
+#else
     if (f->stack) munmap(f->stack, f->stack_size);
+#endif
     free(f);
 }
 LPVOID GetCurrentFiber(void) { return t_fiber; }
@@ -819,10 +1194,12 @@ int plat_fiber_stack_of(const void *fiber, uint64_t *lo, uint64_t *hi, uint64_t 
     const Fiber *f = fiber;
     if (!f || f->is_thread || !f->stack) return 0;
     *lo = (uint64_t)(uintptr_t)f->stack; *hi = *lo + f->stack_size;
-#if defined(__APPLE__) && defined(__aarch64__)
-    *sp = f->uc.r[12];
+#if defined(PLAT_A64_LINUX) || (defined(__APPLE__) && defined(__aarch64__))
+    *sp = f->uc.r[12];                                  /* FiberRegs r[12] = sp (both aarch64 switches) */
 #elif defined(__linux__) && defined(__x86_64__)
     *sp = f->uc.rsp;
+#elif defined(__APPLE__) && defined(__x86_64__)               /* ucontext on macOS x86-64: only tests/port/threads' x86-64 check builds it */
+    *sp = (uint64_t)f->uc.uc_mcontext->__ss.__rsp;
 #else
     *sp = (uint64_t)f->uc.uc_mcontext.gregs[REG_RSP];
 #endif
@@ -840,6 +1217,39 @@ int plat_thread_stacks(uint64_t (*out)[2], int max) {
     if (m) fclose(m);
     return n;
 }
+#ifndef __APPLE__
+/* rb_net.c's handshake note "the other game's exe is another build": Windows reads the PE link time stamp. An ELF file has
+ * none; the GNU build id (a hash of the linked contents, the same in every copy of one build) stands in, its first 4 bytes;
+ * without one (linked without --build-id) the exe's modification time. dl_iterate_phdr reports the exe first. */
+static int exe_build_id(struct dl_phdr_info *in, size_t size, void *out) {
+    (void)size;
+    for (int k = 0; k < in->dlpi_phnum; k++) {
+        const ElfW(Phdr) *ph = &in->dlpi_phdr[k];
+        if (ph->p_type != PT_NOTE) continue;
+        size_t al = ph->p_align == 8 ? 8 : 4;
+        const uint8_t *p = (const uint8_t *)(in->dlpi_addr + ph->p_vaddr), *e = p + ph->p_memsz;
+        while (p + 12 <= e) {
+            uint32_t nsz, dsz, type; memcpy(&nsz, p, 4); memcpy(&dsz, p + 4, 4); memcpy(&type, p + 8, 4);
+            const uint8_t *name = p + 12, *desc = name + ((nsz + al - 1) & ~(al - 1));
+            if (desc + dsz > e) break;
+            if (type == NT_GNU_BUILD_ID && nsz == 4 && !memcmp(name, "GNU", 4) && dsz >= 4) { memcpy(out, desc, 4); return 1; }
+            p = desc + ((dsz + al - 1) & ~(al - 1));
+        }
+    }
+    return 1;                                           /* the exe only */
+}
+uint32_t plat_exe_stamp(void) {
+    static uint32_t s;
+    uint32_t v = __atomic_load_n(&s, __ATOMIC_RELAXED);
+    if (!v) {                                           /* the same value from every thread: a race only computes it twice */
+        struct stat st;
+        dl_iterate_phdr(exe_build_id, &v);
+        if (!v && !stat("/proc/self/exe", &st)) v = (uint32_t)st.st_mtime;
+        __atomic_store_n(&s, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+#endif
 /* nnunwind.c: the bounds of the stack this thread runs on now: the running fiber's, else the thread's own */
 int plat_current_stack(uintptr_t *lo, uintptr_t *hi) {
     if (plat_current_fiber_stack(lo, hi)) return 1;
@@ -849,11 +1259,16 @@ int plat_current_stack(uintptr_t *lo, uintptr_t *hi) {
     *lo = *hi - pthread_get_stacksize_np(t);
     return 1;
 #else
-    pthread_attr_t a; void *base; size_t sz;
-    if (pthread_getattr_np(pthread_self(), &a)) return 0;
-    pthread_attr_getstack(&a, &base, &sz);
-    pthread_attr_destroy(&a);
-    *lo = (uintptr_t)base; *hi = (uintptr_t)base + sz;
+    static __thread uintptr_t t_lo, t_hi;              /* once per thread: glibc reads /proc/self/maps for the main thread's */
+    if (!t_hi) {
+        pthread_attr_t a; void *base; size_t sz;
+        if (pthread_getattr_np(pthread_self(), &a)) return 0;
+        int bad = pthread_attr_getstack(&a, &base, &sz);
+        pthread_attr_destroy(&a);
+        if (bad) return 0;
+        t_lo = (uintptr_t)base; t_hi = t_lo + sz;
+    }
+    *lo = t_lo; *hi = t_hi;
     return 1;
 #endif
 }
@@ -1181,6 +1596,48 @@ void plat_map_retry(const char *what, unsigned long long want) {
     (void)what; (void)want;
 #endif
 }
+#if defined(__aarch64__) && !defined(__APPLE__)   /* Linux aarch64 only: macOS keeps its own placement (and host-page sizes, nm) */
+/* aarch64 hosts (48-bit VA): mmap(NULL) hands out the top-down area at 0xffff_xxxx_xxxx, above the 2^47 a Windows process (and
+ * the guest's 47-bit pointers) never saw. VirtualAlloc(NULL) is placed instead from just above the guest's fixed addresses
+ * (image 0x71_0000_0000 and the NRO/rollback ranges below 0x76_0000_0000) upward, below 2^47: a bump cursor probed with
+ * MAP_FIXED_NOREPLACE (no extra syscall in the common case), wrapping at 2^47 so released ranges get reused. Called with
+ * g_vm_lock held. Returns MAP_FAILED when nothing below 2^47 is free: never a pointer above it. */
+#define LOW_START 0x7600000000ULL
+#define LOW_END   0x800000000000ULL
+static uintptr_t g_low_cursor = LOW_START;
+static void *low_place(size_t n, int prot, int flags) {
+    size_t step = (n + 0xffff) & ~(size_t)0xffff;
+    uintptr_t at = g_low_cursor;
+    for (int tries = 0; tries < 4096; tries++) {
+        if (at + n > LOW_END || at < LOW_START) at = LOW_START;
+        void *p = mmap((void *)at, n, prot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED && (uintptr_t)p == at) { g_low_cursor = at + step; return p; }
+        if (p != MAP_FAILED) munmap(p, n);          /* kernel without MAP_FIXED_NOREPLACE put it elsewhere */
+        else if (errno != EEXIST) return MAP_FAILED;
+        at += tries < 64 ? step : 1ULL << 30;       /* step past what is there, then jump by 1 GiB */
+        at &= ~(uintptr_t)0xffff;
+    }
+    errno = ENOMEM;
+    return MAP_FAILED;
+}
+#endif
+#ifdef PLAT_A64_LINUX
+/* (C3b) Thread and fiber stacks: `size` bytes below 2^47 (low_place) over a `guard`-byte PROT_NONE guard, NULL when there
+ * is no room. Not entered in the VirtualQuery map (it reports them from /proc/self/maps, as before). */
+static void *low_stack(size_t size, size_t guard) {
+    size_t n = size + guard;
+#ifdef __APPLE__                                  /* the macOS check: placement is not what it checks */
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#else
+    vm_lock();
+    void *p = low_place(n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK);
+    vm_unlock();
+#endif
+    if (p == MAP_FAILED) return NULL;
+    if (guard && mprotect(p, guard, PROT_NONE)) { munmap(p, n); return NULL; }
+    return p;
+}
+#endif
 /* MEM_RESERVE maps the range PROT_NONE (address space only) and MEM_COMMIT is an mprotect; reservations start on 64 KB, the
  * Windows allocation granularity. Decommit (VirtualFree MEM_DECOMMIT) drops the pages, so a new commit reads zeros as on Windows. */
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
@@ -1201,6 +1658,9 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
         void *p;
         if (addr) p = mmap((void *)lo, nm, mprot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+#if defined(__aarch64__) && !defined(__APPLE__)
+        else p = low_place(nm, mprot, flags);
+#else
         else {
             /* 64 KB alignment: over-allocate and trim */
             p = mmap(NULL, nm + 0x10000, mprot, flags, -1, 0);
@@ -1211,6 +1671,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
                 p = (void *)al;
             }
         }
+#endif
         if (p == MAP_FAILED || (addr && (uintptr_t)p != lo)) {
             if (p != MAP_FAILED) munmap(p, nm);
             vm_unlock();
@@ -1561,7 +2022,7 @@ void *_aligned_realloc(void *p, size_t size, size_t align) {
     _aligned_free(p);
     return q;
 }
-/* Paths: '\\' becomes '/'. File names are case-sensitive here, unlike Windows (FindFirstFile patterns still match either case). */
+/* Paths: '\\' becomes '/'. The file system's names are case-sensitive; the file calls below fall back to a case-insensitive lookup (plat_ci_*) when the exact path is missing. */
 const char *plat_path(const char *in, char *out, size_t n) {
     size_t i = 0;
     for (; in[i] && i + 1 < n; i++) out[i] = in[i] == '\\' ? '/' : in[i];
@@ -1569,7 +2030,217 @@ const char *plat_path(const char *in, char *out, size_t n) {
     return out;
 }
 #define P(in, buf) plat_path((in), (buf), sizeof (buf))
-FILE *plat_fopen(const char *path, const char *mode) { char b[PATH_MAX]; return fopen(P(path, b), mode); }
+/* ---- Case-insensitive lookup (Windows paths are; romfs, mods and saves moved from Windows keep their case). Used only when the
+ * path as given does not exist: reads try the plain call first (a correct-case path costs no extra syscall); calls that create
+ * look first, so an existing file in another case is opened rather than shadowed by a new one. plat_ci_fix rewrites a path in
+ * place, component by component, to the names as stored. ASCII folding only. A name present in two cases resolves to the
+ * exact match first, else the first in upper-case order. Folder listings are cached while the folder's dev/inode/mtime are
+ * unchanged and the mtime is older than 2 s (a coarse timestamp cannot hide a change), so a create, rename or delete (ours or
+ * anyone's) is seen by the next lookup. The cache lock guards the table only; a folder is read with no lock held. */
+static int ci_cmp(const char *a, const char *b) {
+    for (;; a++, b++) {
+        unsigned ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (!ca) return 0;
+    }
+}
+static int ci_order(const void *x, const void *y) { const char *a = *(const char *const *)x, *b = *(const char *const *)y; int r = ci_cmp(a, b); return r ? r : strcmp(a, b); }
+typedef struct CiDir { struct CiDir *next; char *path; dev_t dev; ino_t ino; struct timespec mtime; int n; char **names; } CiDir;
+#define CI_BUCKETS 256
+#define CI_MAX 2048
+static CiDir *g_ci[CI_BUCKETS];
+static int g_ci_count;
+static pthread_mutex_t g_ci_mu = PTHREAD_MUTEX_INITIALIZER;
+static void ci_free(CiDir *d) { if (d) { free(d->names); free(d->path); free(d); } }
+static CiDir *ci_read(const char *dir, const struct stat *st) {      /* names live in the same block as the array */
+    DIR *dh = opendir(dir);
+    if (!dh) return NULL;
+    size_t cap = 64, n = 0, bytes = 0, bcap = 4096;
+    uintptr_t *off = malloc(cap * sizeof *off);
+    char *pool = malloc(bcap);
+    struct dirent *de;
+    while ((de = readdir(dh)) != NULL) {
+        size_t l = strlen(de->d_name) + 1;
+        if (n == cap) off = realloc(off, (cap *= 2) * sizeof *off);
+        while (bytes + l > bcap) pool = realloc(pool, bcap *= 2);
+        memcpy(pool + bytes, de->d_name, l);
+        off[n++] = bytes; bytes += l;
+    }
+    closedir(dh);
+    CiDir *d = calloc(1, sizeof *d);
+    d->names = malloc(n * sizeof(char *) + bytes + 1);
+    char *block = (char *)(d->names + n);
+    memcpy(block, pool, bytes);
+    for (size_t i = 0; i < n; i++) d->names[i] = block + off[i];
+    free(off); free(pool);
+    d->n = (int)n;
+    qsort(d->names, n, sizeof(char *), ci_order);
+    d->path = strdup(dir);
+    d->dev = st->st_dev; d->ino = st->st_ino; d->mtime = st->st_mtim;
+    return d;
+}
+static int ci_find(const CiDir *d, const char *name, char *real) {   /* in memory: leftmost entry equal ignoring case, exact match preferred */
+    int lo = 0, hi = d->n - 1, at = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2, r = ci_cmp(d->names[mid], name);
+        if (r < 0) lo = mid + 1; else { if (!r) at = mid; hi = mid - 1; }
+    }
+    if (at < 0) return 0;
+    int pick = at;
+    for (int i = at; i < d->n && !ci_cmp(d->names[i], name); i++) if (!strcmp(d->names[i], name)) { pick = i; break; }
+    strcpy(real, d->names[pick]);
+    return 1;
+}
+static int ci_lookup(const char *dir, const char *name, char *real) {
+    struct stat st;
+    if (stat(dir, &st) || !S_ISDIR(st.st_mode)) return 0;
+    unsigned h = 2166136261u;
+    for (const char *s = dir; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    h &= CI_BUCKETS - 1;
+    pthread_mutex_lock(&g_ci_mu);
+    CiDir **pp = &g_ci[h], *d = NULL;
+    for (; *pp; pp = &(*pp)->next) if (!strcmp((*pp)->path, dir)) { d = *pp; break; }
+    if (d && d->dev == st.st_dev && d->ino == st.st_ino && d->mtime.tv_sec == st.st_mtim.tv_sec && d->mtime.tv_nsec == st.st_mtim.tv_nsec) {
+        int r = ci_find(d, name, real);
+        pthread_mutex_unlock(&g_ci_mu);
+        return r;
+    }
+    if (d) { *pp = d->next; ci_free(d); g_ci_count--; }       /* changed: drop it */
+    pthread_mutex_unlock(&g_ci_mu);
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    CiDir *own = ci_read(dir, &st);                            /* the disk read holds no lock */
+    if (!own) return 0;
+    int r = ci_find(own, name, real);
+    if (now.tv_sec - st.st_mtim.tv_sec > 2) {                  /* stable folder: keep the listing */
+        pthread_mutex_lock(&g_ci_mu);
+        if (g_ci_count >= CI_MAX) {
+            for (int i = 0; i < CI_BUCKETS; i++) while (g_ci[i]) { CiDir *x = g_ci[i]; g_ci[i] = x->next; ci_free(x); }
+            g_ci_count = 0;
+        }
+        own->next = g_ci[h]; g_ci[h] = own; g_ci_count++;
+        pthread_mutex_unlock(&g_ci_mu);
+    } else ci_free(own);
+    return r;
+}
+/* Rewrites `out` (a '/' path) to the stored case, as far as it exists. 1 = the result exists. */
+static int plat_ci_fix(char *out) {
+    struct stat st;
+    size_t len = strlen(out);
+    while (len > 1 && out[len - 1] == '/') out[--len] = 0;
+    if (!len) return 0;
+    if (stat(out, &st) == 0) return 1;
+    if (errno != ENOENT && errno != ENOTDIR) return 0;
+    size_t start = 0;                                          /* first byte after the deepest existing folder */
+    for (size_t i = len; i-- > 0;) {
+        if (out[i] != '/') continue;
+        if (i == 0) { start = 1; break; }
+        out[i] = 0;
+        int ok = stat(out, &st) == 0 && S_ISDIR(st.st_mode);
+        out[i] = '/';
+        if (ok) { start = i + 1; break; }
+    }
+    char *p = out + start, name[NAME_MAX + 1], real[NAME_MAX + 1];
+    while (*p) {
+        char *e = strchr(p, '/');
+        size_t cl = e ? (size_t)(e - p) : strlen(p);
+        if (cl && !(cl == 1 && p[0] == '.') && !(cl == 2 && p[0] == '.' && p[1] == '.')) {
+            if (cl > NAME_MAX) { errno = ENAMETOOLONG; return 0; }
+            memcpy(name, p, cl); name[cl] = 0;
+            int ok;
+            if (p == out) ok = ci_lookup(".", name, real);
+            else if (p == out + 1 && out[0] == '/') ok = ci_lookup("/", name, real);
+            else { p[-1] = 0; ok = ci_lookup(out, name, real); p[-1] = '/'; }
+            if (!ok) { errno = ENOENT; return 0; }
+            memcpy(p, real, cl);
+        }
+        p += cl;
+        if (*p == '/') p++;
+    }
+    return stat(out, &st) == 0;
+}
+/* host_path_resolve (datapaths.c, C10): `in` -> `out`: '\\' becomes '/', existing components get their stored case, the missing tail is kept. 1 = it exists. */
+int host_path_resolve(const char *in, char *out, size_t n) {
+    char t[PATH_MAX];
+    plat_path(in, t, sizeof t);
+    int ok = plat_ci_fix(t);
+    snprintf(out, n, "%s", t);
+    return ok;
+}
+/* host_make_parents / host_fsync_parent (datapaths.c, C10): the folders above `path` (0 or -errno); fsync of the folder holding `path`. */
+int host_make_parents(const char *path) {
+    char rp[PATH_MAX];
+    struct stat st;
+    host_path_resolve(path, rp, sizeof rp);
+    char *s = strrchr(rp, '/');
+    if (!s || s == rp) return 0;
+    *s = 0;
+    if (stat(rp, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : -ENOTDIR;
+    *s = '/';
+    for (char *p = rp + 1; p <= s; p++) {
+        if (*p != '/' && p != s) continue;
+        char c = *p; *p = 0;
+        if (stat(rp, &st) != 0 && mkdir(rp, 0777) != 0 && errno != EEXIST) { int e = errno; *p = c; return -e; }
+        *p = c;
+    }
+    return 0;
+}
+int host_fsync_parent(const char *path) {
+    char rp[PATH_MAX];
+    host_path_resolve(path, rp, sizeof rp);
+    char *s = strrchr(rp, '/');
+    if (!s) strcpy(rp, "."); else if (s == rp) rp[1] = 0; else *s = 0;
+    int fd = open(rp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -errno;
+    int r = fsync(fd) == 0 ? 0 : -errno;
+    close(fd);
+    return r;
+}
+/* host_exe_dir (datapaths.c, C10): the folder of the executable with a trailing '/'. */
+const char *host_exe_dir(void) {
+    static char dir[PATH_MAX + 2];
+    if (!dir[0]) { ssize_t k = readlink("/proc/self/exe", dir, PATH_MAX - 1); if (k > 0) { dir[k] = 0; char *s = strrchr(dir, '/'); if (s) s[1] = 0; else strcpy(dir, "./"); } else strcpy(dir, "./"); }
+    return dir;
+}
+/* After a plain call on `b` failed with ENOENT/ENOTDIR: 1 = b now names an existing file in another case, so retry. errno is kept otherwise. */
+static int plat_ci_retry(char *b) {
+    int e = errno;
+    if (e != ENOENT && e != ENOTDIR) return 0;
+    char t[PATH_MAX];
+    snprintf(t, sizeof t, "%s", b);
+    if (plat_ci_fix(t) && strcmp(t, b)) { strcpy(b, t); return 1; }
+    errno = e;
+    return 0;
+}
+/* Before a call that creates: the folders (and the file, if it exists) get their stored case; the missing tail is kept as given. */
+static void plat_ci_pre(char *b) {
+    struct stat st;
+    if (stat(b, &st) == 0) return;
+    char t[PATH_MAX];
+    snprintf(t, sizeof t, "%s", b);
+    int e = errno;
+    plat_ci_fix(t);
+    strcpy(b, t);
+    errno = e;
+}
+/* Opening a file: as plat_path, and Windows' null device NUL (any case; nnhid.c's pad self-test sets SSBU_REC=NUL) is
+ * /dev/null rather than a file named NUL in the current directory. Only where files are opened: removing, renaming or
+ * making a directory "NUL" is left alone. 1 = mapped to /dev/null. */
+static int plat_open_path(const char *in, char *out, size_t n) {
+    if (!strcasecmp(in, "NUL")) { snprintf(out, n, "/dev/null"); return 1; }
+    plat_path(in, out, n);
+    return 0;
+}
+FILE *plat_fopen(const char *path, const char *mode) {
+    char b[PATH_MAX];
+    if (plat_open_path(path, b, sizeof b)) return fopen(b, mode);
+    if (strpbrk(mode, "wa+")) plat_ci_pre(b);            /* creating or truncating: look before, so the existing file is the one written */
+    FILE *f = fopen(b, mode);
+    if (!f && plat_ci_retry(b)) f = fopen(b, mode);
+    return f;
+}
 int plat_remove(const char *path) { char b[PATH_MAX]; return remove(P(path, b)); }
 int plat_rename(const char *a, const char *b) { char x[PATH_MAX], y[PATH_MAX]; return rename(P(a, x), P(b, y)); }
 char *_fullpath(char *out, const char *path, size_t n) {
@@ -1597,7 +2268,11 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD share, SECURITY_ATTRIBUTES *
     case TRUNCATE_EXISTING: of |= O_TRUNC; break;
     default: break;
     }
-    int fd = open(P(path, b), of | O_CLOEXEC, 0666);
+    int nul = plat_open_path(path, b, sizeof b);
+    if (nul) of &= ~O_EXCL;                           /* NUL: the device exists, CREATE_NEW opens it as on Windows */
+    else if (of & O_CREAT) plat_ci_pre(b);            /* creating: an existing file in another case is the one opened (CREATE_NEW then fails as it exists) */
+    int fd = open(b, of | O_CLOEXEC, 0666);
+    if (fd < 0 && !nul && plat_ci_retry(b)) fd = open(b, of | O_CLOEXEC, 0666);
     if (fd < 0 && errno == EISDIR && !(access & GENERIC_WRITE)) fd = open(b, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) { fail_errno(); return INVALID_HANDLE_VALUE; }
 #ifdef __APPLE__
@@ -1661,14 +2336,20 @@ static DWORD attrs_of(const struct stat *st, const char *name) {
     if (name && name[0] == '.' && name[1] && strcmp(name, "..")) a |= FILE_ATTRIBUTE_HIDDEN;
     return a;
 }
-DWORD GetFileAttributesA(LPCSTR path) { char b[PATH_MAX]; struct stat st; if (stat(P(path, b), &st)) { fail_errno(); return INVALID_FILE_ATTRIBUTES; } return attrs_of(&st, NULL); }
+DWORD GetFileAttributesA(LPCSTR path) {
+    char b[PATH_MAX]; struct stat st;
+    P(path, b);
+    if (stat(b, &st) && !(plat_ci_retry(b) && !stat(b, &st))) { fail_errno(); return INVALID_FILE_ATTRIBUTES; }
+    return attrs_of(&st, NULL);
+}
 static void st_times(const struct stat *st, FILETIME *c, FILETIME *a, FILETIME *w) {
     ft_set(c, ts_to_ft(&st->st_ctim)); ft_set(a, ts_to_ft(&st->st_atim)); ft_set(w, ts_to_ft(&st->st_mtim));
 }
 BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS lvl, LPVOID out) {
     (void)lvl;
     char b[PATH_MAX]; struct stat st;
-    if (stat(P(path, b), &st)) return fail_errno();
+    P(path, b);
+    if (stat(b, &st) && !(plat_ci_retry(b) && !stat(b, &st))) return fail_errno();
     WIN32_FILE_ATTRIBUTE_DATA *d = out;
     d->dwFileAttributes = attrs_of(&st, NULL);
     st_times(&st, &d->ftCreationTime, &d->ftLastAccessTime, &d->ftLastWriteTime);
@@ -1676,30 +2357,47 @@ BOOL GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS lvl, LPVOID out) {
     return TRUE;
 }
 BOOL SetFileAttributesA(LPCSTR path, DWORD attr) { (void)path; (void)attr; return TRUE; }      /* no attributes kept; a file's own mode never stops its deletion here (nnfs.c clears read-only for that) */
-BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; char b[PATH_MAX]; return mkdir(P(path, b), 0777) ? fail_errno() : TRUE; }
-BOOL RemoveDirectoryA(LPCSTR path) { char b[PATH_MAX]; return rmdir(P(path, b)) ? fail_errno() : TRUE; }
-BOOL DeleteFileA(LPCSTR path) { char b[PATH_MAX]; return unlink(P(path, b)) ? fail_errno() : TRUE; }
+BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; char b[PATH_MAX]; P(path, b); plat_ci_pre(b); return mkdir(b, 0777) ? fail_errno() : TRUE; }
+BOOL RemoveDirectoryA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (rmdir(b) && !(plat_ci_retry(b) && !rmdir(b))) return fail_errno(); return TRUE; }
+BOOL DeleteFileA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (unlink(b) && !(plat_ci_retry(b) && !unlink(b))) return fail_errno(); return TRUE; }
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {      /* rename() replaces the target in one step, as MOVEFILE_REPLACE_EXISTING does */
     char a[PATH_MAX], b[PATH_MAX];
     P(from, a); P(to, b);
+    struct stat st;
+    if (lstat(a, &st) && plat_ci_retry(a)) {}
+    plat_ci_pre(b);                                      /* the target's folders and, if it exists, its stored name */
     if (!(flags & MOVEFILE_REPLACE_EXISTING) && !access(b, F_OK)) { t_lasterr = ERROR_ALREADY_EXISTS; return FALSE; }
+    if (flags & MOVEFILE_WRITE_THROUGH) {                /* the data first: the new name must never reach the disk before it */
+        int fd = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0) { if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fsync(fd)) { int e = errno; close(fd); errno = e; return fail_errno(); } close(fd); }
+    }
     if (rename(a, b)) return fail_errno();
-    if (flags & MOVEFILE_WRITE_THROUGH) {                /* the file and the folder entry on disk before returning */
-        int fd = open(b, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) { fsync(fd); close(fd); }
-        char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%s", b);
-        char *sl = strrchr(dir, '/');
-        if (sl) { *sl = 0; fd = open(sl == dir ? "/" : dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC); }
-        else fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0) { fsync(fd); close(fd); }
+    if (flags & MOVEFILE_WRITE_THROUGH) {                /* then both folder entries on disk before returning */
+        char da[PATH_MAX], db[PATH_MAX];
+        const char *p[2] = {b, a};
+        char *d[2] = {db, da};
+        for (int k = 0; k < 2; k++) {
+            snprintf(d[k], PATH_MAX, "%s", p[k]);
+            char *sl = strrchr(d[k], '/');
+            if (!sl) strcpy(d[k], "."); else if (sl == d[k]) d[k][1] = 0; else *sl = 0;
+        }
+        for (int k = 0; k < 2; k++) {
+            if (k && !strcmp(da, db)) break;
+            int fd = open(d[k], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (fd < 0) return fail_errno();
+            int r = fsync(fd); int e = errno; close(fd);
+            if (r) { errno = e; return fail_errno(); }
+        }
     }
     return TRUE;
 }
 BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
     char a[PATH_MAX], b[PATH_MAX];
     int in = open(P(from, a), O_RDONLY | O_CLOEXEC);
+    if (in < 0 && plat_ci_retry(a)) in = open(a, O_RDONLY | O_CLOEXEC);      /* as CreateFileA: the source in another case */
     if (in < 0) return fail_errno();
-    int out = open(P(to, b), O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
+    plat_ci_pre(P(to, b));                                                  /* an existing target in another case is the one written */
+    int out = open(b, O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
     if (out < 0) { close(in); return fail_errno(); }
     char buf[1 << 16]; ssize_t k; BOOL ok = TRUE;
     while ((k = read(in, buf, sizeof buf)) > 0) if (write(out, buf, (size_t)k) != k) { ok = fail_errno(); break; }
@@ -1753,6 +2451,7 @@ HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd) {
     else { snprintf(o->dir_path, sizeof o->dir_path, "."); snprintf(o->pattern, sizeof o->pattern, "%s", b); }
     if (!strcmp(o->pattern, "*.*")) snprintf(o->pattern, sizeof o->pattern, "*");
     o->dir = opendir(o->dir_path);
+    if (!o->dir && plat_ci_retry(o->dir_path)) o->dir = opendir(o->dir_path);
     if (!o->dir) { fail_errno(); if (t_lasterr == ERROR_FILE_NOT_FOUND) t_lasterr = ERROR_PATH_NOT_FOUND; obj_release(o); return INVALID_HANDLE_VALUE; }
     if (!find_next(o, fd)) { obj_release(o); t_lasterr = ERROR_FILE_NOT_FOUND; return INVALID_HANDLE_VALUE; }
     return o;
@@ -2032,18 +2731,28 @@ BOOLEAN SystemFunction036(PVOID buf, ULONG n) {
 }
 BOOL QueryThreadCycleTime(HANDLE h, ULONG64 *cycles) {
 #ifdef __APPLE__                                  /* the thread's CPU time from Mach (no pthread_getcpuclockid on macOS) */
-    pthread_t th = is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD ? ((PlatObj *)h)->th : pthread_self();
+    int is_thr = is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD;
+    PlatObj *o = is_thr ? thread_live_lock(h) : NULL;
+    if (is_thr && !o) return FALSE;                                          /* ended */
     thread_basic_info_data_t bi;
     mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
-    if (thread_info(pthread_mach_thread_np(th), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS) return FALSE;
+    kern_return_t kr = thread_info(pthread_mach_thread_np(o ? o->th : pthread_self()), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt);
+    if (o) pthread_mutex_unlock(&o->m);
+    if (kr != KERN_SUCCESS) return FALSE;
     *cycles = ((ULONG64)bi.user_time.seconds + (ULONG64)bi.system_time.seconds) * 1000000000ULL
             + ((ULONG64)bi.user_time.microseconds + (ULONG64)bi.system_time.microseconds) * 1000ULL;
     return TRUE;
 #else
     clockid_t id = CLOCK_THREAD_CPUTIME_ID;
-    if (is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD && pthread_getcpuclockid(((PlatObj *)h)->th, &id)) return FALSE;
+    PlatObj *o = NULL;
+    if (is_obj(h) && ((PlatObj *)h)->kind == PO_THREAD) {
+        if (!(o = thread_live_lock(h))) return FALSE;                        /* ended */
+        if (pthread_getcpuclockid(o->th, &id)) { pthread_mutex_unlock(&o->m); return FALSE; }
+    }
     struct timespec ts;
-    if (clock_gettime(id, &ts)) return FALSE;
+    int bad = clock_gettime(id, &ts);                                        /* under the lock: the clock names the thread */
+    if (o) pthread_mutex_unlock(&o->m);
+    if (bad) return FALSE;
     *cycles = (ULONG64)ts.tv_sec * 1000000000ULL + (ULONG64)ts.tv_nsec;
     return TRUE;
 #endif

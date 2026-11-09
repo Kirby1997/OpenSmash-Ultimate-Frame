@@ -287,6 +287,18 @@ uint64_t nro_guest_function_of(uint64_t rip) {
     return 0;
 }
 
+/* crash reports (async-signal-safe: reads the module table only): the script module whose guest image holds `addr`, with the
+ * offset in it, or NULL. A plugin has no NroInfo of its own. */
+const char *nro_module_name_of(uint64_t addr, uint64_t *off) {
+    for (int i = 0; g_mods && i < g_mod_count; i++) {
+        const NroModule *m = &g_mods[i];
+        if (m->plugin || !m->info || addr < m->info->base || addr - m->info->base >= m->info->image_size) continue;
+        *off = addr - m->info->base;
+        return m->info->name;
+    }
+    return NULL;
+}
+
 /* ---------------------------------------------------------------- symbol resolution
  * Order: main's exports, the module itself, the other loaded modules, then whatever main itself uses
  * for the same imported name (a host handler behind a placeholder address, or redirected SDK data). */

@@ -146,10 +146,12 @@ static uint32_t exe_stamp(void) {
     const uint8_t *b = (const uint8_t *)GetModuleHandleA(NULL); if (!b) return 0;
     const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
     return nt->FileHeader.TimeDateStamp;
-#else                                                   /* POSIX builds: ELF / Mach-O have no link time: the exe's modification time */
+#elif defined(__APPLE__)                                /* Mach-O has no link time: the exe's modification time */
     char p[MAX_PATH]; struct stat st;
     DWORD n = GetModuleFileNameA(NULL, p, MAX_PATH);
     return n && n < MAX_PATH && !stat(p, &st) ? (uint32_t)st.st_mtime : 0;
+#else                                                   /* ELF: its GNU build id stands in, the same in every copy of one build (plat_posix.c) */
+    return plat_exe_stamp();
 #endif
 }
 int rbn_handshake_wanted(void) {

@@ -555,7 +555,7 @@ DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)(uintptr_t)obj(key)->cs
 #elif defined(__APPLE__)
 DWORD os_mutex_owner(uint64_t key) { (void)key; return 0; }       /* macOS: a pthread mutex does not show its owner */
 #else
-DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)obj(key)->cs.__data.__owner : 0; }     /* glibc: the owner's tid */
+DWORD os_mutex_owner(uint64_t key) { return key ? (DWORD)(uintptr_t)obj(key)->cs.OwningThread : 0; }     /* Linux: plat's CRITICAL_SECTION keeps the owner's tid */
 #endif
 static void pmtx_lock(Ctx *c) { EnterCriticalSection(&obj(A0)->cs); RET(0); }
 static void pmtx_unlock(Ctx *c) { LeaveCriticalSection(&obj(A0)->cs); RET(0); }

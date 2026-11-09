@@ -45,8 +45,12 @@ import build_nro      # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\llvm-9.0.0\bin\clang.exe')
-OPT = os.environ.get('RECOMP_OPT', '-O1')
-EXTRA = ['-ffp-contract=off'] + os.environ.get('RECOMP_CFLAGS', '').split()
+# (getattr: tests/build_opt_sched_test.py imports this module with an empty stand-in for build)
+TARGET_ARM64 = getattr(build, 'TARGET_ARM64', False)
+OPT = os.environ.get('RECOMP_OPT', '-O2' if TARGET_ARM64 else '-O1')
+if TARGET_ARM64 and OPT not in ('-O2', '-O3'):
+    print('RECOMP_OPT=%s: the Frame build is tuned for -O2 or better; every step of the ladder below it is reported in _opt_report.txt' % OPT)
+EXTRA = ['-ffp-contract=off'] + getattr(build, 'CODEGEN_FLAGS', []) + os.environ.get('RECOMP_CFLAGS', '').split()   # CODEGEN_FLAGS = the aarch64 driver flags (empty on windows / x86-64 linux)
 # RECOMP_INLINE=1: the helpers of runtime.h / neon.h / fpexact.h (every guest load / store, flag, NEON op) inlined into the
 # lifted code. clang 9 at -O1 runs only the always-inline inliner, so without this each helper is a real call: measured
 # 2026-10-13 (private round 15): main thread -25-30 %, audio update 9-17 -> 2-4 ms, per-frame hash identical. Same
@@ -58,7 +62,7 @@ OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
 # Linux build: address-space limit per compiler, bytes (0: none). Set by limit_memory(): the most one compiler may get.
 MEM_LIMIT = 0
-# Linux and macOS builds (RECOMP_TARGET linux / macos): the RAM all compilers share, bytes (0: no sharing, as on Windows).
+# Linux and macOS builds (RECOMP_TARGET linux / linux-arm64 / macos): the RAM all compilers share, bytes (0: no sharing, as on Windows).
 # Each compile reserves an estimate of what it needs before it starts (mem_estimate) and gives it back when it ends, so
 # the job count can follow the CPU threads while the few files that need many GB run with fewer beside them. On Linux the
 # reservation is also the compiler's address-space limit: a file that passes it is compiled again with twice as much (up
@@ -69,7 +73,7 @@ MEM_BUDGET = 0
 # going quiet, which is what made the 2026-10-22 report (issue 75) take days to read.
 MEM_WAIT_TICK = 5.0
 MEM_WAIT_WARN = float(os.environ.get('RECOMP_MEM_WAIT_WARN', '120'))
-POSIX_TARGET = os.environ.get('RECOMP_TARGET') in ('linux', 'macos')
+POSIX_TARGET = os.environ.get('RECOMP_TARGET') in ('linux', 'linux-arm64', 'macos')
 DEF = re.compile(r'^(?:static )?void (\w+)\((Ctx \*c(?:, uint64_t rp)?)\) \{$')
 
 
@@ -133,7 +137,7 @@ def limit_memory(jobs):
     if not ram:
         return
     MEM_BUDGET = max(2 << 30, ram - (4 << 30))
-    if os.environ.get('RECOMP_TARGET') == 'linux':        # macOS: no limit (no prlimit; RLIMIT_AS is not enforced there)
+    if os.environ.get('RECOMP_TARGET') in ('linux', 'linux-arm64'):   # both Linux targets; macOS: no limit (no prlimit; RLIMIT_AS is not enforced there)
         MEM_LIMIT = MEM_BUDGET
     print('compilers share %.1f GB of RAM (%s); at most %d at once' % (MEM_BUDGET / 2.0 ** 30, 'each held to its reservation'
           if MEM_LIMIT else 'reservations pace them', jobs), flush=True)

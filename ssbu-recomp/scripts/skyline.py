@@ -58,7 +58,7 @@ def run(argv, cwd, env):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('--target', choices=('windows', 'linux', 'macos'), default='windows')
+    ap.add_argument('--target', choices=('windows', 'linux', 'linux-arm64', 'macos'), default='windows')
     ap.add_argument('--build')
     ap.add_argument('step', choices=('plugins', 'relift', 'link', 'play'))
     a, rest = ap.parse_known_args()

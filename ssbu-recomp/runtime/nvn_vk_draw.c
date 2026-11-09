@@ -33,6 +33,7 @@ static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 
 struct VFeatures D;                                     /* the members: nvn_vk_int.h */
 static PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT;
+LONG64 g_sb_cut;                                  /* storage buffer ranges cut to maxStorageBufferRange (sb_range; the exit report in nvn_vk_m4.c) */
 static PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV;
 static PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV;
 static PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT;
@@ -69,6 +70,67 @@ int vk_gpl_mode(void) {
 }
 
 /* ---------------------------------------------------------------- device features */
+/* Steam Frame bring-up (Adreno 750 / Turnip, docs/STEAM_FRAME.md "Graphics"): the rest of the startup "features:" line and
+ * two more lines, so that the first log of a new GPU / driver says everything the renderer depends on without a second
+ * run: the driver's identity (ID, name, Mesa version string), every core feature the drawing code or the translated
+ * shaders use, the 24-bit depth formats, the limits it relies on and the memory types. Prints only: nothing here changes
+ * what is enabled or drawn. */
+static void vkd_device_report(const VkExtensionProperties *dext, uint32_t ndext) {
+    const VkPhysicalDeviceFeatures *f = &D.f2.features;
+    const VkPhysicalDeviceLimits *l = &V.props.limits;
+    VkFormatProperties fx, fs, fz;
+    vkGetPhysicalDeviceFormatProperties(V.gpu, VK_FORMAT_X8_D24_UNORM_PACK32, &fx);
+    vkGetPhysicalDeviceFormatProperties(V.gpu, VK_FORMAT_D24_UNORM_S8_UINT, &fs);
+    vkGetPhysicalDeviceFormatProperties(V.gpu, VK_FORMAT_D32_SFLOAT_S8_UINT, &fz);
+#define DSA(p) (((p).optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
+    printf(", BC %d, dual-source blend %d, logic op %d, fill mode non-solid %d, sample shading %d, anisotropy %d, cube arrays %d, depth bias clamp %d, multi viewport %d, "
+           "int64 %d, clip distance %d, gather offsets %d, storage image write / read without format %d / %d, layer / viewport output %d / %d, draw parameters %d, "
+           "sampler min/max %d, robust images %d, X8_D24 %d, D24S8 %d, D32S8 %d\n",
+           (int)f->textureCompressionBC, (int)f->dualSrcBlend, (int)f->logicOp, (int)f->fillModeNonSolid, (int)f->sampleRateShading, (int)f->samplerAnisotropy, (int)f->imageCubeArray,
+           (int)f->depthBiasClamp, (int)f->multiViewport, (int)f->shaderInt64, (int)f->shaderClipDistance, (int)f->shaderImageGatherExtended, (int)f->shaderStorageImageWriteWithoutFormat,
+           (int)f->shaderStorageImageReadWithoutFormat, (int)D.f12.shaderOutputLayer, (int)D.f12.shaderOutputViewportIndex, (int)D.f11.shaderDrawParameters, (int)D.f12.samplerFilterMinmax,
+           (int)D.f13.robustImageAccess, DSA(fx), DSA(fs), DSA(fz));
+#undef DSA
+    /* the driver: VkPhysicalDeviceVulkan12Properties (the device is 1.3 or it was not chosen); the loader may lack the entry point */
+    PFN_vkGetPhysicalDeviceProperties2 gp2 = (PFN_vkGetPhysicalDeviceProperties2)(void *)GetProcAddress(V.loader, "vkGetPhysicalDeviceProperties2");
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDevicePushDescriptorPropertiesKHR pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+    VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+    void **tail = &p2.pNext;
+    *tail = &p11; tail = &p11.pNext; *tail = &p12; tail = &p12.pNext;
+    if (has_name(dext, ndext, "VK_KHR_push_descriptor")) { *tail = &pp; tail = &pp.pNext; }
+    if (D.ext_gpl) { *tail = &gp; tail = &gp.pNext; }
+    if (gp2) gp2(V.gpu, &p2);
+    if (gp2)
+        printf("nvn_vk: driver: %s, %s (driver ID %d), conformance %u.%u.%u.%u, driverVersion 0x%08x (%u.%u.%u read as a Vulkan version: the Mesa drivers' encoding), device Vulkan %u.%u.%u\n",
+               p12.driverName[0] ? p12.driverName : "?", p12.driverInfo[0] ? p12.driverInfo : "no driver info", (int)p12.driverID, (unsigned)p12.conformanceVersion.major,
+               (unsigned)p12.conformanceVersion.minor, (unsigned)p12.conformanceVersion.subminor, (unsigned)p12.conformanceVersion.patch, V.props.driverVersion,
+               VK_API_VERSION_MAJOR(V.props.driverVersion), VK_API_VERSION_MINOR(V.props.driverVersion), VK_API_VERSION_PATCH(V.props.driverVersion),
+               VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion), VK_API_VERSION_PATCH(V.props.apiVersion));
+    else printf("nvn_vk: driver: the loader has no vkGetPhysicalDeviceProperties2; driverVersion 0x%08x\n", V.props.driverVersion);
+    /* the limits the renderer relies on (the smallest ones met so far in brackets: the GPL layout needs 33 storage buffers and
+     * 64 samplers per stage, 66 / 128 per set; shared memory: Maxwell allows 48 KB, Adreno 750 and Apple GPUs have 32 KB) */
+    printf("nvn_vk: limits: push constants %u (16 used), push descriptors %u (32 used at most), per stage: storage buffers %u, samplers %u, sampled images %u, resources %u; per set: storage buffers %u, samplers %u; "
+           "storage buffer range %u, offset alignment %llu; vertex attributes %u, bindings %u, stride %u; viewports %u, colour attachments %u, line width %.1f..%.1f; "
+           "compute: shared memory %u, invocations %u, size %u x %u x %u; subgroup %u%s; timestamps %d (%.2f ns)\n",
+           l->maxPushConstantsSize, gp2 && pp.maxPushDescriptors ? pp.maxPushDescriptors : 0, l->maxPerStageDescriptorStorageBuffers, l->maxPerStageDescriptorSamplers, l->maxPerStageDescriptorSampledImages,
+           l->maxPerStageResources, l->maxDescriptorSetStorageBuffers, l->maxDescriptorSetSamplers, l->maxStorageBufferRange, (unsigned long long)l->minStorageBufferOffsetAlignment,
+           l->maxVertexInputAttributes, l->maxVertexInputBindings, l->maxVertexInputBindingStride, l->maxViewports, l->maxColorAttachments, (double)l->lineWidthRange[0], (double)l->lineWidthRange[1],
+           l->maxComputeSharedMemorySize, l->maxComputeWorkGroupInvocations, l->maxComputeWorkGroupSize[0], l->maxComputeWorkGroupSize[1], l->maxComputeWorkGroupSize[2],
+           gp2 ? p11.subgroupSize : 0, D.ext_gpl && gp2 ? (gp.graphicsPipelineLibraryFastLinking ? ", GPL fast linking yes" : ", GPL fast linking NO") : "",
+           (int)l->timestampComputeAndGraphics, (double)l->timestampPeriod);
+    {   /* memory: one device-local heap that is also host visible = unified memory (the Frame); the type list is what vmem_alloc picks from (first match) */
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(V.gpu, &mp);
+        printf("nvn_vk: memory: %u heaps:", (unsigned)mp.memoryHeapCount);
+        for (uint32_t i = 0; i < mp.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++) printf(" %u=%llu MB%s", (unsigned)i, (unsigned long long)(mp.memoryHeaps[i].size >> 20), mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+        printf("; %u types (heap: flags; 1 device-local, 2 host-visible, 4 coherent, 8 cached, 16 lazy):", (unsigned)mp.memoryTypeCount);
+        for (uint32_t i = 0; i < mp.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; i++) printf(" %u=%u:0x%x", (unsigned)i, (unsigned)mp.memoryTypes[i].heapIndex, (unsigned)mp.memoryTypes[i].propertyFlags);
+        printf("\n");
+    }
+}
 void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
     void **tail;
     vkGetPhysicalDeviceFeatures2 = vk_sym("vkGetPhysicalDeviceFeatures2");
@@ -113,7 +175,13 @@ void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, 
     /* session 4: blend / mask / polygon / multisample state out of the pipeline key, only when the GPU has ALL of these (else all stay in the key) */
     D.has_eds3 = D.has_eds3 && D.eds3.extendedDynamicState3ColorBlendEnable && D.eds3.extendedDynamicState3ColorBlendEquation && D.eds3.extendedDynamicState3ColorWriteMask && D.eds3.extendedDynamicState3PolygonMode &&
                  D.eds3.extendedDynamicState3AlphaToCoverageEnable && D.eds3.extendedDynamicState3SampleMask && (D.eds3.extendedDynamicState3DepthClampEnable || !D.f2.features.depthClamp);
-    printf("nvn_vk: extended dynamic state 3 (blend enable / equation / write mask, polygon mode, alpha to coverage, sample mask, depth clamp dynamic = not in the pipeline key): %s\n", D.has_eds3 ? "yes" : "no");
+    printf("nvn_vk: extended dynamic state 3 (blend enable / equation / write mask, polygon mode, alpha to coverage, sample mask, depth clamp dynamic = not in the pipeline key): %s", D.has_eds3 ? "yes" : "no");
+    /* Frame (Adreno / Turnip) bring-up: which of the seven the driver has, so a "no" names the missing one */
+    if (D.eds3.sType) printf(" [blend enable %d, equation %d, write mask %d, polygon mode %d, alpha to coverage %d, sample mask %d, depth clamp %d]", (int)D.eds3.extendedDynamicState3ColorBlendEnable,
+                             (int)D.eds3.extendedDynamicState3ColorBlendEquation, (int)D.eds3.extendedDynamicState3ColorWriteMask, (int)D.eds3.extendedDynamicState3PolygonMode,
+                             (int)D.eds3.extendedDynamicState3AlphaToCoverageEnable, (int)D.eds3.extendedDynamicState3SampleMask, (int)D.eds3.extendedDynamicState3DepthClampEnable);
+    else printf(" [VK_EXT_extended_dynamic_state3 not listed%s]", getenv("SSBU_VK_EDS3") && !atoi(getenv("SSBU_VK_EDS3")) ? " or turned off by SSBU_VK_EDS3=0" : "");
+    printf("\n");
     D.has_gpl = D.has_gpl && D.gpl.graphicsPipelineLibrary && D.has_eds3 && D.has_vids;
     printf("nvn_vk: driver support for pipelines without a hold: VK_EXT_graphics_pipeline_library %s, VK_EXT_shader_object %s, extended dynamic state 3 (all seven states) %s, vertex input dynamic state %s | pipeline libraries in use: %s\n",
            D.ext_gpl ? "yes" : "NO", D.ext_so ? "yes" : "NO", D.has_eds3 ? "yes" : "NO", D.has_vids ? "yes" : "NO", D.has_gpl ? "YES" : "no");
@@ -141,8 +209,9 @@ void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, 
                             D.has_vad && D.vad.vertexAttributeInstanceRateDivisor ? "yes (VK_EXT_vertex_attribute_divisor)" : "NO (a draw with one stops the game)");
     if (!D.f2.features.textureCompressionBC) nvn_vk_missing("a GPU without BC texture compression");
     di->enabledExtensionCount = D.next; di->ppEnabledExtensionNames = D.exts; di->pNext = &D.f2;
-    printf("nvn_vk: features: vertex input dynamic %d, custom border colour %d, provoking vertex last %d, 8-bit indices %d, list restart %d, ASTC %d, depth clamp %d, wide lines %d, robust buffers %d\n",
+    printf("nvn_vk: features: vertex input dynamic %d, custom border colour %d, provoking vertex last %d, 8-bit indices %d, list restart %d, ASTC %d, depth clamp %d, wide lines %d, robust buffers %d",
            D.has_vids, D.has_cbc, D.has_pv, D.has_iu8, D.has_plr, (int)D.f2.features.textureCompressionASTC_LDR, (int)D.f2.features.depthClamp, (int)D.f2.features.wideLines, (int)D.f2.features.robustBufferAccess);
+    vkd_device_report(dext, ndext);
 }
 
 /* ---------------------------------------------------------------- memory: 64 MB blocks per memory type and class, first fit */
@@ -2300,6 +2369,16 @@ static int cb_assemble(uint64_t addr, uint64_t size, BufRef *b) {
     { static int lg; if (lg++ < 8) printf("nvn_vk_cbkeep: frame %lld: range %llx+%llu put together on the GPU from %d compute buffer(s) (first %llx+%llu) and guest memory, no landing\n", (long long)g_cur_frame, (unsigned long long)addr, (unsigned long long)size, n, (unsigned long long)g_cb[idx[0]].addr, (unsigned long long)g_cb[idx[0]].size); }
     return 1;
 }
+/* Frame bring-up: the range of a storage-buffer descriptor. Turnip's maxStorageBufferRange is 128 MB (desktop drivers: 1 GB
+ * and more, above the 256 MB stream ring, so this never acts there); a larger guest range is cut to the limit, the shader's
+ * reads past it then get robust-access zeros, instead of a descriptor the device does not promise to handle. Counted and
+ * named once. */
+static VkDeviceSize sb_range(uint64_t size) {
+    uint64_t lim = V.props.limits.maxStorageBufferRange;
+    if (!lim || size <= lim) return size;
+    if (g_sb_cut++ == 0) { printf("nvn_vk: a storage buffer range of %llu bytes is above this device's maxStorageBufferRange (%llu): cut to it (counted at exit)\n", (unsigned long long)size, (unsigned long long)lim); fflush(stdout); }
+    return lim;
+}
 /* Where a command reads the guest range from: a CB of this batch that contains it, else the stream ring. align: the offset
  * alignment the use needs (storage descriptors), 1 = none. Returns 1 when a CB is bound. */
 static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
@@ -2347,6 +2426,25 @@ static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!v) { nvn_vk_missing("nvnCommandBufferDispatchCompute: the compute stage could not be translated or compiled (the log names the program)"); return; }
     if (v->images) { nvn_vk_missing("a compute program that uses images (nvnCommandBufferBindImage)"); return; }
     if (v->nsmp > 32) { nvn_vk_missing("a compute program with more than 32 samplers"); return; }
+    {   /* Frame bring-up: Maxwell gives a work group up to 48 KB of shared memory; the Adreno 750 on Turnip (and Apple GPUs)
+         * have 32 KB, NVIDIA's desktop GPUs 48 KB. A program beyond the device's compute limits is named once (its pipeline is
+         * outside what the device promises: a failed vkCreateComputePipelines or a wrong result may follow). Prints only. */
+        static int seen[20], nseen;
+        const VkPhysicalDeviceLimits *l = &V.props.limits;
+        uint64_t inv = (uint64_t)(st->local[0] ? st->local[0] : 1) * (st->local[1] ? st->local[1] : 1) * (st->local[2] ? st->local[2] : 1);
+        if (st->smem_bytes > l->maxComputeSharedMemorySize || inv > l->maxComputeWorkGroupInvocations || st->local[0] > l->maxComputeWorkGroupSize[0] || st->local[1] > l->maxComputeWorkGroupSize[1] ||
+            st->local[2] > l->maxComputeWorkGroupSize[2]) {
+            int k = 0;
+            while (k < nseen && seen[k] != p->serial) k++;
+            if (k == nseen && nseen < 20) {
+                seen[nseen++] = p->serial;
+                printf("nvn_vk: compute program #%d is beyond this device's limits: shared memory %u bytes (device %u), work group %u x %u x %u = %llu invocations (device %u, %u x %u x %u)\n", p->serial,
+                       st->smem_bytes, l->maxComputeSharedMemorySize, st->local[0], st->local[1], st->local[2], (unsigned long long)inv, l->maxComputeWorkGroupInvocations,
+                       l->maxComputeWorkGroupSize[0], l->maxComputeWorkGroupSize[1], l->maxComputeWorkGroupSize[2]);
+                fflush(stdout);
+            }
+        }
+    }
     if (!gx || !gy || !gz) return;
     int cp_how = 0;
     if (v->cp_state != 2) { LONG64 t0 = tk(); cp_how = compute_pipe_ensure(v); if (cp_how) { hold_note(cp_how == 1 ? H_PIPE_DRAW : H_PIPE_WAIT, tk() - t0); g_tm[5] += tk() - t0; } }
@@ -2437,7 +2535,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
         unsigned bit = n < 18 ? v->cbufs >> n & 1 : v->ssbos >> (n - 18) & 1;
         if (!bit) continue;
         BufRef *b = &bufs[ib];
-        bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : b->size;
+        bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : sb_range(b->size);
         w[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[nw].dstSet = sets[0]; w[nw].dstBinding = n < 18 ? n : 20 + n - 18; w[nw].descriptorCount = 1;
         w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nw].pBufferInfo = &bi[ib]; nw++; ib++;
     }
@@ -2659,7 +2757,7 @@ static int draw_prepare(unsigned prim) {
                 unsigned bit = n < 18 ? v->cbufs >> n & 1 : v->ssbos >> (n - 18) & 1;
                 if (!bit) continue;
                 BufRef *b = &bufs[ib];
-                bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : b->size;
+                bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : sb_range(b->size);
                 w[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[nw].dstSet = sets[0]; w[nw].dstBinding = 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18); w[nw].descriptorCount = 1;
                 w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nw].pBufferInfo = &bi[ib]; nw++; ib++;
             }
