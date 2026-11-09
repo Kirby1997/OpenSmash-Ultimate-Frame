@@ -929,6 +929,7 @@ typedef struct Shader {
     u32 written_mask, learn_runs;   /* compute: storage buffers it was seen to write, over its first runs */
     struct Shader *next_job;
     int cached;            /* an earlier run compiled it (its job is a load) */
+    u64 asked_ms;          /* when a draw first asked for it (GetTickCount64), for the first-use log */
     struct Prewarm *prewarm;   /* a prewarm job (not a shader of the game yet): the entry it fills */
     int drawn;             /* a draw (or launch) has used it: its first one was timed (first_draw_done) */
 } Shader;
@@ -1201,6 +1202,18 @@ static DWORD WINAPI compiler_main(void *arg) {
         else InterlockedIncrement64((volatile LONG64 *)&gfx_stat_shader_failures);
         InterlockedExchange(&s->state, state);
         InterlockedDecrement(&compiles_pending);
+        /* (a program a draw asked for that was not ready: those draws were skipped until now, an effect missing
+         * the first time it is used - the owner's report 2026-11-09. Every one is logged, up to 200, then counted) */
+        if (s->asked_ms) {
+            static volatile LONG logged;
+            LONG n = InterlockedIncrement(&logged);
+            u64 ms = GetTickCount64() - s->asked_ms;
+            if (n <= 200)
+                fprintf(stderr, "[gfx] first use: %s %s in %llu ms%s\n", s->name, s->cached ? "loaded from the disk cache" : "compiled",
+                        (unsigned long long)ms, state == 1 ? "" : " (FAILED)");
+            else if (n == 201)
+                fprintf(stderr, "[gfx] first use: more than 200 programs made at their first draw; no more lines\n");
+        }
     }
 }
 
@@ -2116,10 +2129,12 @@ static Shader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding 
     char path[1200];
     cache_path(s, path, sizeof path);
     s->cached = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    s->asked_ms = GetTickCount64();
     enqueue_shader(s);
-    /* a compute program that was compiled before is waited for (a few ms): a skipped launch
-     * leaves its outputs (skinned vertices) unwritten for a frame */
-    if (stage == SHADER_COMPUTE && s->cached)
+    /* a program that was compiled before is waited for (a few ms, its load): a skipped draw is an effect missing
+     * the first time it is used (vertex and pixel programs too, from 2026-11-09), a skipped launch leaves its
+     * outputs (skinned vertices) unwritten for a frame. One compiled from scratch (fxc, seconds) is not waited for. */
+    if (s->cached)
         for (u64 until = GetTickCount64() + 250; s->state == 0 && GetTickCount64() < until;) SwitchToThread();
     return s;
 }
@@ -3018,6 +3033,63 @@ static int unpacked_formats(DXGI_FORMAT f, Unpacked *u) {
 /* Software decode (ssbu-recomp/runtime/tex_decode.c). RGBA8 is the stored bytes, alpha included;
  * an sRGB view is applied later, so the colour space stays what the file asked for. */
 int tex_decode_rgba8(int nvn_format, const void *src, int w, int h, uint8_t *dst);
+
+/* The CPU decode of a big texture (sRGB BC, decoded here because Direct3D 11 has no sRGB BC6/7 view of
+ * the game's kind) took up to 29 ms on the renderer's thread at a match's load (2026-11-04): split into
+ * bands of block rows decoded on the system's thread pool at once, each band its own call of the same
+ * decoder (a band's source starts at its first block row, its picture at that row's pixels). Small ones are
+ * decoded as before. Returns tex_decode_rgba8's answer (0 good). */
+typedef struct DecodeBand { int nf, w, h; const u8 *src; u8 *dst; volatile LONG *left, *failed; HANDLE done; } DecodeBand;
+static void CALLBACK decode_band(PTP_CALLBACK_INSTANCE inst, void *ctx) {
+    (void)inst;
+    DecodeBand *b = ctx;
+    if (tex_decode_rgba8(b->nf, b->src, b->w, b->h, b->dst)) InterlockedExchange(b->failed, 1);
+    if (!InterlockedDecrement(b->left)) SetEvent(b->done);
+}
+static int decode_rgba8_parallel(int nf, const u8 *src, int w, int h, u8 *dst, u32 bw, u32 bh, u32 bpb) {
+    enum { MAX_BANDS = 16 };
+    u32 wb = (w + bw - 1) / bw, hb = (h + bh - 1) / bh;
+    static int threads;
+    if (!threads) { SYSTEM_INFO si; GetSystemInfo(&si); threads = si.dwNumberOfProcessors > MAX_BANDS ? MAX_BANDS : (int)si.dwNumberOfProcessors; }
+    int bands = (int)(hb / 8);   /* (at least 8 block rows a band: 32 pixel rows of a BC texture) */
+    if (bands > threads) bands = threads;
+    if ((u64)w * h < 256 * 256 || bands < 2) return tex_decode_rgba8(nf, src, w, h, dst);
+    DecodeBand b[MAX_BANDS];
+    volatile LONG left = bands, failed = 0;
+    HANDLE done = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!done) return tex_decode_rgba8(nf, src, w, h, dst);
+    u64 t_par = rt_now_ns();
+    u32 per = (hb + bands - 1) / bands;
+    int queued = 0;
+    for (int i = 0; i < bands; i++) {
+        u32 r0 = i * per, r1 = r0 + per > hb ? hb : r0 + per;
+        if (r0 >= r1) { if (!InterlockedDecrement(&left)) SetEvent(done); continue; }
+        int y0 = (int)(r0 * bh), y1 = (int)(r1 * bh) > h ? h : (int)(r1 * bh);
+        b[i] = (DecodeBand){nf, w, y1 - y0, src + (size_t)r0 * wb * bpb, dst + (size_t)y0 * w * 4, &left, &failed, done};
+        if (!TrySubmitThreadpoolCallback(decode_band, &b[i], NULL)) decode_band(NULL, &b[i]);   /* (no pool: here) */
+        queued++;
+    }
+    (void)queued;
+    WaitForSingleObject(done, INFINITE);
+    CloseHandle(done);
+    t_par = rt_now_ns() - t_par;
+    /* SSBU_DECODE_CHECK=1 (tests): the same texture decoded whole as well, and compared */
+    static int check = -1;
+    if (check < 0) { const char *e = getenv("SSBU_DECODE_CHECK"); check = e && *e == '1'; }
+    if (check && !failed) {
+        static volatile LONG checked, differed;
+        static double ms_par, ms_ser;
+        u8 *ref = malloc((size_t)w * h * 4);
+        u64 t_ser = rt_now_ns();
+        if (ref && !tex_decode_rgba8(nf, src, w, h, ref)) {
+            ms_ser += (rt_now_ns() - t_ser) / 1e6; ms_par += t_par / 1e6;
+            LONG n = InterlockedIncrement(&checked), d = memcmp(ref, dst, (size_t)w * h * 4) ? InterlockedIncrement(&differed) : differed;
+            if (n <= 3 || (n % 50) == 0 || d && n == d) fprintf(stderr, "[gfx] SSBU_DECODE_CHECK: %ld textures decoded in %d bands, %ld differed (last %dx%d); %.1f ms in bands vs %.1f ms whole\n", (long)n, bands, (long)d, w, h, ms_par, ms_ser);
+        }
+        free(ref);
+    }
+    return failed ? -1 : 0;
+}
 /* BC7 often cannot store alpha 0. A clear texel is then (1,1,1,1). The alpha test keeps any
  * alpha above 0 and the black is drawn (Paper Mario's sticker wheel). A real clear texel, as on
  * the stickers sheet, is alpha 0 and is thrown away. */
@@ -3203,7 +3275,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
             u32 l = i % levels;
             u32 tw = (d.width >> l) ? d.width >> l : 1, th = (d.height >> l) ? d.height >> l : 1;
             rgba[i] = malloc((size_t)tw * th * 4);
-            if (!rgba[i] || tex_decode_rgba8(cpu_bc, mem[i], (int)tw, (int)th, rgba[i])) decoded = 0;
+            if (!rgba[i] || decode_rgba8_parallel(cpu_bc, mem[i], (int)tw, (int)th, rgba[i], d.bw, d.bh, d.bytes)) decoded = 0;
         }
         int punched = 0;
         if (decoded)
@@ -3295,7 +3367,11 @@ static ID3D11SamplerState *get_sampler(const u32 *tsc) {
     u32 mag = tsc[1] & 3, min = (tsc[1] >> 4) & 3, mip = (tsc[1] >> 6) & 3, aniso = (tsc[0] >> 20) & 7, cmp = (tsc[0] >> 9) & 1;
     int lin_mag = mag == 2, lin_min = min == 2, lin_mip = mip == 3;
     sd.Filter = (D3D11_FILTER)((lin_mip ? 1 : 0) | (lin_mag ? 4 : 0) | (lin_min ? 0x10 : 0));
-    if (aniso) { sd.Filter = D3D11_FILTER_ANISOTROPIC; sd.MaxAnisotropy = 1u << aniso; }
+    if (aniso) {   /* (Maxwell's field: 1, 2, 4, 6, 8, 10, 12, 16x; 1 << 7 = 128 is past Direct3D's 16 and CreateSamplerState fails) */
+        static const u8 ratio[8] = {1, 2, 4, 6, 8, 10, 12, 16};
+        sd.Filter = D3D11_FILTER_ANISOTROPIC;
+        sd.MaxAnisotropy = ratio[aniso];
+    }
     if (cmp) sd.Filter = (D3D11_FILTER)(sd.Filter | 0x80);
     sd.AddressU = wrap_mode(tsc[0] & 7); sd.AddressV = wrap_mode((tsc[0] >> 3) & 7); sd.AddressW = wrap_mode((tsc[0] >> 6) & 7);
     sd.ComparisonFunc = (D3D11_COMPARISON_FUNC)(((tsc[0] >> 10) & 7) + 1);
@@ -3881,7 +3957,12 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     /* The fixed-function alpha test (ui2d's alpha compare: the main menu's stencil masks are cut
      * from a texture's alpha this way) needs the pixel shader's variant that discards; while that
      * compiles, the plain one draws as before. */
-    D3D11_COMPARISON_FUNC alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : D3D11_COMPARISON_ALWAYS;
+    /* Alpha to coverage (a material's "alpha sample to coverage": Waluigi's down-special
+     * icons) on targets of one sample keeps a pixel whose alpha is at least one half; without
+     * it the clear texels were drawn black. Done as that alpha test when the game's own test is off. */
+    int a2c = (regs[M_ANTI_ALIAS_ALPHA_CONTROL] & 1) && !(regs[M_ALPHA_TEST] & 1) && !(gfx_debug() & 64);
+    D3D11_COMPARISON_FUNC alpha_func = regs[M_ALPHA_TEST] & 1 && !(gfx_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC])
+                                     : a2c ? D3D11_COMPARISON_GREATER_EQUAL : D3D11_COMPARISON_ALWAYS;
     Shader *pa_e = alpha_func != D3D11_COMPARISON_ALWAYS && ps_e && ps_e->state != 2 && (ps_e->info.color_mask & 1)
                  ? find_shader_ex(ps_g, SHADER_PIXEL, vs_e->info.outputs, cb[STAGE_FRAGMENT], NULL, 0, 1) : NULL;
     Shader *vs = vs_e && vs_e->state == 1 ? vs_e : NULL;
@@ -3952,7 +4033,7 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     /* the fragment position in the game's pixels: SV_Position times these (gpu_shader.c ps_input) */
     params.base[2] = f32_bits(1.0f / rt_sx);
     params.base[3] = f32_bits(1.0f / rt_sy);
-    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
+    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = a2c ? 0.5f : f32_of(regs[M_ALPHA_REF]); }
     /* Facing: the hardware takes the signed area in window coordinates (x, y_w = scale * ndc + offset)
      * as GL does, counter-clockwise positive, and WINDOW_ORIGIN.FLIP_Y (bit 4) swaps the front face.
      * D3D judges the winding as seen on the target, which after the fix-up above is the window
@@ -4432,6 +4513,20 @@ static void save_bmp(ID3D11Texture2D *back, const char *path) {
     ID3D11Texture2D_Release(staging);
 }
 
+/* SSBU_CAPTURE_FROM / SSBU_CAPTURE_TO=<fight frame>: captures only inside that span of a fight
+ * (with SSBU_DEBUG_MATCH or SSBU_DEBUG_END set, which count the fight frames). */
+extern volatile long long test_fight_frame;
+static int capture_fight_window(void) {
+    static int read; static long long from, to;
+    if (!read++) {
+        const char *f = getenv("SSBU_CAPTURE_FROM"), *t = getenv("SSBU_CAPTURE_TO");
+        from = f ? atoll(f) : 0; to = t ? atoll(t) : 0;
+    }
+    if (from && test_fight_frame < from) return 0;
+    if (to && test_fight_frame > to) return 0;
+    return 1;
+}
+
 static void capture(ID3D11Texture2D *back, ID3D11Texture2D *window) {
     static const char *dir;
     static int checked, count;
@@ -4444,10 +4539,12 @@ static void capture(ID3D11Texture2D *back, ID3D11Texture2D *window) {
         if (getenv("SSBU_CAPTURE_EVERY")) every = (u64)(atof(getenv("SSBU_CAPTURE_EVERY")) * 1e9);
     }
     if (!dir || count >= most || rt_now_ns() - last < every) return;
+    if (!capture_fight_window()) return;
     last = rt_now_ns();
     char path[1024];
     snprintf(path, sizeof path, "%s/frame_%03d.bmp", dir, count);
     save_bmp(back, path);
+    if (test_fight_frame) fprintf(stderr, "[capture] frame_%03d.bmp at fight frame %lld\n", count, test_fight_frame);
     if (window && getenv("SSBU_CAPTURE_WINDOW")) {
         snprintf(path, sizeof path, "%s/window_%03d.bmp", dir, count);
         save_bmp(window, path);

@@ -1807,11 +1807,16 @@ static VShader *find_shader_ex(u64 g, int stage, u32 vs_outputs, const CbBinding
     if (!hlsl) { s->state = 2; vk_stat_shader_failures++; return s; }
     s->hlsl = hlsl;
     s->job.run = shader_job;
+    char cached_path[1200];
+    shader_cache_file(cached_path, sizeof cached_path, cache_dir(), s->stage, s->hash, s->vs_outputs, s->table_hash);
+    int cached = GetFileAttributesA(cached_path) != INVALID_FILE_ATTRIBUTES;
     job_add(&s->job);
     if (wait_makes()) wait_for(&s->state);
-    /* a compute program compiled before (its DXBC in the disk cache) is waited for a little, as gpu_d3d11.c
-     * does: a skipped launch leaves its outputs (skinned vertices) unwritten for a frame */
-    if (stage == SHADER_COMPUTE)
+    /* a program compiled before (its DXBC in the disk cache: only the SPIR-V and the module to make, milliseconds) is
+     * waited for a little, as gpu_d3d11.c does: a skipped draw is an effect missing the first time it is used (the
+     * owner's report 2026-11-09), a skipped launch leaves its outputs (skinned vertices) unwritten for a frame.
+     * Compute programs were waited for already; every stage now. One compiled from scratch (fxc) is not waited for. */
+    if (cached || stage == SHADER_COMPUTE)
         for (u64 until = GetTickCount64() + 250; s->state == 0 && GetTickCount64() < until;) SwitchToThread();
     return s;
 }
@@ -2460,6 +2465,9 @@ static VkPipeline get_pipeline(const PipeKey *k) {
     npipes++;
     job_add(&e->job);
     if (wait_makes()) wait_for(&e->state);
+    /* a new pipeline is waited for a little (its shaders are ready: the driver makes it in milliseconds, less with the
+     * pipeline cache warm), rather than its first draws skipped - an effect missing the first time (2026-11-09) */
+    for (u64 until = GetTickCount64() + 100; e->state == 0 && GetTickCount64() < until;) SwitchToThread();
     return e->state == 1 ? e->pipe : VK_NULL_HANDLE;
 }
 
@@ -2686,7 +2694,9 @@ static void vk_draw_(const u32 *regs, const CbBinding cb[STAGES][18], int indexe
     VShader *vs = vs_g ? find_shader(vs_g, SHADER_VERTEX, 0, cb[STAGE_VERTEX], 0) : NULL;
     /* (the pixel shader asked for once the vertex shader is translated: both are made at the same time) */
     VShader *ps_e = vs && vs->state != 2 && ps_g ? find_shader(ps_g, SHADER_PIXEL, vs->info.outputs, cb[STAGE_FRAGMENT], 0) : NULL;
-    u32 alpha_func = regs[M_ALPHA_TEST] & 1 && !(vk_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : 8;
+    /* alpha to coverage on targets of one sample: the alpha test >= 0.5 (gpu_d3d11.c) */
+    int a2c = (regs[M_ANTI_ALIAS_ALPHA_CONTROL] & 1) && !(regs[M_ALPHA_TEST] & 1) && !(vk_debug() & 64);
+    u32 alpha_func = regs[M_ALPHA_TEST] & 1 && !(vk_debug() & 64) ? compare_func(regs[M_ALPHA_FUNC]) : a2c ? 7 : 8;
     VShader *pa_e = alpha_func != 8 && ps_e && ps_e->state != 2 && (ps_e->info.color_mask & 1)
                   ? find_shader(ps_g, SHADER_PIXEL, vs->info.outputs, cb[STAGE_FRAGMENT], 1) : NULL;
     VShader *ps = pa_e && pa_e->state == 1 ? pa_e : ps_e && ps_e->state == 1 ? ps_e : NULL;
@@ -2750,7 +2760,7 @@ static void vk_draw_(const u32 *regs, const CbBinding cb[STAGES][18], int indexe
     params.frag[1] = (float)rt_h;
     params.base[2] = f32_bits(1.0f / rt_sx);
     params.base[3] = f32_bits(1.0f / rt_sy);
-    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = f32_of(regs[M_ALPHA_REF]); }
+    if (pa_e && ps == pa_e) { params.frag[2] = f32_of(alpha_test_mask(alpha_func)); params.frag[3] = a2c ? 0.5f : f32_of(regs[M_ALPHA_REF]); }
     int flipped = (!lower_left) != ((regs[M_WINDOW_ORIGIN] >> 4) & 1);
     VkRect2D scissor = {{0, 0}, {area_w, area_h}};
     if (regs[M_SCISSOR(0)] & 1) {

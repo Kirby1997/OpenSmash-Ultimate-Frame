@@ -235,7 +235,9 @@ int net_rollback_default(void) {
     char line[256], host[256] = "";
     const char *h = getenv("SSBU_NET_HOST"), *r = getenv("SSBU_NET_RELAY");
     v = 0;
-    if (settings_line_read(config_path(CONFIG_ONLINE_ROLLBACK), line, sizeof line) && !_strnicmp(line, "off", 3)) return v;
+    /* (off unless asked for: online_rollback.txt "on", the settings menu's Online > Rollback netcode. The game's
+     * own netcode is the default until rollback passes two-PC tests; alpha.3's players found it unplayable) */
+    if (!(settings_line_read(config_path(CONFIG_ONLINE_ROLLBACK), line, sizeof line) && !_strnicmp(line, "on", 2))) return v;
     /* (a private room started by Host/Join SSBU Netplay.bat: SSBU_NET_HOST or SSBU_NET_RELAY, no --online) */
     if (h && *h && strcmp(h, "0")) return v = 1;
     if (r && *r) return v = _stricmp(r, "off") != 0;
@@ -2725,6 +2727,27 @@ static void start(void) {
         }
     }
     InitOnceComplete(&once, 0, NULL);
+}
+
+int net_peer_quality(NetPeerQ *out, int max) {
+    if (!configured || !joined) return 0;
+    u64 t = now_ms();
+    int n = 0;
+    AcquireSRWLockShared(&peers_lock);
+    for (int i = 0; i < npeers && n < max; i++) {
+        const Peer *q = &peers[i];
+        NetPeerQ *o = &out[n++];
+        snprintf(o->name, sizeof o->name, "%s", q->name);
+        int direct = usable(q, t);
+        o->relayed = !direct;
+        o->rtt_ms = direct ? (int)q->rtt : -1;
+        /* (good: a direct path under 60 ms; so-so: up to 120 ms, or through the lobby's relay; poor: slower, or
+         * nothing heard from them for over 2 s) */
+        int quiet = q->last_ack && t - q->last_ack > 2000 && direct;
+        o->quality = quiet ? 2 : !direct ? 1 : q->rtt <= 60 ? 0 : q->rtt <= 120 ? 1 : 2;
+    }
+    ReleaseSRWLockShared(&peers_lock);
+    return n;
 }
 
 void net_status(char *out, size_t n) {
