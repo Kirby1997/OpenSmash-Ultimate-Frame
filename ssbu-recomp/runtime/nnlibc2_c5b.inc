@@ -20,6 +20,7 @@ uint64_t sdk_symbol(const char *name);
 void sdk_host_override(const char *name, ImportFn fn);
 int sdk_install(const char *name);
 uint32_t fs_mount_plain(const char *name, const char *host_dir);
+const char *fs_mount_work(const char *name);
 
 static char *g_diag_capture;             /* self-test: the text that reached the debug log */
 static size_t g_diag_capture_len, g_diag_capture_cap;
@@ -151,7 +152,7 @@ int libc2_stdio_selftest(Ctx *c) {
     snprintf(base + strlen(base), 64, "ssbu_stdio_selftest_%lu", (unsigned long)GetCurrentProcessId());
     CreateDirectoryA(base, NULL);
     STCHECK(fs_mount_plain("c5bstdio", base) == 0, "scratch mount");
-    snprintf(p, sizeof p, "%s.work.%lu\\w.txt", base, (unsigned long)GetCurrentProcessId());   /* nnfs.c: changes of a mount live in its working folder until a commit */
+    snprintf(p, sizeof p, "%s\\w.txt", fs_mount_work("c5bstdio"));   /* nnfs.c: changes of a mount live in its working folder until a commit */
     uint64_t f = st_call(c, "fopen", SG("c5bstdio:/none.txt"), SG("r"), 0, 0);
     STCHECK(f == 0 && st_errno(c) == 2, "fopen(missing, \"r\") is not NULL / ENOENT");
     f = st_call(c, "fopen", SG("c5bstdio:/w.txt"), SG("w"), 0, 0);

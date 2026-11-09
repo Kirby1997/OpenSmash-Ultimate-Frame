@@ -395,6 +395,8 @@ static void t_writethrough(void) {
     snprintf(s, sizeof s, "%s/wt/b/none.bin", T);
     CHECK(!MoveFileExA(b, s, 0) && GetLastError() == ERROR_FILE_NOT_FOUND);                              /* the source is gone */
     CHECK(CopyFileA(a, b, TRUE) && fsize(b) == 1 && !CopyFileA(a, b, TRUE) && (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS));
+    snprintf(a, sizeof a, "%s/wt/b", T); snprintf(b, sizeof b, "%s/wt/fromdir.bin", T);
+    CHECK(!CopyFileA(a, b, FALSE) && fsize(b) == -1);     /* a read error (here EISDIR) fails the copy and leaves no file (was TRUE + 0 bytes) */
 }
 
 /* ================================================================ 6. save commit with kill -9 */
@@ -776,6 +778,153 @@ static void t_old_marker(void) {
     CHECKF(!strcmp(s, k_more), "a reused pid: %s", s);
 }
 
+/* ---- the second review: an unreadable marker, leftovers of an earlier run with the same pid, a marker that appears before
+ * the decision, a decision whose folder sync fails, the commit lock not taken */
+static int child_unreadable_commit(void) {         /* a pending commit of a dead process whose marker this process cannot read */
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    chmod(tp("ud/save.commit"), 0);
+    uint32_t r = MOUNT_SAVE("save");
+    chmod(tp("ud/save.commit"), 0644);
+    if (!r) return 6;                                            /* must be refused: it cannot know the decided state */
+    if (MOUNT_SAVE("save")) return 7;                            /* readable again: the APPLY at the mount finishes it */
+    wr("save:/keep.bin", "keep2");
+    chmod(tp("ud/save.commit"), 0);                              /* (none now: the Commit needs no marker) */
+    uint32_t c = COMMIT("save");
+    UNMOUNT("save");
+    return c ? 3 : 0;
+}
+static int child_unreadable_c1(void) {             /* the same marker unreadable at Commit (C1): refused, nothing changed */
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    chmod(tp("ud/save"), 0555);
+    if (MOUNT_SAVE("save")) return 4;                            /* (its APPLY fails: pending, seeded) */
+    chmod(tp("ud/save"), 0777);
+    wr("save:/keep.bin", "keep2");
+    chmod(tp("ud/save.commit"), 0);
+    uint32_t c = COMMIT("save");
+    chmod(tp("ud/save.commit"), 0644);
+    if (!c || fsize(tp("ud/save/a.bin")) != 5) return 6;          /* refused, R untouched */
+    c = COMMIT("save");
+    UNMOUNT("save");
+    return c ? 3 : 0;
+}
+static char g_stale_dir[2048];
+static void stale_hook(const char *op, const char *path) {   /* the removal of stale.bin fails (its folder made read-only) */
+    char hp[2048];
+    if (!path || strcmp(op, "unlink") || !strstr(path, "stale.bin") || g_stale_dir[0]) return;
+    host_path_resolve(path, hp, sizeof hp);
+    snprintf(g_stale_dir, sizeof g_stale_dir, "%s", hp); *strrchr(g_stale_dir, '/') = 0; chmod(g_stale_dir, 0555);
+}
+static int child_stale(void) {                     /* stage and working folders an earlier start with this pid left behind */
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    char p[2048];
+    snprintf(p, sizeof p, "ud/save.stage.%d/sub/stale.bin", (int)getpid()); put(tp(p), "STALE");          /* an earlier build */
+    snprintf(p, sizeof p, "ud/save.stage.%d-1-1/sub/stale.bin", (int)getpid()); put(tp(p), "STALE");     /* this build, another run */
+    snprintf(p, sizeof p, "ud/save.work.%d/stale.bin", (int)getpid()); put(tp(p), "STALE");
+    g_stale_dir[0] = 0; fi_hook = stale_hook;
+    uint32_t r = MOUNT_SAVE("save");                             /* the sweep cannot remove one of them */
+    fi_hook = NULL;
+    if (g_stale_dir[0]) chmod(g_stale_dir, 0777);
+    if (r || !rd_is("save:/stale.bin", NULL) || !rd_is("save:/sub/stale.bin", NULL)) return 6;
+    wr("save:/keep.bin", "keep2");
+    r = COMMIT("save");
+    UNMOUNT("save");
+    return r ? 3 : 0;
+}
+static int g_foreign;
+static void foreign_hook(const char *op, const char *path) {  /* an older build decides its own commit just before this one does */
+    if (!g_foreign && path && !strcmp(op, "move") && strstr(path, "save.commit")) { g_foreign = 1; old_marker("4294967290"); }
+}
+static int child_foreign(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    char k[4096] = "";
+    if (MOUNT_SAVE("save")) return 4;
+    wr("save:/keep.bin", "keep2");
+    g_foreign = 0; fi_hook = foreign_hook;
+    uint32_t r = COMMIT("save");
+    fi_hook = NULL;
+    get(tp("ud/save.commit"), k, sizeof k);
+    if (!r || !g_foreign || !strstr(k, "save.work.4294967290")) return 6;   /* refused, and the other marker is still there, whole */
+    if (fsize(tp("ud/save/a.bin")) != 5) return 7;
+    UNMOUNT("save");                                             /* the other commit is applied; this one was never decided */
+    return 0;
+}
+static int g_syncfail;
+static void syncfail_hook(const char *op, const char *path) {   /* the folder of the new marker cannot be synced (open fails) */
+    if (path && !strcmp(op, "fsync-dir") && strstr(path, "save.commit") && !g_syncfail) { g_syncfail = 1; chmod(tp("ud"), 0333); }
+}
+static int child_syncfail(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    changes();
+    g_syncfail = 0; fi_hook = syncfail_hook;
+    uint32_t r = COMMIT("save");
+    fi_hook = NULL;
+    chmod(tp("ud"), 0777);
+    if (!r || !g_syncfail || fsize(tp("ud/save.commit")) < 0) return 6;    /* failed, decided, pending */
+    char s[2048] = ""; snap(tp("ud/save"), "", s, sizeof s);
+    if (strcmp(s, g_old)) return 7;                              /* and not applied: R untouched */
+    if (!view_is_new()) return 8;
+    UNMOUNT("save");                                             /* applied now */
+    return 0;
+}
+static int child_nolock(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    if (MOUNT_SAVE("save")) return 4;
+    wr("save:/keep.bin", "keep2");
+    chmod(tp("ud"), 0333);                                       /* the folder cannot be opened: no flock */
+    uint32_t r = COMMIT("save");
+    chmod(tp("ud"), 0777);
+    if (!r || fsize(tp("ud/save.commit")) >= 0 || fsize(tp("ud/save/keep.bin")) != 4) return 6;   /* refused, nothing changed */
+    r = COMMIT("save");
+    UNMOUNT("save");
+    return r ? 3 : 0;
+}
+static void t_review5(void) {
+    SECTION("unreadable marker (mount refused, no sweep, C1 refused), an earlier start's leftovers, a marker that appears before the decision, a failed decision sync, no lock");
+    const char *keep2 = "D.bin=new-d;RE/;RE/y.bin=new-y;a.bin=new-a-longer;dir1/;dir1/c.bin=new-c;keep.bin=keep2;";
+    const char *old_keep2 = "a.bin=old-a;b.bin=old-b;d.bin=old-d;keep.bin=keep2;olddir/;olddir/o1.bin=o1;olddir/o2.bin=o2;re/;re/x.bin=old-x;";
+    char s[2048];
+    int st;
+#define STATE_IS(want, what) do { s[0] = 0; snap(tp("ud/save"), "", s, sizeof s); CHECKF(!strcmp(s, want) && !leftovers(), "%s: %d leftovers, state %s", what, leftovers(), s); } while (0)
+    for (int kind = FAIL_MOVE; kind <= FAIL_DELETE; kind++) {
+        g_twoproc_kind = kind;
+        old_state();
+        CHECK(in_child(child_a) == 99);
+        CHECKF((st = in_child(child_unreadable_commit)) == 0, "%s: unreadable marker at the mount: %d", k_fail_kind[kind], st);
+        STATE_IS(keep2, "unreadable marker at the mount, then readable");
+        old_state();
+        CHECK(in_child(child_a) == 99);
+        chmod(tp("ud/save.commit"), 0);
+        CHECK(!DONE(run_child(1, 0)));                           /* a mount (and its sweep) while it cannot be read: refused */
+        chmod(tp("ud/save.commit"), 0644);
+        CHECK(DONE(run_child(1, 0)));
+        STATE_IS(k_new, "unreadable marker at one mount and its sweep, then the next mount");
+        old_state();
+        CHECK(in_child(child_a) == 99);
+        CHECKF((st = in_child(child_unreadable_c1)) == 0, "%s: unreadable marker at C1: %d", k_fail_kind[kind], st);
+        CHECK(DONE(run_child(1, 0)));
+        STATE_IS(keep2, "unreadable marker at C1, then Commit again");
+    }
+    old_state();
+    CHECKF((st = in_child(child_stale)) == 0, "leftovers of an earlier start: %d", st);
+    CHECK(DONE(run_child(1, 0)));
+    s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+    CHECKF(!strstr(s, "stale") && strstr(s, "keep.bin=keep2") && !leftovers(), "leftovers of an earlier start: %d leftovers, state %s", leftovers(), s);
+    old_state();
+    CHECKF((st = in_child(child_foreign)) == 0, "a marker that appears before the decision: %d", st);
+    CHECK(DONE(run_child(1, 0)));
+    STATE_IS(k_new, "a marker that appears before the decision (it is applied, this commit was not decided)");
+    old_state();
+    g_old[0] = 0; snap(tp("ud/save"), "", g_old, sizeof g_old);
+    CHECKF((st = in_child(child_syncfail)) == 0, "the decision's folder sync fails: %d", st);
+    CHECK(DONE(run_child(1, 0)));
+    STATE_IS(k_new, "the decision's folder sync fails, then Unmount");
+    old_state();
+    CHECKF((st = in_child(child_nolock)) == 0, "no commit lock: %d", st);
+    CHECK(DONE(run_child(1, 0)));
+    STATE_IS(old_keep2, "no commit lock, then Commit again");
+#undef STATE_IS
+}
+
 /* ================================================================ 7. config and font paths, exe dir, the built-in self-tests */
 static int in_child(int (*fn)(void)) { fflush(NULL); pid_t p = fork(); if (!p) _exit(fn()); int st; waitpid(p, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) : 99; }
 static int gfx_existing(void) {                    /* an existing config in another case, named with backslashes */
@@ -849,7 +998,7 @@ int main(int argc, char **argv) {
     if (!getenv("FS_NO_KILL")) t_commit_kill();
     t_commit_fail();
     if (!getenv("FS_NO_KILL") && !g_skip_fail) { t_commit_fail_kill(); t_two_process(); }
-    if (!g_skip_fail) t_old_marker();
+    if (!g_skip_fail) { t_old_marker(); t_review5(); }
     t_misc();
     if (!mt_fail && !getenv("FS_KEEP")) rm_rf(T); else printf("test_fs: kept %s\n", T);
     return mt_done("test_fs");

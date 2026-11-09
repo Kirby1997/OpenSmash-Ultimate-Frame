@@ -30,6 +30,7 @@ void register_unwind_imports(void) { needs_game("register_unwind_imports"); }
 void cxx_string_init(Ctx *c, uint64_t str, const char *p, size_t n) { (void)c; (void)str; (void)p; (void)n; needs_game("cxx_string_init (libcxx.c, the game allocator)"); }
 const char *cxx_string_data(uint64_t str, size_t *n) { (void)str; (void)n; needs_game("cxx_string_data"); }
 uint32_t fs_mount_plain(const char *name, const char *host_dir) { (void)name; (void)host_dir; return 1; }
+const char *fs_mount_work(const char *name) { (void)name; return ""; }
 int nnfs_handle_fd(uint64_t h) { (void)h; return -1; }
 int sdk_image_ready(void) { return 0; }
 ImportFn sdk_lifted(const char *name) { (void)name; return NULL; }

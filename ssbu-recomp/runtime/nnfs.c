@@ -12,12 +12,12 @@
  * SAVE DATA JOURNAL. On the console, writes to save data are not permanent until nn::fs::Commit: they go to a journal,
  * Commit applies all of them together, and uncommitted writes are gone at the next mount. Here:
  *   - <userdata>\save is the COMMITTED state and is never written outside Commit.
- *   - Mounting creates the working folder <userdata>\save.work.<pid>. A file is copied into it the first time it is
+ *   - Mounting creates the working folder <userdata>\save.work.<pid>-<run>-<n> (a name never used before). A file is copied into it the first time it is
  *     opened for writing (copy-on-write) or created there; deletions are recorded (tombstones); every read, existence
  *     test and directory listing sees the working folder over the committed one, minus the tombstones.
  *   - Commit ([sdk 0x1f4490] FileSystemAccessor::Commit: fails with 0x327202 while a file of the mount is open with the
- *     write mode) is two-phase: (1) the working folder is copied to <userdata>\save.stage.<pid> and the list of changes is
- *     written to <userdata>\save.journal.<pid>, flushed, and renamed to <userdata>\save.commit -- from this rename on the
+ *     write mode) is two-phase: (1) the working folder is copied to a new <userdata>\save.stage.<pid>-<run>-<n> and the list
+ *     of changes is written to a journal file, flushed, and renamed to <userdata>\save.commit -- from this rename on the
  *     commit is decided; (2) the changes are applied (deletions done, files moved from the stage folder over the committed
  *     ones) and the marker is removed. A process killed in phase 1 leaves the committed state untouched; one killed in
  *     phase 2 leaves the marker, and the next mount finishes the apply (roll forward) before anything is read. An apply that
@@ -119,7 +119,18 @@ static void make_parents(const char *path) {             /* creates every missin
     snprintf(tmp, sizeof tmp, "%s", path);
     for (char *p = tmp + 3; *p; p++) if (*p == '\\') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '\\'; }
 }
-static void remove_tree(const char *dir) {
+/* Windows: an antivirus or the indexer can hold a file for a moment (sharing violation, or access denied while it is open):
+ * tried again for up to about half a second. Elsewhere a failure is final at once. */
+static int transient_failure(int attempt) {
+#ifdef _WIN32
+    DWORD e = GetLastError();
+    if (attempt < 15 && (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION || e == ERROR_ACCESS_DENIED)) { Sleep(30); return 1; }
+#endif
+    (void)attempt;
+    return 0;
+}
+/* The folder and everything in it; read-only attributes cleared, transient failures retried. 1 = gone afterwards. */
+static int remove_tree(const char *dir) {
     char pat[MAX_PATH], sub[MAX_PATH];
     WIN32_FIND_DATAA fd;
     snprintf(pat, sizeof pat, "%s\\*", dir);
@@ -129,12 +140,16 @@ static void remove_tree(const char *dir) {
             if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
             snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(sub);
-            else { SetFileAttributesA(sub, FILE_ATTRIBUTE_NORMAL); DeleteFileA(sub); }
+            else for (int i = 0; exists(sub); i++) {
+                SetFileAttributesA(sub, FILE_ATTRIBUTE_NORMAL);
+                if (DeleteFileA(sub) || !transient_failure(i)) break;
+            }
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
     SetFileAttributesA(dir, FILE_ATTRIBUTE_NORMAL);       /* Windows: a read-only folder is not removed */
-    RemoveDirectoryA(dir);
+    for (int i = 0; exists(dir); i++) if (RemoveDirectoryA(dir) || !transient_failure(i)) break;
+    return !exists(dir);
 }
 
 /* ---- tombstones */
@@ -541,33 +556,37 @@ static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "
 
 /* ---- journal: commit and recovery
  *
- * THE COMMIT PROTOCOL. Folders and files next to a journaled root R (<userdata>\save, <userdata>\cache):
+ * THE COMMIT PROTOCOL. Folders and files next to a journaled root R (<userdata>\save, <userdata>\cache); <id> below is
+ * "<pid>-<run>-<n>": the pid, this run's start time and a counter, so a name is never used twice, not even by a later start
+ * that gets the same pid (a Steam runtime container can give the game the same pid every time). Earlier builds used "<pid>".
  *   R                  the committed state. Changed only by APPLY of a decided marker.
- *   R.work.<pid>  (E)  a mount's working folder: the uncommitted changes of that process (copy-on-write files, new files),
+ *   R.work.<id>   (E)  a mount's working folder: the uncommitted changes of that mount (copy-on-write files, new files),
  *                      with the mount's tombstones (in memory) for its deletions. Never named by a marker of this build, so
- *                      an uncommitted write can never be applied. (".work.<pid>-1" when an older build's marker still names
- *                      ".work.<pid>": a reused pid.)
- *   R.stage.<pid> (S)  a frozen copy of E taken by Commit: what a decided commit moves into R. Written only before its
+ *                      an uncommitted write can never be applied.
+ *   R.stage.<id>  (S)  a frozen copy of E taken by one Commit: what that decided commit moves into R. A new name for every
+ *                      Commit (a folder whose removal failed is never mistaken for an empty one); written only before its
  *                      marker exists; once a marker names it, only APPLY's moves take files out of it; removed only after
  *                      its marker is gone.
- *   R.journal.<pid>    the marker being written.
+ *   R.journal.<id>     the marker being written.
  *   R.commit      (K)  the marker. Lines: "W <folder the files come from>", "R <root>", then "D rel" (delete), then "M rel"
  *                      (make folder) and "F rel" (move file) in the order of a walk of W. All D lines come before the first
  *                      F line. Earlier builds wrote the same lines with W = their E; those are applied the same way.
- * A commit is DECIDED once K is durably renamed into place. Every step below runs under the commit lock (a named mutex on
- * Windows, flock of R's parent folder elsewhere: plat_posix.c's CreateMutexA has no names).
+ * A commit is DECIDED once K is renamed into place (on POSIX: and its folder is synced). Every step below runs under the
+ * commit lock: a named mutex on Windows, flock of R's parent folder elsewhere (plat_posix.c's CreateMutexA has no names).
+ * When the lock cannot be taken, Commit is refused, recovery does nothing, and a mount over a pending commit is refused.
  *
  * Commit (fs_Commit), states and what a crash or a failure leaves:
- *   C1 K exists (an earlier decided commit, of any process, is unfinished): APPLY it. If that fails the new Commit is refused
- *      and nothing else changes -- a commit is never decided over an unfinished one, so at most one K exists per root.
- *   C2 S of this pid (stale: nothing names it) is removed; E is copied into S; S's files are flushed and its folders synced.
- *   C3 the marker is written to R.journal.<pid> and flushed.         Crash or failure in C2..C3: K absent, R = OLD state;
- *                                                                    S and the journal are dropped (now, or at the next mount
- *                                                                    when the pid is dead).
- *   C4 R.journal.<pid> is renamed to K: DECIDED.
+ *   C1 K exists (an earlier decided commit, of any process, is unfinished, or its marker cannot be read): APPLY it. If that
+ *      fails the new Commit is refused and nothing else changes -- a commit is never decided over an unfinished one.
+ *   C2 E is copied into a new S; S's files are flushed and its folders synced.
+ *   C3 the marker is written to a new R.journal.<id> and flushed.  Crash or failure in C2..C3: K absent, R = OLD state;
+ *                                                                    S and the journal are dropped (now, or by the sweep).
+ *   C4 R.journal.<id> is renamed to K WITHOUT replacing: if a K exists after all (a committer without the lock: an older
+ *      build), the rename fails and this commit is not decided. POSIX: K's folder is then synced (3 tries): if that fails,
+ *      K stays but is not applied now -- the moves of C5 must not reach the disk before K does; the commit is pending.
  *   C5 APPLY K.                                                      Crash in C4..C5: K present, the next mount APPLIES it:
  *                                                                    R = NEW state. Failure in C5: K stays, see "pending".
- *   C6 success: E is emptied and the tombstones dropped (R now holds all of it).
+ *   C6 success: E is emptied (a new E if that fails) and the tombstones dropped (R now holds all of it).
  * APPLY(K), repeatable from any point:
  *   A1 if every F source still exists in W, the D phase may be unfinished: each D target is deleted (read-only cleared,
  *      sharing violations retried on Windows) and must be GONE afterwards, else APPLY stops before the first F (-3). If some
@@ -575,52 +594,86 @@ static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "
  *   A2 M and F lines in order; an F whose source is gone was moved already. A folder that cannot be made, or a move that
  *      fails, stops APPLY (-2): the D phase is complete, the remaining sources are still in W.
  *   A3 K is deleted and must be GONE (an antivirus can hold it open on Windows), else -4; then R's folder is synced.
- *   A4 then (only then) a stage folder W is removed. (An older build's ".work." W is left to the dead-pid sweep.)
- * Pending: K exists and APPLY failed (a full disk, a read-only file or folder, a sharing violation).
+ *   A4 then (only then) a stage folder W is removed. (An older build's ".work." W is left to the sweep.)
+ *   A K that exists but cannot be read is -1: nothing is done, and it counts as pending.
+ * Pending: K exists and APPLY failed (a full disk, a read-only file or folder, a sharing violation, an unreadable K).
  *   - The committing mount keeps E and its tombstones: they still describe the decided state, which is what the game sees.
  *     New writes go to E only; S is untouched, so they are never applied by the pending commit.
  *   - A mount that finds K pending (after its own APPLY attempt failed) starts E as a copy of W, plus tombstones for the D
- *     lines when the D phase is unfinished: it sees the decided state too. If that copy fails the mount fails (the game
- *     sees an error, not a wrong state; everything stays on disk for the next attempt).
+ *     lines when the D phase is unfinished: it sees the decided state too. If K cannot be read, or that copy fails, or the
+ *     lock is not held, the mount fails (the game sees an error, not a wrong state; everything stays for the next attempt).
  *   - While a commit is pending, every deletion records a tombstone, since a file may exist only in the pending commit,
  *     which C1 moves into R before this mount's own changes.
- *   - K is APPLIED again by the next Commit (C1), by Unmount, and by every mount; until then W is kept by the dead-pid sweep.
- * Unmount: APPLY a pending K (best effort), then remove E: uncommitted changes are dropped.
+ *   - K is APPLIED again by the next Commit (C1), by Unmount, and by every mount.
+ * The sweep (journal_recover, at every mount and Unmount) drops the working folders, stage folders and
+ * journals of runs that are over (another pid that no longer runs; this pid with another <run>; an older build's name with
+ * this pid). While any K exists -- readable or not -- it drops no working or stage folder: one of them is K's W.
+ * Unmount: APPLY a pending K (best effort) and sweep, then remove E: uncommitted changes are dropped.
  * Every crash point thus converges to the complete old state (K never written) or the complete state of the last decided
  * commit (K written; APPLY finishes it), and the game's view of a mounted save is the last decided state plus its own
  * uncommitted changes. Not covered: two processes changing the same save at once (each commit is whole; the later one
- * wins), and an older build running at the same time as this one (it does not know stage folders or the POSIX lock). */
+ * wins), and an older build running at the same time as this one (it does not know stage folders or the POSIX lock; it
+ * can still replace a marker this build decided). */
+typedef struct { intptr_t h; int ok; } CommitLock;       /* ok 0: the lock could not be taken (see "the commit lock") */
 #ifdef _WIN32
-typedef HANDLE CommitLock;
 static CommitLock commit_mutex(const char *root) {
     (void)root;
+    CommitLock l = {0, 0};
     HANDLE mx = CreateMutexA(NULL, FALSE, "ssbu_native_save_commit");
-    if (mx) WaitForSingleObject(mx, INFINITE);
-    return mx;
+    if (mx) { DWORD w = WaitForSingleObject(mx, INFINITE); l.ok = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED; }   /* abandoned: its owner died; ours now */
+    if (mx && !l.ok) { CloseHandle(mx); mx = NULL; }
+    l.h = (intptr_t)mx;
+    return l;
 }
-static void commit_done(CommitLock mx) { if (mx) { ReleaseMutex(mx); CloseHandle(mx); } }
+static void commit_done(CommitLock l) { if (l.h) { ReleaseMutex((HANDLE)l.h); CloseHandle((HANDLE)l.h); } }
 #else
-typedef int CommitLock;
 static CommitLock commit_mutex(const char *root) {       /* flock of the folder that holds R: other processes and other threads (own descriptions) */
+    CommitLock l = {-1, 0};
     char dir[MAX_PATH];
     host_path_resolve(root, dir, sizeof dir);
     char *sl = strrchr(dir, '/');
     if (!sl) strcpy(dir, "."); else if (sl == dir) dir[1] = 0; else *sl = 0;
     int fd = open(dir, O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) while (flock(fd, LOCK_EX) != 0 && errno == EINTR) {}
-    return fd;
+    if (fd < 0) return l;
+    int r;
+    while ((r = flock(fd, LOCK_EX)) != 0 && errno == EINTR) {}
+    if (r) { close(fd); return l; }                       /* (ENOLCK: a network file system without locks) */
+    l.h = fd; l.ok = 1;
+    return l;
 }
-static void commit_done(CommitLock fd) { if (fd >= 0) close(fd); }
+static void commit_done(CommitLock l) { if (l.ok) close((int)l.h); }
 #endif
-/* Windows: an antivirus or the indexer can hold a file for a moment (sharing violation, or access denied while it is open):
- * tried again for up to about half a second. Elsewhere a failure is final at once. */
-static int transient_failure(int attempt) {
-#ifdef _WIN32
-    DWORD e = GetLastError();
-    if (attempt < 15 && (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION || e == ERROR_ACCESS_DENIED)) { Sleep(30); return 1; }
-#endif
-    (void)attempt;
-    return 0;
+/* Names of working, stage and journal files that no other process and no earlier run with the same pid ever uses:
+ * "<root>.<kind>.<pid>-<run>-<n>" (<run> = this process's start time, hex). A Steam runtime container can give the game the
+ * same pid at every start, so a pid alone is not enough; a name is never reused, so a folder left by a failed removal is
+ * never mistaken for a fresh one. Earlier builds named them "<root>.<kind>.<pid>". */
+static unsigned long long g_run_id;
+static volatile LONG g_name_seq;
+static unsigned long long run_id(void) {
+    if (!g_run_id) { FILETIME ft; GetSystemTimeAsFileTime(&ft); g_run_id = ((unsigned long long)ft.dwHighDateTime << 32 | ft.dwLowDateTime) | 1; }
+    return g_run_id;
+}
+static void journal_name(char *out, const char *root, const char *kind) {
+    snprintf(out, MAX_PATH, "%s.%s.%lu-%llx-%ld", root, kind, (unsigned long)GetCurrentProcessId(), run_id(), (long)InterlockedIncrement(&g_name_seq));
+}
+/* "<root leaf>.<kind>.<pid>[-<run>-<n>]" next to the root: its kind ("work", "stage", "journal"), pid and run (0: an earlier
+ * build's name); NULL for anything else. */
+static const char *journal_entry(const char *root, const char *name, DWORD *pid, unsigned long long *run) {
+    static const char *const kinds[] = {"work", "stage", "journal"};
+    const char *leaf = root + strlen(root);
+    while (leaf > root && leaf[-1] != '\\' && leaf[-1] != '/') leaf--;
+    size_t n = strlen(leaf);
+    if (_strnicmp(name, leaf, n) || name[n] != '.') return NULL;
+    const char *k = name + n + 1;
+    for (int i = 0; i < 3; i++) {
+        size_t kl = strlen(kinds[i]);
+        if (strncmp(k, kinds[i], kl) || k[kl] != '.' || k[kl + 1] < '0' || k[kl + 1] > '9') continue;
+        char *e;
+        *pid = (DWORD)strtoul(k + kl + 1, &e, 10);
+        *run = *e == '-' ? strtoull(e + 1, NULL, 16) : 0;
+        return kinds[i];
+    }
+    return NULL;
 }
 static int delete_entry(const char *path) {               /* 1 = gone afterwards */
     if (is_dir(path)) remove_tree(path);
@@ -751,13 +804,14 @@ static int journal_apply(const char *marker) {
     if (work[0] && is_stage(work)) remove_tree(work);
     return n;
 }
-/* A decided commit of `root` that is not finished: 1, and `work` = its W (the folder that holds the rest of it). */
+/* A decided commit of `root` that is not finished: 1, and `work` = its W (the folder that holds the rest of it); -1 when its
+ * marker exists but cannot be read now (Windows: an antivirus or a sync client holding it; POSIX: EMFILE, EIO); 0 none. */
 static int commit_pending(const char *root, char *work) {
     char marker[MAX_PATH], r[MAX_PATH];
     int done;
     snprintf(marker, sizeof marker, "%s.commit", root);
     FILE *j = marker_open(marker, work, r, &done);
-    if (!j) return 0;
+    if (!j) return exists(marker) ? -1 : 0;
     fclose(j);
     return 1;
 }
@@ -769,12 +823,13 @@ static int pid_alive(DWORD pid) {
     return alive;
 }
 /* Before a save-type folder is mounted, and at Unmount: APPLY a decided commit that is not finished, and drop the working
- * folders, stage folders and half-written journals of processes that no longer run -- except the folder a pending marker
- * still moves from. */
+ * folders, stage folders and half-written journals of runs that are over. While any marker exists -- readable or not --
+ * no working or stage folder is dropped: one of them is the rest of the decided commit. Without the lock nothing is done. */
 static void journal_recover(const char *root) {
     char marker[MAX_PATH], pat[MAX_PATH], path[MAX_PATH];
     WIN32_FIND_DATAA fd;
     CommitLock mx = commit_mutex(root);
+    if (!mx.ok) { printf("nn::fs: the commit lock of %s could not be taken: recovery skipped\n", root); return; }
     snprintf(marker, sizeof marker, "%s.commit", root);
     if (exists(marker)) {
         int n = journal_apply(marker);
@@ -782,21 +837,16 @@ static void journal_recover(const char *root) {
         else printf("nn::fs: a decided commit of %s could not be finished yet (%d); it is kept and tried again\n", root, n);
         trace_printf("     fs journal: interrupted commit of %s rolled forward (%d)\n", root, n);
     }
-    char pending[MAX_PATH];
-    const char *pending_leaf = commit_pending(root, pending) && pending[0] ? pending + strlen(pending) : NULL;
-    while (pending_leaf && pending_leaf > pending && pending_leaf[-1] != '\\' && pending_leaf[-1] != '/') pending_leaf--;
+    int marker_left = exists(marker);
     snprintf(pat, sizeof pat, "%s.*", root);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            const char *ext = strrchr(fd.cFileName, '.');
-            const char *kind = !ext ? NULL : ext - 5 >= fd.cFileName && !strncmp(ext - 5, ".work", 5) ? "work"
-                             : ext - 6 >= fd.cFileName && !strncmp(ext - 6, ".stage", 6) ? "stage"
-                             : ext - 8 >= fd.cFileName && !strncmp(ext - 8, ".journal", 8) ? "journal" : NULL;
-            if (!kind) continue;
-            DWORD pid = (DWORD)strtoul(ext + 1, NULL, 10);
-            if (!pid || pid == GetCurrentProcessId() || pid_alive(pid)) continue;
-            if (pending_leaf && _stricmp(pending_leaf, fd.cFileName) == 0) continue;
+            DWORD pid;
+            unsigned long long run;
+            const char *kind = journal_entry(root, fd.cFileName, &pid, &run);
+            if (!kind || !pid || (marker_left && strcmp(kind, "journal"))) continue;
+            if (pid == GetCurrentProcessId() ? run == run_id() : pid_alive(pid)) continue;    /* (our pid, another run: an earlier start) */
             snprintf(path, sizeof path, "%s\\..\\%s", root, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else delete_entry(path);
             trace_printf("     fs journal: uncommitted %s of process %lu discarded (%s)\n", kind, (unsigned long)pid, fd.cFileName);
@@ -835,17 +885,17 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     if (kind != MK_ROM && kind != MK_DIRECT) {             /* a direct folder (sd:) is written at once: no working folder */
         char pending[MAX_PATH];
         CommitLock mx = commit_mutex(root);
-        snprintf(m->work, MAX_PATH, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
+        journal_name(m->work, root, "work");               /* a new name: nothing of an earlier mount or run is in it */
         int pend = commit_pending(root, pending);
-        if (pend && _stricmp(pending, m->work) == 0)       /* an older build's pending commit moves from this name (a reused pid) */
-            snprintf(m->work, MAX_PATH, "%s.work.%lu-1", root, (unsigned long)GetCurrentProcessId());
-        remove_tree(m->work);                              /* a second mount in this process starts from the committed state */
-        CreateDirectoryA(m->work, NULL);
-        int ok = !pend || seed_from_pending(m);
+        const char *why = pend < 0 ? "its marker cannot be read now" : pend && !mx.ok ? "the commit lock could not be taken" : NULL;
+        if (!why && !((CreateDirectoryA(m->work, NULL) || is_dir(m->work)))) why = "the working folder cannot be made";
+        if (!why && pend && !seed_from_pending(m)) why = "it could not be copied (disk full?)";
         commit_done(mx);
-        if (!ok) {
-            printf("nn::fs: %s has a decided commit that is not finished and could not be read (disk full?): mount refused\n", root);
-            remove_tree(m->work); tomb_clear(m);
+        if (why) {                                         /* the game sees an error, never a state that is not the decided one */
+            if (pend) printf("nn::fs: %s has a decided commit that is not finished and %s: mount refused\n", root, why);
+            else printf("nn::fs: %s: %s: mount refused\n", root, why);
+            remove_tree(m->work);                          /* (a name of this run only) */
+            tomb_clear(m);
             memset(m, 0, sizeof *m);
             fs_unlock();
             return RESULT_GENERIC_FAILURE;
@@ -903,9 +953,7 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
     if (m) {
         for (int i = 0; i < OPEN_MAX; i++) if (g_open[i].h && g_open[i].mount == m) { CloseHandle(g_open[i].h); g_open[i].h = NULL; }   /* [sdk 0x1f4870] the accessor closes what is left open */
         if (m->work[0]) {
-            char marker[MAX_PATH];
-            snprintf(marker, sizeof marker, "%s.commit", m->root);
-            if (exists(marker)) journal_recover(m->root);  /* a decided commit is not finished: try now (else the next Commit or mount does) */
+            journal_recover(m->root);                      /* a decided commit not finished: try now (else the next Commit or mount does); the sweep */
             remove_tree(m->work);                          /* the uncommitted changes: never part of a decided commit */
         }
         tomb_clear(m);
@@ -932,24 +980,26 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     for (int i = 0; i < OPEN_MAX; i++)
         if (g_open[i].h && g_open[i].mount == m && (g_open[i].mode & 2)) { fs_unlock(); trace_printf("     fs commit \"%s\": refused, a file is open for writing\n", name); RET(RESULT_WRITE_FILE_OPEN); return; }
     CommitLock mx = commit_mutex(m->root);
-    snprintf(journal, sizeof journal, "%s.journal.%lu", m->root, (unsigned long)GetCurrentProcessId());
-    snprintf(stage, sizeof stage, "%s.stage.%lu", m->root, (unsigned long)GetCurrentProcessId());
+    journal_name(journal, m->root, "journal");
+    journal_name(stage, m->root, "stage");                /* never used before: no leftover of a failed removal can be in it */
     snprintf(marker, sizeof marker, "%s.commit", m->root);
-    const char *step = "finish the pending commit";
-    int changes = exists(marker) ? journal_apply(marker) : 0;                  /* C1 */
-    int ok = changes >= 0, decided = 0;
+    const char *step = "lock";
+    int changes = -1, ok = mx.ok, decided = 0;
+    if (ok) {                                                                   /* C1 */
+        step = "finish the pending commit";
+        changes = exists(marker) ? journal_apply(marker) : 0;                  /* (-1: a marker that cannot be read) */
+        ok = changes >= 0;
+    }
     if (ok) {                                                                   /* C2 */
         step = "stage";
-        remove_tree(stage);
-        ok = copy_tree(m->work, stage, 1);
+        ok = !exists(stage) && copy_tree(m->work, stage, 1);
 #ifndef _WIN32
         if (ok) host_fsync_parent(stage);
 #endif
     }
     if (ok) {                                                                   /* C3 */
         step = "write the journal";
-        delete_entry(journal);
-        FILE *j = fopen(journal, "w");
+        FILE *j = exists(journal) ? NULL : fopen(journal, "w");
         ok = j != NULL;
         if (ok) {
             fprintf(j, "W\t%s\nR\t%s\n", stage, m->root);
@@ -961,20 +1011,36 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     }
     if (ok) {                                                                   /* C4 */
         step = "decide";
-        ok = MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-        decided = ok || exists(marker);                    /* (renamed, but its folder sync failed: decided all the same) */
+        /* never over an existing marker (an older build, or a process without the lock, may have decided one since C1): the
+         * rename fails instead, and this commit is not decided */
+#ifdef _WIN32
+        decided = ok = MoveFileExA(journal, marker, MOVEFILE_WRITE_THROUGH);
+#else
+        decided = ok = MoveFileExA(journal, marker, 0);   /* (the journal's data is on disk already; its folder is synced next) */
+        if (decided) {
+            step = "sync the decision";
+            ok = 0;
+            for (int i = 0; i < 3 && !ok; i++) ok = host_fsync_parent(marker) == 0;
+        }                                                 /* not synced: K stays and is not applied now (C5 must not outrun it to the disk) */
+#endif
     }
-    if (decided) { step = "apply"; changes = journal_apply(marker); ok = changes >= 0; }     /* C5 */
+    if (decided && ok) { step = "apply"; changes = journal_apply(marker); ok = changes >= 0; }     /* C5 */
     DWORD err = ok ? 0 : GetLastError();
-    if (ok) { tomb_clear(m); remove_tree(m->work); CreateDirectoryA(m->work, NULL); m->pend = 0; }   /* C6 */
+    if (ok) {                                                                   /* C6 */
+        tomb_clear(m);
+        if (!remove_tree(m->work)) journal_name(m->work, m->root, "work");     /* (not all gone: a new folder, the rest is swept later) */
+        CreateDirectoryA(m->work, NULL);
+        m->pend = 0;
+    }
     else if (decided) m->pend = 1;                         /* E and the tombstones stay: they show the decided state */
-    else if (strcmp(step, "finish the pending commit")) { delete_entry(journal); remove_tree(stage); }   /* not decided: nothing happened */
+    else if (mx.ok && changes >= 0) { delete_entry(journal); remove_tree(stage); }   /* not decided: nothing happened (leftovers are swept later) */
     commit_done(mx);
     fs_unlock();
     trace_printf("     fs commit \"%s\": %s (%d changes)\n", name, ok ? "ok" : step, changes);
     if (!ok) printf("nn::fs::Commit(\"%s\") failed on the host at \"%s\" (%d, error %lu): %s\n", name, step, changes, (unsigned long)err,
                     decided ? "it is decided and is finished by the next Commit, Unmount or mount"
                     : !strcmp(step, "finish the pending commit") ? "an earlier decided commit is still unfinished, so this one was refused"
+                    : !strcmp(step, "lock") ? "the commit lock could not be taken, so nothing was changed"
                     : "the committed save data is unchanged");
     RET(ok ? 0 : RESULT_GENERIC_FAILURE);
 }
@@ -1333,6 +1399,14 @@ static void fs_false(Ctx *c) { RET(0); }
 
 /* ---- self-test of the mount table and of the save data journal, in a scratch folder under %TEMP% (SSBU_SDK_SELFTEST) */
 uint32_t fs_mount_plain(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_PLAIN, host_dir); }
+const char *fs_mount_work(const char *name) {          /* self-tests: the working folder of a mount ("" if none) */
+    static char w[MAX_PATH];
+    fs_lock();
+    Mount *m = name ? mount_find(name, strlen(name)) : NULL;
+    snprintf(w, sizeof w, "%s", m ? m->work : "");
+    fs_unlock();
+    return w;
+}
 uint32_t fs_mount_direct(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_DIRECT, host_dir); }   /* skyline.c: sd: */
 static int st_host_is(const char *path, const char *text) {
     char buf[64] = "";
@@ -1377,7 +1451,6 @@ int nnfs_selftest(Ctx *c) {
     strcpy(g_user_root, t);
     snprintf(save, sizeof save, "%s\\save", t); CreateDirectoryA(save, NULL);
     snprintf(a, sizeof a, "%s\\a.bin", save); snprintf(n, sizeof n, "%s\\sub\\new.bin", save);
-    snprintf(work, sizeof work, "%s.work.%lu", save, (unsigned long)GetCurrentProcessId());
     snprintf(marker, sizeof marker, "%s.commit", save); snprintf(journal, sizeof journal, "%s.journal.%lu", save, (unsigned long)GetCurrentProcessId());
     FILE *f = fopen(a, "wb"); if (f) { fputs("committed", f); fclose(f); }
 
@@ -1387,6 +1460,7 @@ int nnfs_selftest(Ctx *c) {
     FSCHECK(c->x[0] == 0, "MountSaveData failed");
     c->x[0] = (uint64_t)(uintptr_t)"st"; c->x[1] = (uint64_t)(uintptr_t)uid; fs_MountSaveData(c);
     FSCHECK(c->x[0] == RESULT_MOUNT_NAME_EXISTS, "mounting the same name twice is not MountNameAlreadyExists");
+    snprintf(work, sizeof work, "%s", fs_mount_work("st"));
     /* 1. a write is visible to the game and NOT in the committed folder */
     FSCHECK(st_write(c, "st:/a.bin", "CHANGED!!", NULL) == 0, "write failed");
     FSCHECK(st_read_is(c, "st:/a.bin", "CHANGED!!"), "the game does not read back what it wrote");
@@ -1398,6 +1472,7 @@ int nnfs_selftest(Ctx *c) {
     c->x[0] = (uint64_t)(uintptr_t)"st"; fs_Unmount(c);
     FSCHECK(!exists(work), "the working folder survived Unmount");
     c->x[0] = (uint64_t)(uintptr_t)"st"; c->x[1] = (uint64_t)(uintptr_t)uid; fs_MountSaveData(c);
+    snprintf(work, sizeof work, "%s", fs_mount_work("st"));
     FSCHECK(st_read_is(c, "st:/a.bin", "committed") && st_read_is(c, "st:/sub/new.bin", NULL), "uncommitted changes survived a remount");
     /* 3. commit is refused while a file is open for writing, then applies everything */
     FSCHECK(st_write(c, "st:/a.bin", "SECOND!!!", &h) == 0, "write failed");
