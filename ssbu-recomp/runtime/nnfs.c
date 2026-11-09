@@ -30,6 +30,9 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#ifndef _WIN32
+#include "hostpath.h"                                    /* host_fsync_parent: a deletion, a new folder, the removed marker reach the disk */
+#endif
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -557,12 +560,24 @@ static void journal_list(FILE *j, const char *work, const char *rel) {     /* ev
 }
 /* Applies a decided commit: marker lines are "W <working folder>", "R <committed folder>", then "D rel" (delete),
  * "M rel" (make folder), "F rel" (move file). Every step can be repeated, so a commit interrupted here is finished by
- * running it again. */
+ * running it again. All D lines come before the first F line, and an F line's working file exists until it is moved:
+ * so once any F source is gone, every D was done before, and a D must not run again -- a file deleted and created again
+ * in the same commit ("D a" + "F a") would otherwise be deleted after its new version was moved in (a crash between that
+ * move and the removal of the marker, and the next mount, lost the new save file). linux-arm64 (WP4) found this with kill -9. */
 static int journal_apply(const char *marker) {
     char line[MAX_PATH + 8], work[MAX_PATH] = "", root[MAX_PATH] = "", a[MAX_PATH], b[MAX_PATH];
     FILE *j = fopen(marker, "r");
-    int n = 0;
+    int n = 0, deletes_done = 0;
     if (!j) return -1;
+    while (!deletes_done && fgets(line, sizeof line, j)) {    /* first pass: has the move phase started? */
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (len < 3) continue;
+        if (line[0] == 'W') snprintf(work, sizeof work, "%s", line + 2);
+        else if (line[0] == 'F' && work[0]) { join(a, work, line + 2); deletes_done = !exists(a); }
+    }
+    rewind(j);
+    work[0] = 0;
     while (fgets(line, sizeof line, j)) {
         size_t len = strlen(line);
         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
@@ -571,8 +586,17 @@ static int journal_apply(const char *marker) {
         if (line[0] == 'W') snprintf(work, sizeof work, "%s", arg);
         else if (line[0] == 'R') snprintf(root, sizeof root, "%s", arg);
         else if (!root[0] || !work[0]) continue;
-        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else DeleteFileA(a); n++; }
-        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL); }
+        else if (line[0] == 'D' && deletes_done) n++;
+        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else DeleteFileA(a); n++;
+#ifndef _WIN32
+            host_fsync_parent(a);                         /* on disk before the marker goes: a deleted file must not come back */
+#endif
+        }
+        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL);
+#ifndef _WIN32
+            host_fsync_parent(a);
+#endif
+        }
         else if (line[0] == 'F') {
             join(a, work, arg); join(b, root, arg);
             if (exists(a)) { make_parents(b); if (!MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { fclose(j); return -2; } }
@@ -581,8 +605,28 @@ static int journal_apply(const char *marker) {
     }
     fclose(j);
     DeleteFileA(marker);
+#ifndef _WIN32
+    host_fsync_parent(marker);                            /* else a crash could replay this marker later over newer working files */
+#endif
     return n;
 }
+/* A decided commit of `root` that is not finished (a move failed -- a full disk, say -- or the process died): 1, and `work` =
+ * the working folder it moves from. That folder holds the rest of the commit: it must not be dropped while the marker exists. */
+static int commit_pending(const char *root, char *work) {
+    char marker[MAX_PATH], line[MAX_PATH + 8];
+    snprintf(marker, sizeof marker, "%s.commit", root);
+    work[0] = 0;
+    FILE *j = fopen(marker, "r");
+    if (!j) return 0;
+    while (fgets(line, sizeof line, j)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (len >= 3 && line[0] == 'W') { snprintf(work, MAX_PATH, "%s", line + 2); break; }
+    }
+    fclose(j);
+    return 1;
+}
+static int commit_pending_from(const char *root, const char *work) { char w[MAX_PATH]; return commit_pending(root, w) && _stricmp(w, work) == 0; }
 static int pid_alive(DWORD pid) {
     HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
     if (!p) return GetLastError() == ERROR_ACCESS_DENIED;
@@ -602,6 +646,9 @@ static void journal_recover(const char *root) {
         printf("nn::fs: a commit of %s was interrupted after it was decided: finished now (%d changes)\n", root, n);
         trace_printf("     fs journal: interrupted commit of %s rolled forward (%d changes)\n", root, n);
     }
+    char pending[MAX_PATH];                                /* still unfinished (a move failed again): its working folder stays */
+    const char *pending_leaf = commit_pending(root, pending) && pending[0] ? pending + strlen(pending) : NULL;
+    while (pending_leaf && pending_leaf > pending && pending_leaf[-1] != '\\' && pending_leaf[-1] != '/') pending_leaf--;
     snprintf(pat, sizeof pat, "%s.*", root);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -611,6 +658,7 @@ static void journal_recover(const char *root) {
             if (!kind) continue;
             DWORD pid = (DWORD)strtoul(ext + 1, NULL, 10);
             if (!pid || pid == GetCurrentProcessId() || pid_alive(pid)) continue;
+            if (pending_leaf && _stricmp(pending_leaf, fd.cFileName) == 0) continue;
             snprintf(path, sizeof path, "%s\\..\\%s", root, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else DeleteFileA(path);
             trace_printf("     fs journal: uncommitted %s of process %lu discarded (%s)\n", kind, (unsigned long)pid, fd.cFileName);
@@ -632,7 +680,8 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     snprintf(m->root, MAX_PATH, "%s", root);
     if (kind != MK_ROM && kind != MK_DIRECT) {             /* a direct folder (sd:) is written at once: no working folder */
         snprintf(m->work, MAX_PATH, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
-        remove_tree(m->work);                              /* a second mount in this process starts from the committed state */
+        if (!commit_pending_from(root, m->work))           /* a second mount in this process starts from the committed state, */
+            remove_tree(m->work);                          /* unless the folder still holds the rest of a decided commit (part of that state) */
         CreateDirectoryA(m->work, NULL);
     }
     m->kind = kind;
@@ -686,7 +735,8 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
     }
     if (m) {
         for (int i = 0; i < OPEN_MAX; i++) if (g_open[i].h && g_open[i].mount == m) { CloseHandle(g_open[i].h); g_open[i].h = NULL; }   /* [sdk 0x1f4870] the accessor closes what is left open */
-        if (m->work[0]) remove_tree(m->work);
+        if (m->work[0] && commit_pending_from(m->root, m->work)) journal_recover(m->root);   /* a Commit whose moves failed: finish it now */
+        if (m->work[0] && !commit_pending_from(m->root, m->work)) remove_tree(m->work);      /* else the next mount finishes it */
         tomb_clear(m);
         trace_printf("     fs unmount \"%s\"\n", name);
         m->kind = 0;
@@ -723,7 +773,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     }
     if (ok) ok = MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);      /* the commit is decided here */
     if (ok) { changes = journal_apply(marker); ok = changes >= 0; }
-    if (ok) tomb_clear(m);
+    if (ok || changes == -2) tomb_clear(m);                /* -2: a move failed, so every deletion was done (the marker finishes the rest) */
     commit_done(mx);
     fs_unlock();
     trace_printf("     fs commit \"%s\": %s (%d changes)\n", name, ok ? "ok" : "FAILED", changes);
