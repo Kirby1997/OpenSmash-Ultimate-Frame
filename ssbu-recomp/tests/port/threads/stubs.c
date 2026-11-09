@@ -25,6 +25,11 @@ void register_imports(const ImportDef *defs, int count) {
     if (g_ntables == 256) { fprintf(stderr, "stubs.c: too many import tables\n"); abort(); }
     g_tables[g_ntables].defs = defs; g_tables[g_ntables].count = count; g_ntables++;
 }
+ImportFn import_lookup(const char *name) {            /* test_cxxrt: the C++ runtime asks for the handlers it replaces or reuses */
+    for (int t = g_ntables - 1; t >= 0; t--)
+        for (int i = 0; i < g_tables[t].count; i++) if (!strcmp(g_tables[t].defs[i].name, name)) return g_tables[t].defs[i].fn;
+    return NULL;
+}
 void register_thread_imports(void);
 ImportFn tst_import(const char *name) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;

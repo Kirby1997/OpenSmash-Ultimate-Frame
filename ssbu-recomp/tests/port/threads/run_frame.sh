@@ -1,7 +1,8 @@
 #!/bin/sh
 # C3b on the Steam Frame:
 #   - run.sh native with gcc and clang at -O1 and -O2 (thread / fiber stacks below 2^47, the switch, FLS, critical
-#     sections, os_threads.c's guest fibers, then tests/cspike/gaps.c for comparison with the C-spike's run)
+#     sections, os_threads.c's nn::os threads and guest fibers, setjmp / longjmp on fibers (also with _FORTIFY_SOURCE),
+#     nncxxrt.c's exception state per fiber, then tests/cspike/gaps.c for comparison with the C-spike's run)
 #   - run.sh bti with clang and gcc (-mbranch-protection=standard, PROT_BTI on the switch's page)
 #   - the TLS hazard check: in os_threads.o (fiber_main, fib_switch) and hostrt.o (call_guest) at -O2, no direct read of
 #     the thread pointer (tpidr_el0): their thread variables are reached through noinline accessors only
@@ -21,8 +22,8 @@ elif [ -z "${1:-}" ] && [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = aarch64 ]
 if [ "$MODE" = remote ]; then
     HOST=${1:-steamos@frame}
     cd "$ROOT"
-    tar -cf - runtime/plat_posix.c runtime/plat runtime/os_threads.c runtime/hostrt.c runtime/*.h tests/cspike/gaps.c \
-        tests/cspike/stubs/fake_whitelist.h tests/cspike/stubs/fake_openlist.h tests/port/threads |
+    tar -cf - runtime/plat_posix.c runtime/plat_crash.c runtime/plat runtime/os_threads.c runtime/hostrt.c runtime/*.h runtime/*.inc \
+        runtime/nncxxrt.c runtime/nncxxlib.c runtime/nnlibc2.c runtime/clib.c tests/cspike/gaps.c tests/cspike/stubs tests/port/threads |
         ssh -o BatchMode=yes "$HOST" 'rm -rf ~/ssbu-port/threads && mkdir -p ~/ssbu-port/threads && cd ~/ssbu-port/threads && tar -xf -'
     exec ssh -o BatchMode=yes "$HOST" 'cd ~/ssbu-port/threads && sh tests/port/threads/run_frame.sh --local'
 fi

@@ -40,7 +40,7 @@ $CC $F -c runtime/os_threads.c -o "$OUT/os_threads.o"
 $CC $F -c "$OUT/libstubs.c" -o "$OUT/libstubs.o"
 $CC $F -c $T/stubs.c -o "$OUT/stubs.o"
 HAVE_CRASH=""
-TESTS="test_threads test_sync test_fls test_os_fibers"
+TESTS="test_threads test_sync test_fls test_os_fibers test_os_threads test_setjmp"
 link() {                                           # link <name> <sources/objects...>: + the platform layer (paths may hold spaces)
     _n=$1; shift
     if [ -n "$HAVE_CRASH" ]; then $CC $F "$@" "$OUT/plat_posix.o" "$OUT/libstubs.o" "$OUT/plat_crash.o" $L -o "$OUT/$_n"
@@ -58,6 +58,19 @@ link test_threads $T/test_threads.c
 link test_sync $T/test_sync.c
 link test_fls $T/test_fls.c
 link test_os_fibers $T/test_os_fibers.c "$OUT/os_threads.o" "$OUT/stubs.o"
+# test_cxxrt: nncxxrt.c is #included by the test; the C++ runtime units see the game's tables through pointers (game_tables.h)
+GT="-include $T/game_tables.h -I tests/cspike/stubs"
+for u in nncxxlib nnlibc2 clib; do $CC $F $GT -c runtime/$u.c -o "$OUT/$u.o"; done
+$CC $F $GT -c $T/stubs_cxxrt.c -o "$OUT/stubs_cxxrt.o"
+TESTS="$TESTS test_cxxrt"
+$CC $F $GT -Wno-unused-function $T/test_cxxrt.c "$OUT/nncxxlib.o" "$OUT/nnlibc2.o" "$OUT/clib.o" "$OUT/stubs_cxxrt.o" "$OUT/plat_posix.o" "$OUT/libstubs.o" \
+    "$OUT/os_threads.o" "$OUT/stubs.o" ${HAVE_CRASH:+"$OUT/plat_crash.o"} $L -lm -o "$OUT/test_cxxrt"
+link test_os_threads $T/test_os_threads.c "$OUT/os_threads.o" "$OUT/stubs.o"
+link test_setjmp $T/test_setjmp.c
+if [ "$MODE" != mac ]; then                                  # longjmp is __longjmp_chk on glibc with _FORTIFY_SOURCE (it refuses to jump down a stack)
+    TESTS="$TESTS test_setjmp_chk"
+    ( F="$(echo "$F" | sed 's/-O[0-9s]//') -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2"; link test_setjmp_chk $T/test_setjmp.c )
+fi
 link gaps tests/cspike/gaps.c                                # the C-spike's gap probe, now against this layer
 [ "$MODE" = cross ] && { ls "$OUT"; exit 0; }
 fail=0
