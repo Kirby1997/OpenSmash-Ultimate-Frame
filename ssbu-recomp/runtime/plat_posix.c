@@ -2947,6 +2947,7 @@ BOOL CryptDestroyHash(HCRYPTHASH h) { EVP_MD_CTX_free((EVP_MD_CTX *)h); return T
 static BOOL bad_ptr(const void *p, UINT_PTR n, int write) {
     if (!p) return n != 0;
     uintptr_t a = (uintptr_t)p, e = a + (n ? n : 1);
+    if (e < a) return TRUE;                              /* a range that wraps past the top of the address space is not readable */
     while (a < e) {
         MEMORY_BASIC_INFORMATION mi;
         if (!VirtualQuery((void *)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return TRUE;

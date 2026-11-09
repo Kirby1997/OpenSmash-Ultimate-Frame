@@ -284,9 +284,23 @@ const char *guest_thread_name_of(DWORD tid) {
     return NULL;
 }
 
+#if defined(__linux__) && defined(__aarch64__)
+/* The host thread gets the nn::os name (the kernel keeps 15 characters): top -H, perf, gdb and the crash report's "thread <tid>
+ * (<name>)" tell the game's threads apart on the Frame (linux-arm64 did this as host_thread_set_name). */
+static void name_host_thread(HANDLE h, const char *name) {
+    WCHAR w[16];
+    int i = 0;
+    for (; name && i < 15 && name[i]; i++) w[i] = (unsigned char)name[i];
+    w[i] = 0;
+    if (i) SetThreadDescription(h, w);
+}
+#endif
 static DWORD WINAPI thread_main(LPVOID arg) {
     Obj *o = arg;
     t_thread = o->key;
+#if defined(__linux__) && defined(__aarch64__)
+    name_host_thread(GetCurrentThread(), o->name ? (const char *)(uintptr_t)o->name : NULL);       /* named before StartThread */
+#endif
     { void display_perf_thread(void); display_perf_thread(); }      /* track V session 14: the game's threads on the performance cores of a hybrid CPU (display.c; SSBU_PCORES=0 off) */
     Ctx *c = new_ctx(o->stack + o->stack_size);
     wr64(c->tpidr + 0x1f8, o->key);                   /* Horizon thread-local region: the ThreadType pointer lives at +0x1f8 */
@@ -388,6 +402,9 @@ static void os_DestroyThread(Ctx *c) { Obj *o = obj(A0); if (o->thread) { CloseH
 static void os_SetThreadName(Ctx *c) {               /* the guest string may be a temporary: keep a copy */
     char *copy = _strdup((const char *)(uintptr_t)A1);
     obj(A0)->name = (uint64_t)(uintptr_t)copy;
+#if defined(__linux__) && defined(__aarch64__)
+    if (obj(A0)->thread && !obj(A0)->finished) name_host_thread(obj(A0)->thread, copy);            /* already started: renamed */
+#endif
 }
 static void os_GetCurrentThread(Ctx *c) { RET(t_thread ? t_thread : (uint64_t)g_main_thread); }
 static Obj *thread_obj(uint64_t key);
