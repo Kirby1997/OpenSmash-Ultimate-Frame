@@ -14,6 +14,10 @@ void EVP_MD_CTX_free(EVP_MD_CTX *c);
 int EVP_DigestInit_ex(EVP_MD_CTX *c, const EVP_MD *md, ENGINE *e);
 int EVP_DigestUpdate(EVP_MD_CTX *c, const void *d, size_t n);
 int EVP_DigestFinal_ex(EVP_MD_CTX *c, unsigned char *md, unsigned int *n);
-int EVP_MD_CTX_get_size(const EVP_MD_CTX *c);
+/* EVP_MD_CTX_get_size is a macro in OpenSSL 3 (not an exported symbol; 3.0 spells it with the two functions below, later 3.x with
+ * EVP_MD_CTX_get_size_ex): the long form exists in every 3.x, so a build against a real libcrypto.so.3 links. */
+const EVP_MD *EVP_MD_CTX_get0_md(const EVP_MD_CTX *c);
+int EVP_MD_get_size(const EVP_MD *md);
+#define EVP_MD_CTX_get_size(c) EVP_MD_get_size(EVP_MD_CTX_get0_md(c))
 int EVP_MD_CTX_copy_ex(EVP_MD_CTX *out, const EVP_MD_CTX *in);
 #endif
