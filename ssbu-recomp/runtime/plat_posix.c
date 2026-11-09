@@ -364,6 +364,9 @@ typedef struct PlatObj {
     /* files, finds, mappings */
     int fd;
     DIR *dir; char dir_path[MAX_PATH]; char pattern[MAX_PATH];
+#ifdef PLAT_A64_LINUX
+    char **fnames; int nfn, ifn;                   /* a find: the folder's names in NTFS order (find_collect), the next one to give */
+#endif
     size_t map_size;
 } PlatObj;
 #define PSEUDO_PROCESS ((HANDLE)(intptr_t)-1)
@@ -388,6 +391,10 @@ static void obj_release(PlatObj *o) {
     if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL)) return;
     if (o->fd >= 0) close(o->fd);
     if (o->dir) closedir(o->dir);
+#ifdef PLAT_A64_LINUX
+    for (int i = 0; i < o->nfn; i++) free(o->fnames[i]);
+    free(o->fnames);
+#endif
     pthread_mutex_destroy(&o->m);
     pthread_cond_destroy(&o->cv);
     free(o);
@@ -2424,19 +2431,60 @@ DWORD GetFullPathNameA(LPCSTR path, DWORD n, LPSTR out, LPSTR *file) {
     if (file) { char *s = strrchr(out, '/'); *file = s ? s + 1 : out; }
     return k;
 }
-static BOOL find_next(PlatObj *o, WIN32_FIND_DATAA *fd) {
+#ifdef PLAT_A64_LINUX
+/* A folder listing in NTFS order. NTFS lists a folder sorted by upper-case ordinal; readdir gives the file system's own order (a
+ * hash on ext4 and btrfs, different from disk to disk), and the game and the mods it loads see these listings (nnfsdir.c). The names
+ * are read at FindFirstFileA, sorted like the case-insensitive lookup does (ASCII fold, then the bytes), and given in that order
+ * (linux-arm64 hostpath.c did this). Win32 wildcards: '*' and '?' only, so "[1]*" means a name starting with "[1]" (fnmatch would
+ * read a character class); "*.*" is everything. */
+static int find_wild(const char *p, const char *n) {
+    const char *star = NULL, *sn = NULL;
+    for (;;) {
+        if (*p == '*') { star = p++; sn = n; continue; }
+        if (*n && *p && (*p == '?' || (*p >= 'a' && *p <= 'z' ? *p - 32 : *p) == (*n >= 'a' && *n <= 'z' ? *n - 32 : *n))) { p++; n++; continue; }
+        if (!*p && !*n) return 1;
+        if (star && *sn) { p = star + 1; n = ++sn; continue; }       /* the last '*' takes one more character */
+        return 0;
+    }
+}
+static void find_collect(PlatObj *o) {
+    size_t cap = 64;
+    o->fnames = malloc(cap * sizeof *o->fnames);
     struct dirent *e;
     while ((e = readdir(o->dir))) {
-        if (fnmatch(o->pattern, e->d_name, FNM_CASEFOLD)) continue;
+        if (o->nfn == (int)cap) o->fnames = realloc(o->fnames, (cap *= 2) * sizeof *o->fnames);
+        o->fnames[o->nfn++] = strdup(e->d_name);
+    }
+    closedir(o->dir);
+    o->dir = NULL;
+    qsort(o->fnames, (size_t)o->nfn, sizeof *o->fnames, ci_order);
+}
+#endif
+static BOOL find_next(PlatObj *o, WIN32_FIND_DATAA *fd) {
+    struct dirent *e;
+    for (;;) {
+        const char *name;
+#ifdef PLAT_A64_LINUX
+        if (o->fnames) {
+            if (o->ifn >= o->nfn) break;
+            name = o->fnames[o->ifn++];
+            if (!find_wild(o->pattern, name)) continue;
+        } else
+#endif
+        {
+            if (!(e = readdir(o->dir))) break;
+            name = e->d_name;
+            if (fnmatch(o->pattern, name, FNM_CASEFOLD)) continue;
+        }
         char full[PATH_MAX]; struct stat st;
-        snprintf(full, sizeof full, "%s/%s", o->dir_path, e->d_name);
+        snprintf(full, sizeof full, "%s/%s", o->dir_path, name);
         memset(fd, 0, sizeof *fd);
         if (!stat(full, &st)) {
-            fd->dwFileAttributes = attrs_of(&st, e->d_name);
+            fd->dwFileAttributes = attrs_of(&st, name);
             st_times(&st, &fd->ftCreationTime, &fd->ftLastAccessTime, &fd->ftLastWriteTime);
             fd->nFileSizeHigh = (DWORD)((uint64_t)st.st_size >> 32); fd->nFileSizeLow = (DWORD)st.st_size;
         } else fd->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-        snprintf(fd->cFileName, sizeof fd->cFileName, "%s", e->d_name);
+        snprintf(fd->cFileName, sizeof fd->cFileName, "%s", name);
         return TRUE;
     }
     t_lasterr = ERROR_NO_MORE_FILES;
@@ -2453,6 +2501,9 @@ HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd) {
     o->dir = opendir(o->dir_path);
     if (!o->dir && plat_ci_retry(o->dir_path)) o->dir = opendir(o->dir_path);
     if (!o->dir) { fail_errno(); if (t_lasterr == ERROR_FILE_NOT_FOUND) t_lasterr = ERROR_PATH_NOT_FOUND; obj_release(o); return INVALID_HANDLE_VALUE; }
+#ifdef PLAT_A64_LINUX
+    find_collect(o);
+#endif
     if (!find_next(o, fd)) { obj_release(o); t_lasterr = ERROR_FILE_NOT_FOUND; return INVALID_HANDLE_VALUE; }
     return o;
 }
