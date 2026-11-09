@@ -373,6 +373,14 @@ static void tzrule_build(TzRule *r, const WinZone *z, const char *iana, int fixe
         char name[16];
         int32_t off = w.ttis[i].utoff, a = off < 0 ? -off : off;
         map[i] = -1;
+#if defined(__linux__) || defined(PLAT_LINUX_PATHS_ON_MAC)
+        /* a slim zone file keeps its old types after the ones the footer names (New York: EDT, EST, EWT, EPT): "the newest with the same
+         * offset" below would be EPT, a 1945 abbreviation, for every daylight-time period after the file's last transition. The footer's
+         * own names pick first. (Windows and macOS keep what they had.) */
+        const char *foot = w.ttis[i].isdst ? dst_name : std_name;
+        for (int k = r->typecnt - 1; foot[0] && k >= 0 && map[i] < 0; k--)
+            if (r->ttis[k].utoff == off && r->ttis[k].isdst == w.ttis[i].isdst && !strcmp(r->chars + r->ttis[k].desigidx, foot)) map[i] = k;
+#endif
         for (int k = r->typecnt - 1; k >= 0 && map[i] < 0; k--) if (r->ttis[k].utoff == off && r->ttis[k].isdst == w.ttis[i].isdst) map[i] = k;
         if (map[i] >= 0 || r->typecnt >= 128) { if (map[i] < 0) map[i] = 0; continue; }
         if (!w.ttis[i].isdst && std_name[0] && off == n_std) strcpy(name, std_name);
