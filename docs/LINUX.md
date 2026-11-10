@@ -354,7 +354,8 @@ mode when the driver has it (no tearing), `vrr` and `SSBU_SPEED` with immediate;
 clock, as with DXVK. The `[status] vulkan drawing thread` line gives the drawing thread's CPU time
 in nanoseconds a draw, not cycles as on Windows.
 
-If you try it, please report the log's `[vulkan]` and `[gfx]` lines, `vulkaninfo --summary`, your
+If you try it, please report the log's `[vulkan]` and `[gfx]` lines (the `[vulkan] device` lines give the
+driver, the limits the renderer relies on, the memory heaps and what the card lacks), `vulkaninfo --summary`, your
 desktop (X11 or Wayland) and what you saw; a run with Khronos' validation layer
 (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`) and frame times against DXVK
 (`--status 30`) are what [CONTRIBUTING](../CONTRIBUTING.md) asks of a renderer change.

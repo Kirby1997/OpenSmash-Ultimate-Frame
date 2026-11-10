@@ -79,7 +79,7 @@ static void display_show_window(void) {}   /* (Linux: SDL's window shows when li
     X(GetPhysicalDeviceFormatProperties) X(EnumerateDeviceExtensionProperties) X(CreateDevice) X(GetDeviceProcAddr) \
     VK_WINDOW_SURFACE_FUNCS(X) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
     X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR) \
-    X(GetPhysicalDeviceFeatures2)
+    X(GetPhysicalDeviceFeatures2) X(GetPhysicalDeviceProperties2)
 #define VK_DEVICE_FUNCS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) X(QueueSubmit) X(QueueWaitIdle) \
     X(CreateCommandPool) X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(ResetCommandBuffer) \
     X(CreateFence) X(WaitForFences) X(ResetFences) X(CreateSemaphore) X(DestroySemaphore) \
@@ -3983,6 +3983,89 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     return 0;
 }
 
+/* The device's facts the back end depends on, in the log once at its start, for every card: its driver
+ * (name, version string, ID, conformance), the limits the code below takes as given (buffer ranges and
+ * texel counts, compute sizes, offset alignments, dynamic uniform buffers, the subgroup size), its memory
+ * heaps and types, the device features the back end would enable that it lacks, and the depth format
+ * Z24S8 gets. It only prints: nothing here changes what the back end does. */
+static void device_report(const VkPhysicalDeviceProperties *props, const VkPhysicalDeviceFeatures *have, const VkExtensionProperties *dext,
+                          uint32_t ndext) {
+    VkPhysicalDeviceSubgroupProperties sub = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceDriverProperties drv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sub};
+    int have_driver = props->apiVersion >= VK_API_VERSION_1_2 || has_ext(dext, ndext, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+    if (have_driver) sub.pNext = &drv;
+    if (vkGetPhysicalDeviceProperties2) vkGetPhysicalDeviceProperties2(physical, &p2);
+    else have_driver = 0;   /* (subgroup size 0: unknown) */
+    if (have_driver)
+        fprintf(stderr, "[vulkan] device: %s; driver %s (%s), driver ID %d, conformance %u.%u.%u.%u; vendor %#x, device %#x, Vulkan %u.%u.%u\n",
+                props->deviceName, drv.driverName, drv.driverInfo, (int)drv.driverID, drv.conformanceVersion.major, drv.conformanceVersion.minor,
+                drv.conformanceVersion.subminor, drv.conformanceVersion.patch, props->vendorID, props->deviceID,
+                VK_API_VERSION_MAJOR(props->apiVersion), VK_API_VERSION_MINOR(props->apiVersion), VK_API_VERSION_PATCH(props->apiVersion));
+    else
+        fprintf(stderr, "[vulkan] device: %s; driver version %#x (no driver properties); vendor %#x, device %#x, Vulkan %u.%u.%u\n",
+                props->deviceName, props->driverVersion, props->vendorID, props->deviceID,
+                VK_API_VERSION_MAJOR(props->apiVersion), VK_API_VERSION_MINOR(props->apiVersion), VK_API_VERSION_PATCH(props->apiVersion));
+    const VkPhysicalDeviceLimits *l = &props->limits;
+    fprintf(stderr, "[vulkan] device limits: storage buffer range %u, uniform buffer range %u, texel buffer elements %u; "
+                    "compute: shared memory %u, invocations %u, work group %ux%ux%u, groups %ux%ux%u; "
+                    "alignments: texel buffer offset %llu, uniform buffer offset %llu, storage buffer offset %llu, buffer-image granularity %llu, "
+                    "non-coherent atom %llu; dynamic uniform buffers %u a set; per stage: %u uniform buffers, %u storage buffers, %u sampled images, "
+                    "%u samplers, %u resources; %u descriptor sets; %u allocations; 2D images %u; subgroup size %u (stages %#x, operations %#x)\n",
+            l->maxStorageBufferRange, l->maxUniformBufferRange, l->maxTexelBufferElements, l->maxComputeSharedMemorySize,
+            l->maxComputeWorkGroupInvocations, l->maxComputeWorkGroupSize[0], l->maxComputeWorkGroupSize[1], l->maxComputeWorkGroupSize[2],
+            l->maxComputeWorkGroupCount[0], l->maxComputeWorkGroupCount[1], l->maxComputeWorkGroupCount[2],
+            (unsigned long long)l->minTexelBufferOffsetAlignment, (unsigned long long)l->minUniformBufferOffsetAlignment,
+            (unsigned long long)l->minStorageBufferOffsetAlignment, (unsigned long long)l->bufferImageGranularity,
+            (unsigned long long)l->nonCoherentAtomSize, l->maxDescriptorSetUniformBuffersDynamic, l->maxPerStageDescriptorUniformBuffers,
+            l->maxPerStageDescriptorStorageBuffers, l->maxPerStageDescriptorSampledImages, l->maxPerStageDescriptorSamplers,
+            l->maxPerStageResources, l->maxBoundDescriptorSets, l->maxMemoryAllocationCount, l->maxImageDimension2D, sub.subgroupSize,
+            (unsigned)sub.supportedStages, (unsigned)sub.supportedOperations);
+    char line[1024];
+    int at = 0;
+    for (uint32_t i = 0; i < memory_props.memoryHeapCount && at < (int)sizeof line; i++)
+        at += snprintf(line + at, sizeof line - (size_t)at, "%s%u: %llu MB%s", i ? ", " : "", i, (unsigned long long)(memory_props.memoryHeaps[i].size >> 20),
+                       memory_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+    fprintf(stderr, "[vulkan] device memory heaps: %s\n", line);
+    at = 0;
+    line[0] = 0;
+    for (uint32_t i = 0; i < memory_props.memoryTypeCount && at < (int)sizeof line; i++) {
+        VkMemoryPropertyFlags f = memory_props.memoryTypes[i].propertyFlags;
+        at += snprintf(line + at, sizeof line - (size_t)at, "%s%u: heap %u%s%s%s%s%s", i ? ", " : "", i, memory_props.memoryTypes[i].heapIndex,
+                       f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? " device-local" : "", f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? " host-visible" : "",
+                       f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? " coherent" : "", f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " cached" : "",
+                       f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? " lazy" : "");
+    }
+    fprintf(stderr, "[vulkan] device memory types: %s\n", line);
+    static const struct { size_t at; const char *name; } WANTED[] = {
+        {offsetof(VkPhysicalDeviceFeatures, robustBufferAccess), "robustBufferAccess"},
+        {offsetof(VkPhysicalDeviceFeatures, fillModeNonSolid), "fillModeNonSolid"},
+        {offsetof(VkPhysicalDeviceFeatures, geometryShader), "geometryShader"},
+        {offsetof(VkPhysicalDeviceFeatures, independentBlend), "independentBlend"},
+        {offsetof(VkPhysicalDeviceFeatures, dualSrcBlend), "dualSrcBlend"},
+        {offsetof(VkPhysicalDeviceFeatures, depthClamp), "depthClamp"},
+        {offsetof(VkPhysicalDeviceFeatures, samplerAnisotropy), "samplerAnisotropy"},
+        {offsetof(VkPhysicalDeviceFeatures, textureCompressionBC), "textureCompressionBC"},
+        {offsetof(VkPhysicalDeviceFeatures, fragmentStoresAndAtomics), "fragmentStoresAndAtomics"},
+        {offsetof(VkPhysicalDeviceFeatures, vertexPipelineStoresAndAtomics), "vertexPipelineStoresAndAtomics"},
+        {offsetof(VkPhysicalDeviceFeatures, imageCubeArray), "imageCubeArray"},
+        {offsetof(VkPhysicalDeviceFeatures, shaderClipDistance), "shaderClipDistance"},
+    };
+    at = 0;
+    line[0] = 0;
+    for (size_t i = 0; i < sizeof WANTED / sizeof *WANTED && at < (int)sizeof line; i++) {
+        VkBool32 on;
+        memcpy(&on, (const char *)have + WANTED[i].at, sizeof on);
+        if (!on) at += snprintf(line + at, sizeof line - (size_t)at, "%s%s", at ? ", " : "", WANTED[i].name);
+    }
+    static const char *const OPTIONAL_EXT[] = {"VK_KHR_shader_float_controls", VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME};
+    for (size_t i = 0; i < sizeof OPTIONAL_EXT / sizeof *OPTIONAL_EXT && at < (int)sizeof line; i++)
+        if (!has_ext(dext, ndext, OPTIONAL_EXT[i])) at += snprintf(line + at, sizeof line - (size_t)at, "%s%s", at ? ", " : "", OPTIONAL_EXT[i]);
+    VkFormat z24s8 = depth_format(0x14);
+    fprintf(stderr, "[vulkan] device lacks: %s; Z24S8 depth drawn as %s\n", line[0] ? line : "none of what the back end asks for",
+            z24s8 == VK_FORMAT_D24_UNORM_S8_UINT ? "D24_UNORM_S8_UINT" : "D32_SFLOAT_S8_UINT (no D24S8 attachment)");
+}
+
 static const GfxBackend *vk_start(char *why, size_t size) {
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)vk_loader(why, size);
     if (!gipa) return NULL;
@@ -4100,6 +4183,7 @@ static const GfxBackend *vk_start(char *why, size_t size) {
 #undef LOAD_D
     if (!vkCmdBeginRenderingKHR || !vkCmdEndRenderingKHR) { snprintf(why, size, "%s: the driver lacks vkCmdBeginRenderingKHR", card); return NULL; }
     vkGetDeviceQueue(device, queue_family, 0, &queue);
+    device_report(&props, &have, dext, ndext);
     limits = props.limits;
     limits_vendor = props.vendorID;
     limits_device = props.deviceID;
