@@ -578,6 +578,35 @@ void rt_backtrace_thread(HANDLE thread, int max_frames) {
 }
 #endif
 
+#if defined(__linux__) && defined(__aarch64__)
+/* Linux on arm64: the exception syndrome is a record in the signal frame (uc_mcontext.__reserved:
+ * {magic, size} records, <asm/sigcontext.h>'s struct _aarch64_ctx, the last with magic 0; the ESR
+ * record holds the ESR after its header). A write is a data abort (EC 0x24 from a lower level,
+ * 0x25 from the same) with WnR (bit 6) that is not a cache maintenance operation (CM, bit 8:
+ * those report WnR 1), as the kernel's is_write_abort decides. Each record's size is checked
+ * against what is left before it is followed. */
+#define ESR_RECORD_MAGIC 0x45535201u   /* (the kernel's ESR_MAGIC) */
+#define ESR_EC(esr) ((esr) >> 26 & 0x3F)
+#define ESR_WNR(esr) ((esr) >> 6 & 1)
+#define ESR_CM(esr) ((esr) >> 8 & 1)
+static int esr_writing(const void *reserved, size_t n) {
+    const u8 *p = reserved, *end = p + n;
+    while ((size_t)(end - p) >= 8) {
+        u32 magic, size;
+        memcpy(&magic, p, 4);
+        memcpy(&size, p + 4, 4);
+        if (!magic || size < 8 || size > (size_t)(end - p)) break;
+        if (magic == ESR_RECORD_MAGIC && size >= 16) {
+            u64 esr;
+            memcpy(&esr, p + 8, 8);
+            return (ESR_EC(esr) == 0x24 || ESR_EC(esr) == 0x25) && ESR_WNR(esr) && !ESR_CM(esr);
+        }
+        p += size;
+    }
+    return 0;
+}
+#endif
+
 /* A host fault inside recompiled code is a guest fault: report where, and what it touched.
  * (Writes to pages the protecting write watch guards are not faults: they are noted and go on.)
  * macOS: a protection fault is SIGBUS, and whether it was a write is the exception syndrome's
@@ -592,6 +621,13 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     if ((sig == SIGSEGV || sig == SIGBUS) && writing && rt_ww_fault((void *)(uintptr_t)addr)) return;
     static volatile RtTid reporter;
     RtTid me = pthread_mach_thread_np(pthread_self()), none = 0;
+    (void)si;
+#elif defined(__linux__) && defined(__aarch64__)
+    int writing = esr_writing(uc->uc_mcontext.__reserved, sizeof uc->uc_mcontext.__reserved);
+    u64 addr = (u64)uc->uc_mcontext.fault_address, pc = (u64)uc->uc_mcontext.pc;
+    if (sig == SIGSEGV && writing && rt_ww_fault((void *)(uintptr_t)addr)) return;
+    static volatile pid_t reporter;
+    pid_t me = gettid(), none = 0;
     (void)si;
 #else
     int writing = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
@@ -610,6 +646,9 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
 #ifdef __APPLE__
     u64 sp = uc->uc_mcontext->__ss.__sp;
     int overflow = (sig == SIGSEGV || sig == SIGBUS) && addr + 65536 > sp && addr < sp + 65536;
+#elif defined(__linux__) && defined(__aarch64__)
+    u64 sp = (u64)uc->uc_mcontext.sp;
+    int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
 #else
     u64 sp = (u64)uc->uc_mcontext.gregs[REG_RSP];
     int overflow = sig == SIGSEGV && addr + 65536 > sp && addr < sp + 65536;
@@ -637,6 +676,10 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     for (int i = 0; i < n; i++) if ((u64)frames[i] == pc) { from = i; from_pc = 1; break; }   /* (the faulting frame onwards) */
 #endif
     for (int i = from + 1; i < n && i < from + 24; i++) host_frame("  host frame ", frames[i]);
+#if defined(__linux__) && defined(__aarch64__)   /* (the link register: a leaf function's caller, should the unwinder not get past it) */
+    out("at the fault: host lr %#llx, fp %#llx, sp %#llx\n", (u64)uc->uc_mcontext.regs[30], (u64)uc->uc_mcontext.regs[29], sp);
+    host_frame("  lr ", (void *)(uintptr_t)uc->uc_mcontext.regs[30]);
+#endif
     gfx_report_compiles(out_line);   /* (a fault in the shader compiler names the program) */
     print_frames(frames + from, n - from, from_pc);
     report_close(report);
@@ -658,6 +701,9 @@ static void install_signals(void) {
     sigaction(SIGTRAP, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
 #else
+#if defined(__linux__) && defined(__aarch64__)   /* (brk, __builtin_trap's: x86-64's is ud2, SIGILL above) */
+    sigaction(SIGTRAP, &sa, NULL);
+#endif
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_backtrace_signal;
     sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;

@@ -3,7 +3,7 @@
  * is interrupted by a signal and notes where it is (and, while busy, its call stack); then the
  * busiest functions (named from ssbu.syms next to the program, which the build writes),
  * modules and threads go to build/profile_<time>.txt, and its top lines to the log. A thread
- * stopped right after a `syscall` instruction counts as waiting.
+ * stopped right after a `syscall` instruction (arm64: after or on an `svc #0`) counts as waiting.
  * Also, with the same signal: every thread's stack for freeze reports (profile_dump_threads)
  * and the hitch log (SSBU_HITCH=<ms>: what made each frame over that long late). */
 #define _GNU_SOURCE 1
@@ -366,10 +366,18 @@ static void on_sample(int sig, siginfo_t *si, void *ucv) {
     (void)sig; (void)si;
     int saved = errno;
     ucontext_t *uc = ucv;
+#if defined(__aarch64__)
+    U64 rip = (U64)uc->uc_mcontext.pc;   /* (the pc: the name is x86-64's) */
+    shot.s.rip = rip;
+    const unsigned *at = (const unsigned *)rip;
+    /* (just after an `svc #0`, or on it: a wait a signal interrupted restarts from the svc itself) */
+    shot.s.waiting = !(rip & 3) && (((rip & 0xFFF) >= 4 && at[-1] == 0xD4000001u) || at[0] == 0xD4000001u);
+#else
     U64 rip = (U64)uc->uc_mcontext.gregs[REG_RIP];
     const unsigned char *at = (const unsigned char *)rip;
     shot.s.rip = rip;
     shot.s.waiting = (rip & 0xFFF) >= 2 && at[-2] == 0x0F && at[-1] == 0x05;   /* (stopped just after a `syscall`) */
+#endif
     shot.s.depth = shot.want_stack ? backtrace(shot.s.frames, STACK_DEPTH + 8) : 0;
     sem_post(&shot_done);
     errno = saved;
