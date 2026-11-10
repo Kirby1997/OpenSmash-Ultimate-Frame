@@ -588,6 +588,7 @@ static __thread Fiber *current_fiber;
 
 void rt_fiber_switch(void **save_sp, void *load_sp);
 void rt_fiber_trampoline(void);
+#if defined(__x86_64__)
 /* Save the callee-saved registers and the floating-point control words on this stack, switch
  * stacks, restore the other context's and return into it. A new fiber's stack is prepared to
  * "return" into the trampoline, which calls rt_fiber_entry(fiber in r12) and marks the end of
@@ -629,6 +630,12 @@ __asm__(
     "    ud2\n"
     "    .cfi_endproc\n"
     ".size rt_fiber_trampoline, .-rt_fiber_trampoline\n");
+#elif defined(__aarch64__)
+/* (runtime/linux/fiber_arm64.S: the same, with the floating-point control register, FPCR, in place
+ * of MXCSR and the x87 control word; the new fiber's argument in x19) */
+#else
+#error "fibers: no stack switch for this architecture"
+#endif
 
 __attribute__((used)) void rt_fiber_entry(Fiber *f) {
     f->fn(f->param);
@@ -659,6 +666,7 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     f->stack = stack;
     f->stack_size = size + 0x10000;
     u64 *sp = (u64 *)(((uintptr_t)(stack + size + 0x10000) - 128) & ~(uintptr_t)15);
+#if defined(__x86_64__)
     sp -= 8;   /* control words, r15, r14, r13, r12, rbx, rbp, return address: 16-aligned after the ret */
     u32 mxcsr = 0x1F80;
     u16 fpcw = 0x037F;
@@ -669,6 +677,16 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     sp[4] = (u64)(uintptr_t)f;   /* r12 */
     sp[5] = 0; sp[6] = 0;
     sp[7] = (u64)(uintptr_t)rt_fiber_trampoline;
+#elif defined(__aarch64__)
+    sp -= 22;   /* x19-x28, x29, x30, d8-d15, FPCR (and a spare word): fiber_arm64.S's frame, 16-aligned */
+    memset(sp, 0, 22 * sizeof *sp);
+    sp[0] = (u64)(uintptr_t)f;                       /* x19: the trampoline's argument */
+    sp[10] = 0;                                      /* x29: the end of the frame chain */
+    sp[11] = (u64)(uintptr_t)rt_fiber_trampoline;    /* x30: where the switch returns to */
+    u64 fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    sp[20] = fpcr;                                   /* (the creator's rounding and flush modes) */
+#endif
     f->sp = sp;
     return f;
 }

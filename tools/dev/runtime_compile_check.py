@@ -67,7 +67,9 @@ TESTS = {"difftest.c": "the lifter's differential test: tools/dev/difftest.py bu
 LEFT_OUT = {
     "windows": TESTS,
     "linux": {**TESTS,
-              "debug_profile.c": "Windows' profiler: linux/profile.c is Linux's"},
+              "debug_profile.c": "Windows' profiler: linux/profile.c is Linux's",
+              # TODO(arm64 build): in the program on arm64, when tools/linux/build_linux.py builds for it
+              "linux/fiber_arm64.S": "the arm64 fiber switch: the x86-64 program's is in linux/win32.c"},
     "macos": {**TESTS,
               "cpu_check.c": "the x86-64 processor check (CPUID): the Mac program is arm64",
               "debug_profile.c": "Windows' profiler: macos/profile.c is macOS's",
@@ -77,6 +79,7 @@ LEFT_OUT = {
               "gpu_window.c": "the Win32 / SDL2 window: macos/window.m is macOS's",
               "gpu_overlay.c": "the overlay, drawn with Direct3D 11: macos/gpu_metal_overlay.m is macOS's",
               "linux/d3dcompile_vkd3d.c": "D3DCompile through vkd3d-shader, for DXVK: the Metal renderer takes no DXBC",
+              "linux/fiber_arm64.S": "Linux's arm64 fiber switch: macos/fiber_arm64.S is macOS's",
               "linux/profile.c": "Linux's profiler: macos/profile.c is macOS's",
               "linux/window.c": "Linux's SDL2 window: macos/window.m is macOS's"},
 }

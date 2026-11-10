@@ -265,6 +265,8 @@ def runtime_jobs():
                if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
     sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
                 if n.endswith((".c", ".cpp"))]
+    # TODO(arm64 build): an aarch64 target also takes linux/fiber_arm64.S (win32.c's fiber switch there).
+    # This build targets x86-64 only so far (toolchain.TARGET, tools/isa.py); the arm64 build adds it.
     # ssbu-recomp's block-texture decoder (gpu_d3d11.c's tex_decode_rgba8), as tools/recomp.py links it
     decode = os.path.join(os.path.dirname(RUNTIME), "ssbu-recomp", "runtime", "tex_decode.c")
     if os.path.isfile(decode):
