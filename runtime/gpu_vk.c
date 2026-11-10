@@ -58,7 +58,7 @@ extern u64 gfx_stat_clears, gfx_stat_presented, gfx_stat_blits;   /* (gpu_d3d11.
     X(CreateWin32SurfaceKHR) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
     X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR) \
     X(GetPhysicalDeviceFeatures2)
-#define VK_DEVICE_FUNCS(X) X(GetDeviceQueue) X(DeviceWaitIdle) X(QueueSubmit) X(QueueWaitIdle) \
+#define VK_DEVICE_FUNCS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) X(QueueSubmit) X(QueueWaitIdle) \
     X(CreateCommandPool) X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(ResetCommandBuffer) \
     X(CreateFence) X(WaitForFences) X(ResetFences) X(CreateSemaphore) X(DestroySemaphore) \
     X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) \
@@ -72,7 +72,9 @@ extern u64 gfx_stat_clears, gfx_stat_presented, gfx_stat_blits;   /* (gpu_d3d11.
     X(CmdBindDescriptorSets) X(CmdBindIndexBuffer) X(CmdDraw) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) \
     X(CmdSetBlendConstants) X(CmdSetStencilReference) X(CmdSetStencilCompareMask) X(CmdSetStencilWriteMask) \
     X(CmdCopyBufferToImage) X(CmdBeginRenderingKHR) X(CmdEndRenderingKHR) X(GetPipelineCacheData) \
-    X(CreateComputePipelines) X(CmdDispatch) X(CmdCopyBuffer) X(CreateDescriptorUpdateTemplate) X(UpdateDescriptorSetWithTemplate)
+    X(CreateComputePipelines) X(CmdDispatch) X(CmdCopyBuffer) X(CreateDescriptorUpdateTemplate) X(UpdateDescriptorSetWithTemplate) \
+    X(DestroyCommandPool) X(DestroyFence) X(DestroyPipelineLayout) X(DestroyDescriptorSetLayout) X(DestroyPipelineCache) X(DestroySampler) \
+    X(DestroyDescriptorPool)
 #define DECLARE(name) static PFN_vk##name vk##name;
 VK_INSTANCE_FUNCS(DECLARE)
 VK_DEVICE_FUNCS(DECLARE)
@@ -1102,6 +1104,7 @@ static VkBuffer dummy_buffer;
 static VkBufferView dummy_texels;
 static Alloc dummy_buffer_mem;
 static VkImageView dummy_views[8];   /* by TEX_* (TEX_ARRAY_3D: none) */
+static VkImage dummy_images[3];      /* (the views' images: 1D, 2D with six layers, 3D) */
 static VkSampler default_sampler, default_compare;
 
 /* Copy guest GPU memory [va, va + size) into dst (zeros where unmapped), as gpu_d3d11.c's read_gpu. */
@@ -3842,7 +3845,7 @@ static int draw_objects(void) {
 
     /* images of zeros: 1D, 2D (six layers, a cube too), 3D */
     static const VkImageType types[3] = {VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D};
-    VkImage img[3];
+    VkImage *img = dummy_images;
     Alloc mem[3];
     VkCommandBuffer c = cmd();
     for (int i = 0; i < 3; i++) {
@@ -3901,7 +3904,7 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     return 0;
 }
 
-const GfxBackend *vk_backend_start(char *why, size_t size) {
+static const GfxBackend *vk_start(char *why, size_t size) {
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)vk_loader(why, size);
     if (!gipa) return NULL;
     InitializeCriticalSection(&lock);
@@ -4067,6 +4070,73 @@ const GfxBackend *vk_backend_start(char *why, size_t size) {
             card, VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
             float_controls ? ", float controls" : "", nframes, render_scale, have_immediate ? " immediate" : "", have_mailbox ? " mailbox" : "");
     return &VULKAN;
+}
+
+/* What vk_start made with the device before it failed, let go one by one before the device (Vulkan asks
+ * that a device's objects go first): draw_objects' stand-ins, samplers, layouts and pipeline cache, the
+ * frames' fences, semaphores, upload blocks and descriptor pools, the command pool (and its command
+ * buffers), and the device memory chunks the stand-in images were placed in. Each is let go only if it
+ * was made; the pointers were loaded with the device. (No swap chain, texture or pipeline exists yet:
+ * they are made at the first frames, after a start that succeeded. The makers, if started, wait for
+ * work that never comes.) */
+static void release_device_objects(void) {
+#define LET_GO(fn, h) do { if ((h) && vk##fn) vk##fn(device, (h), NULL); (h) = VK_NULL_HANDLE; } while (0)
+    for (u32 i = 0; i < sizeof dummy_views / sizeof *dummy_views; i++) LET_GO(DestroyImageView, dummy_views[i]);
+    for (u32 i = 0; i < sizeof dummy_images / sizeof *dummy_images; i++) LET_GO(DestroyImage, dummy_images[i]);
+    LET_GO(DestroyBufferView, dummy_texels);
+    LET_GO(DestroyBuffer, dummy_buffer);
+    LET_GO(FreeMemory, dummy_buffer_mem.mem);
+    LET_GO(DestroySampler, default_sampler);
+    LET_GO(DestroySampler, default_compare);
+    LET_GO(DestroyPipelineCache, pipeline_cache);
+    LET_GO(DestroyPipelineLayout, gfx_layout);
+    LET_GO(DestroyPipelineLayout, cs_layout);
+    LET_GO(DestroyDescriptorSetLayout, gfx_set_layout);
+    LET_GO(DestroyDescriptorSetLayout, cs_set_layout);
+    for (u32 i = 0; i < MAX_FRAMES; i++) {
+        Frame *f = &frames[i];
+        LET_GO(DestroyFence, f->done);
+        LET_GO(DestroySemaphore, f->acquired);
+        for (u32 k = 0; k < f->nblocks; k++) {
+            LET_GO(DestroyBuffer, f->blocks[k].buf);
+            LET_GO(FreeMemory, f->blocks[k].mem);
+        }
+        f->nblocks = 0;
+        for (u32 k = 0; k < f->nviews; k++) LET_GO(DestroyBufferView, f->views[k]);
+        f->nviews = 0;
+        for (u32 k = 0; k < f->npools; k++) LET_GO(DestroyDescriptorPool, f->pools[k]);
+        f->npools = 0;
+        f->cmd = VK_NULL_HANDLE;   /* (freed with the pool) */
+        f->recording = f->submitted = 0;
+    }
+    LET_GO(DestroyCommandPool, pool);
+    for (u32 i = 0; i < nchunks; i++) {
+        LET_GO(FreeMemory, chunks[i].mem);
+        free(chunks[i].free);
+        chunks[i].free = NULL;
+        chunks[i].nfree = chunks[i].cap = 0;
+        chunks[i].map = NULL;
+    }
+    nchunks = 0;
+#undef LET_GO
+}
+
+/* A start that failed part way lets go of what it made with the device, the device, the window's surface
+ * and the instance, so that Direct3D 11, which draws instead, has the window to itself. */
+const GfxBackend *vk_backend_start(char *why, size_t size) {
+    const GfxBackend *b = vk_start(why, size);
+    if (b) return b;
+    if (device) {
+        if (vkDeviceWaitIdle) vkDeviceWaitIdle(device);
+        release_device_objects();
+        if (vkDestroyDevice) vkDestroyDevice(device, NULL);
+        device = VK_NULL_HANDLE;
+    }
+    if (vk_surface && vkDestroySurfaceKHR) vkDestroySurfaceKHR(instance, vk_surface, NULL);
+    vk_surface = VK_NULL_HANDLE;
+    if (instance && vkDestroyInstance) vkDestroyInstance(instance, NULL);
+    instance = VK_NULL_HANDLE;
+    return NULL;
 }
 
 #else
