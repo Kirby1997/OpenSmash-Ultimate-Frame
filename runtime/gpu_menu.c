@@ -904,10 +904,11 @@ static void build(void)
         r = add(R_RENDERER, K_CHOICE, W_RESTART, "Renderer",
 #ifdef _WIN32
                 "Direct3D 11: the renderer the game is played and tested with. Vulkan: in development; until it can draw the game, "
-#else
-                "DXVK: Direct3D 11 on Vulkan, the renderer the game is played and tested with. Vulkan: in development; until it can draw the game, "
-#endif
                 "the game checks Vulkan at its start, says what it found in its log, and draws as before.");
+#else
+                "DXVK: Direct3D 11 on Vulkan, the renderer the game is played and tested with. Vulkan: in development, experimental "
+                "here; if it cannot start, DXVK draws and the game's log says why.");
+#endif
         snprintf(r->value, sizeof r->value, "%s", renderer_name(ds.renderer));
         note_env(r, "SSBU_RENDERER");
 #endif

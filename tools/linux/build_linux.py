@@ -59,6 +59,16 @@ RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.pa
                     "-I", os.path.join(DXVK_INCLUDE, "directx"), "-I", os.path.join(SYSROOT, "usr", "include", "SDL2"),
                     "-I", os.path.join(VKD3D_SRC, "include"), "-I", GEN]
 RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL2"]
+# The Vulkan back end (runtime/gpu_vk.c; docs/TECHNICAL.md, "A second back end: Vulkan"), as tools/cc.py
+# builds it on Windows: Khronos' headers from third_party/vulkan-headers (headers only: the program loads
+# the system's libvulkan.so.1 at run time and links no Vulkan library), and vkd3d-shader's SPIR-V for its
+# shaders (runtime/gpu_spirv.c), from the libvkd3d-shader.a the program links anyway. It draws only when
+# display.ini's renderer = vulkan (or SSBU_RENDERER=vulkan) asks for it; DXVK stays the default. Without
+# the headers the program is built as before, and asked for Vulkan it says it has none.
+VULKAN_INCLUDE = os.path.join(REPO, "third_party", "vulkan-headers", "include")
+if os.path.exists(os.path.join(VULKAN_INCLUDE, "vulkan", "vulkan.h")):
+    RUNTIME_INCLUDES += ["-I", VULKAN_INCLUDE]
+    RUNTIME_DEFINES += ["-DSSBU_HAVE_VULKAN", "-DSSBU_HAVE_VKD3D"]
 # --game-dll (tools/game_dll.py): the game's modules in LIBRARY, which the program's runtime, compiled to
 # (game_dll.DEFINE), loads; the library's objects of its own in LIBRARY_OBJ. A shared library's code is
 # position-independent (-fPIC, after toolchain.py's -fno-pic: the last one counts), and the game's

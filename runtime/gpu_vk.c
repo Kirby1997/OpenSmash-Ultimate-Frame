@@ -17,7 +17,14 @@
  * Every image is kept in the GENERAL layout and every operation outside a rendering is followed by a
  * full memory barrier, as is the end of each rendering: simple and correct, to be narrowed later. The
  * work of a frame is one command buffer, submitted at the present. Every entry point takes the back
- * end's lock, as gpu_d3d11.c's do; shaders and pipelines are made by threads of their own (the makers). */
+ * end's lock, as gpu_d3d11.c's do; shaders and pipelines are made by threads of their own (the makers).
+ *
+ * Linux (built with the same headers by tools/linux/build_linux.py): the window is SDL2's
+ * (linux/window.c), and so are the instance extensions and the surface (rt_vk_*, gpu_vulkan.h), so
+ * that neither X11's nor Wayland's Vulkan headers are needed; the swap chain's size, where the surface
+ * leaves it to the program (Wayland), is the window's drawable size. display pacing has no DXGI output
+ * there: gpu_display.c uses the clock, as it does with DXVK. The drawing thread's run time in the status
+ * lines is its CPU time (pthread_getcpuclockid), in nanoseconds, not cycles. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <math.h>
 #include <stdio.h>
@@ -26,9 +33,14 @@
 
 #include "gpu_vk.h"
 
-#if defined(SSBU_HAVE_VULKAN) && defined(_WIN32)
+#if defined(SSBU_HAVE_VULKAN) && (defined(_WIN32) || defined(__linux__))
 #define COBJMACROS
+#ifdef _WIN32
 #include <dxgi.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 
 #include "display.h"
 #include "gpu_backend.h"
@@ -46,16 +58,26 @@
 #include "pad.h"
 
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 extern u64 gfx_stat_clears, gfx_stat_presented, gfx_stat_blits;   /* (gpu_d3d11.c's counters, printed by host.c: either back end counts) */
+#ifndef _WIN32
+static void display_show_window(void) {}   /* (Linux: SDL's window shows when linux/window.c makes it) */
+#endif
 
 /* ---- the Vulkan functions used ------------------------------------------------------------ */
+#ifdef _WIN32
+#define VK_WINDOW_SURFACE_FUNCS(X) X(CreateWin32SurfaceKHR)
+#else
+#define VK_WINDOW_SURFACE_FUNCS(X)   /* (Linux: SDL makes the surface, rt_vk_create_surface) */
+#endif
 #define VK_INSTANCE_FUNCS(X) X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
     X(GetPhysicalDeviceFeatures) X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
     X(GetPhysicalDeviceFormatProperties) X(EnumerateDeviceExtensionProperties) X(CreateDevice) X(GetDeviceProcAddr) \
-    X(CreateWin32SurfaceKHR) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
+    VK_WINDOW_SURFACE_FUNCS(X) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
     X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR) \
     X(GetPhysicalDeviceFeatures2)
 #define VK_DEVICE_FUNCS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) X(QueueSubmit) X(QueueWaitIdle) \
@@ -776,6 +798,23 @@ static VkPresentModeKHR present_mode;
 static int have_immediate, have_mailbox, recreate = 1, shown;
 static VkFormat swap_format = VK_FORMAT_B8G8R8A8_UNORM;
 
+#ifndef _WIN32
+/* Where the surface leaves the swap chain's size to the program (currentExtent 0xFFFFFFFF: Wayland's
+ * surfaces), the window's drawable size in pixels, within the surface's limits; 0 x 0 when it has none
+ * (minimized). */
+static void window_extent(const VkSurfaceCapabilitiesKHR *caps, VkExtent2D *ext) {
+    unsigned w = 0, h = 0;
+    rt_vk_drawable_size(&w, &h);
+    if (!w || !h) { ext->width = ext->height = 0; return; }
+    if (w < caps->minImageExtent.width) w = caps->minImageExtent.width;
+    if (h < caps->minImageExtent.height) h = caps->minImageExtent.height;
+    if (caps->maxImageExtent.width && w > caps->maxImageExtent.width) w = caps->maxImageExtent.width;
+    if (caps->maxImageExtent.height && h > caps->maxImageExtent.height) h = caps->maxImageExtent.height;
+    ext->width = w;
+    ext->height = h;
+}
+#endif
+
 static VkPresentModeKHR wanted_mode(void) {
     if ((display_present_flags() & 0x200u) && have_immediate) return VK_PRESENT_MODE_IMMEDIATE_KHR;   /* vrr, SSBU_SPEED: at once */
     if (have_mailbox) return VK_PRESENT_MODE_MAILBOX_KHR;   /* clock / display pacing: the newest frame at the next refresh */
@@ -803,10 +842,14 @@ static int make_swapchain(void) {
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, vk_surface, &caps) != VK_SUCCESS) return 0;
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
+#ifdef _WIN32
         RECT r;
         GetClientRect(window, &r);
         ext.width = (uint32_t)(r.right - r.left);
         ext.height = (uint32_t)(r.bottom - r.top);
+#else
+        window_extent(&caps, &ext);
+#endif
     }
     if (!ext.width || !ext.height) return 0;
     uint32_t count = caps.minImageCount + 1;
@@ -2706,8 +2749,14 @@ static void vk_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed
     InterlockedAdd64((volatile LONG64 *)&vk_ns_draw, (LONG64)(rt_clock_ns() - t0));
 }
 static volatile DWORD draw_thread;   /* (the thread drawing: its run time in the status lines) */
+#ifndef _WIN32
+static pthread_t draw_pthread;      /* (Linux: the same thread, whose CPU-time clock the status lines read) */
+#endif
 static void vk_draw_(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
     enter();
+#ifndef _WIN32
+    if (!draw_thread) __atomic_store_n(&draw_pthread, pthread_self(), __ATOMIC_RELEASE);
+#endif
     if (!draw_thread) draw_thread = GetCurrentThreadId();
     vk_timing = (vk_stat_draws & (TIMING_EVERY - 1)) == 0;
     u64 tp = vk_timing ? rt_clock_ns() : 0;
@@ -3657,6 +3706,7 @@ static void vk_report_compiles(void (*line)(const char *text)) { (void)line; }
 static void vk_status_lines(void) {
     /* the drawing thread's own run time (preemption left out: a steadier measure than the times above on a busy
      * computer) per draw since the last status */
+#ifdef _WIN32
     static HANDLE dh;
     static ULONG64 last_cycles, last_draws;
     if (!dh && draw_thread) dh = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, draw_thread);
@@ -3666,6 +3716,25 @@ static void vk_status_lines(void) {
                 (cycles - last_cycles) / 1e9, vk_stat_draws - last_draws);
     last_cycles = cycles;
     last_draws = vk_stat_draws;
+#else
+    /* (Linux has no cycle count of another thread: its CPU time, from its own clock; this runs on the window's
+     * thread, so CLOCK_THREAD_CPUTIME_ID would be the wrong thread's) */
+    static clockid_t dclock;
+    static int have_clock;
+    static u64 last_ns, last_draws;
+    pthread_t dt = __atomic_load_n(&draw_pthread, __ATOMIC_ACQUIRE);
+    if (!have_clock && dt && !pthread_getcpuclockid(dt, &dclock)) have_clock = 1;
+    struct timespec ts;
+    u64 ns = 0;
+    if (have_clock && !clock_gettime(dclock, &ts)) {
+        ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+        if (vk_stat_draws > last_draws)
+            fprintf(stderr, "[status] vulkan drawing thread: %.0f ns a draw (%.2f s of its CPU time for %llu draws)\n",
+                    (double)(ns - last_ns) / (double)(vk_stat_draws - last_draws), (ns - last_ns) / 1e9, vk_stat_draws - last_draws);
+    }
+    last_ns = ns;
+    last_draws = vk_stat_draws;
+#endif
     if (memo_on() == 2)
         fprintf(stderr, "[status] vulkan SSBU_VK_MEMO=check: %llu answers taken again checked, %llu differed (constant buffers %llu, shaders %llu, textures %llu)\n",
                 vk_stat_memo_checked, vk_stat_memo_wrong[0] + vk_stat_memo_wrong[1] + vk_stat_memo_wrong[2], vk_stat_memo_wrong[0], vk_stat_memo_wrong[1], vk_stat_memo_wrong[2]);
@@ -3690,7 +3759,11 @@ static void vk_status_lines(void) {
 }
 
 /* The output (monitor) the window is on, referenced, for display pacing (gpu_display.c waits for its
- * refreshes): DXGI's, which needs no Direct3D device; NULL if none matches. */
+ * refreshes): DXGI's, which needs no Direct3D device; NULL if none matches. (Linux: NULL. gpu_display.c's
+ * display pacing does not ask there, and uses the clock, as with DXVK.) */
+#ifndef _WIN32
+static void *vk_display_output(void) { return NULL; }
+#else
 static void *vk_display_output(void) {
     if (!window) return NULL;
     HMONITOR mon = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
@@ -3710,6 +3783,7 @@ static void *vk_display_output(void) {
     IDXGIFactory1_Release(factory);
     return found;
 }
+#endif
 
 /* The pipeline cache to its file (written aside, then put in place): by a maker at most once a minute while
  * new pipelines are made, and at the end. */
@@ -3917,16 +3991,29 @@ static const GfxBackend *vk_start(char *why, size_t size) {
     if (!window) { snprintf(why, size, "the game's window could not be made"); return NULL; }
     vkCreateInstance_ = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
     if (!vkCreateInstance_) { snprintf(why, size, "the Vulkan loader lacks vkCreateInstance"); return NULL; }
+#ifdef _WIN32
     const char *iext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "OpenSmash", 1, "OpenSmash runtime", 1, VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 2, iext};
+#else
+    /* (the surface extension and its window system's - X11's or Wayland's - as SDL names them for the window) */
+    const char *iext[8];
+    uint32_t niext = rt_vk_instance_extensions(iext, 8);
+    if (!niext) { snprintf(why, size, "SDL names no Vulkan surface extensions for the game's window"); return NULL; }
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "OpenSmash", 1, "OpenSmash runtime", 1, VK_API_VERSION_1_1};
+    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, niext, iext};
+#endif
     VkResult r = vkCreateInstance_(&ici, NULL, &instance);
     if (r != VK_SUCCESS) { snprintf(why, size, "vkCreateInstance failed (%d)", (int)r); return NULL; }
 #define LOAD_I(name) vk##name = (PFN_vk##name)gipa(instance, "vk" #name);
     VK_INSTANCE_FUNCS(LOAD_I)
 #undef LOAD_I
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR wci = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR, NULL, 0, GetModuleHandleW(NULL), window};
     if (!vkCreateWin32SurfaceKHR || vkCreateWin32SurfaceKHR(instance, &wci, NULL, &vk_surface) != VK_SUCCESS) {
+#else
+    if (!rt_vk_create_surface(instance, &vk_surface)) {
+#endif
         snprintf(why, size, "no Vulkan surface on the game's window");
         return NULL;
     }
@@ -4061,7 +4148,13 @@ static const GfxBackend *vk_start(char *why, size_t size) {
     if (scale == 0) {
         scale = 1;
         VkSurfaceCapabilitiesKHR caps;
+#ifdef _WIN32
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, vk_surface, &caps) == VK_SUCCESS && caps.currentExtent.width != 0xFFFFFFFFu) {
+#else
+        int known = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, vk_surface, &caps) == VK_SUCCESS;
+        if (known && caps.currentExtent.width == 0xFFFFFFFFu) window_extent(&caps, &caps.currentExtent);   /* (Wayland) */
+        if (known && caps.currentExtent.width && caps.currentExtent.height) {
+#endif
             unsigned fx, fy, fw, fh;
             display_fit(caps.currentExtent.width, caps.currentExtent.height, &fx, &fy, &fw, &fh);
             scale = (float)fh / 1080.0f;
@@ -4147,7 +4240,11 @@ const GfxBackend *vk_backend_start(char *why, size_t size) {
 #else
 
 const struct GfxBackend *vk_backend_start(char *why, size_t size) {
+#ifdef _WIN32
     snprintf(why, size, "this program has no Vulkan back end (Windows builds with the Vulkan headers have it)");
+#else
+    snprintf(why, size, "this program has no Vulkan back end (Windows and Linux builds with the Vulkan headers have it)");
+#endif
     return NULL;
 }
 

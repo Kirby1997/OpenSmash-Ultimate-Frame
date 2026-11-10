@@ -1,6 +1,6 @@
 /* The Vulkan back end behind gpu_backend.h (gpu_vk.c), in development (docs/TECHNICAL.md, "A second
- * back end: Vulkan"). Windows with SSBU_HAVE_VULKAN for now; elsewhere vk_backend_start says it is
- * not in this build. */
+ * back end: Vulkan"). Windows and Linux with SSBU_HAVE_VULKAN; elsewhere (macOS, or a build without
+ * the Vulkan headers) vk_backend_start says it is not in this build. */
 #pragma once
 #include <stddef.h>
 

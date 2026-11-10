@@ -1,7 +1,8 @@
 /* The shaders' DXBC (gpu_shader.c's HLSL, compiled and cached as the Direct3D 11 back end has it)
  * turned into SPIR-V for the Vulkan back end in development, by vkd3d-shader (gpu_spirv.c;
  * docs/TECHNICAL.md, "A second back end: Vulkan"). Built with it where the build has vkd3d-shader
- * (SSBU_HAVE_VKD3D: tools/vkd3d_lib.py on Windows); elsewhere spirv_from_dxbc says it cannot.
+ * (SSBU_HAVE_VKD3D: tools/vkd3d_lib.py on Windows; on Linux the vkd3d-shader tools/linux/build_vkd3d.py
+ * builds, which the program links for D3DCompile anyway); elsewhere spirv_from_dxbc says it cannot.
  *
  * The binding map: the HLSL's registers as Vulkan descriptor bindings, one binding a register, in
  * one descriptor set a stage (the vertex program's set 0, the pixel program's set 1, a compute

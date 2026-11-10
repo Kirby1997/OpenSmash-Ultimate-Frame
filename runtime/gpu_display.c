@@ -21,7 +21,9 @@
  * (display_window_mode ...); borderless and fullscreen are both SDL's desktop full screen.
  * DXVK presents at once at sync interval 0 (Vulkan's immediate mode) whatever the pacing, so
  * clock and vrr differ only in the flag; display falls back to the clock (DXVK's WaitForVBlank
- * only sleeps a refresh).
+ * only sleeps a refresh). The Vulkan back end (renderer = vulkan) picks its present mode as on
+ * Windows (mailbox for clock and display, immediate for vrr), and display falls back to the clock
+ * with it too: there is no DXGI output to wait on.
  *
  * macOS: the window is SDL's too, made and run by macos/window.m; its size is in points (a
  * Retina display has 2 x 2 pixels a point), and borderless and fullscreen are both macOS's own
@@ -159,12 +161,14 @@ static const char DEFAULT_INI[] =
 #ifdef _WIN32
     "; renderer = d3d11 | vulkan\n"
     ";   d3d11:  Direct3D 11, the renderer the game is played and tested with.\n"
+    ";   vulkan: the Vulkan renderer, in development. Until it can draw the game, the game checks Vulkan\n"
+    ";           on this PC at its start, says what it found in its log, and draws as before.\n"
 #else
     "; renderer = dxvk | vulkan\n"
     ";   dxvk:   Direct3D 11 through DXVK, the renderer the game is played and tested with.\n"
+    ";   vulkan: the Vulkan renderer, in development and experimental on Linux (docs/LINUX.md). If it\n"
+    ";           cannot start, DXVK draws and the game's log says why.\n"
 #endif
-    ";   vulkan: the Vulkan renderer, in development. Until it can draw the game, the game checks Vulkan\n"
-    ";           on this PC at its start, says what it found in its log, and draws as before.\n"
     "renderer = " RENDERER_DEFAULT_NAME "\n"
 #endif
     ;

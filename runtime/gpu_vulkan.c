@@ -6,10 +6,11 @@
  * instance, the card display.ini's gpu names, a graphics queue that presents to the game's window,
  * a device - with everything it made let go again before Direct3D 11 makes its own.
  *
- * Built with SSBU_HAVE_VULKAN (tools/cc.py, when the headers in third_party/vulkan-headers are
- * there). The program links no Vulkan library: the loader is the system's, loaded at run time
- * (vulkan-1.dll, which graphics drivers install; libvulkan.so.1 elsewhere), so the program still
- * starts on a PC without Vulkan. Without SSBU_HAVE_VULKAN (the Linux and macOS builds for now)
+ * Built with SSBU_HAVE_VULKAN (tools/cc.py and tools/linux/build_linux.py, when the headers in
+ * third_party/vulkan-headers are there). The program links no Vulkan library: the loader is the
+ * system's, loaded at run time (vulkan-1.dll, which graphics drivers install; libvulkan.so.1 on
+ * Linux), so the program still starts on a PC without Vulkan. On Linux the window's surface and its
+ * instance extensions are SDL's (rt_vk_*, gpu_vulkan.h). Without SSBU_HAVE_VULKAN (the macOS build)
  * vk_probe says the program has none. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
@@ -193,12 +194,25 @@ int vk_probe(void *window, char *what, size_t size) {
     VkExtensionProperties *iext = calloc(next ? next : 1, sizeof *iext);
     if (!iext) { snprintf(what, size, "out of memory"); return 0; }
     vk.EnumerateInstanceExtensionProperties(NULL, &next, iext);
+#ifdef _WIN32
     const char *want_ext[2];
+#else
+    const char *want_ext[8];
+#endif
     uint32_t nwant = 0;
     int surfaces = 0;
 #ifdef _WIN32
     surfaces = has_extension(iext, next, VK_KHR_SURFACE_EXTENSION_NAME) && has_extension(iext, next, VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
     if (surfaces) { want_ext[nwant++] = VK_KHR_SURFACE_EXTENSION_NAME; want_ext[nwant++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME; }
+#else
+    /* (the extensions SDL names for a surface on the window - VK_KHR_surface and X11's or Wayland's - when the
+     * loader has them all) */
+    if (window) {
+        nwant = rt_vk_instance_extensions(want_ext, 8);
+        surfaces = nwant > 0;
+        for (uint32_t i = 0; i < nwant; i++) surfaces &= has_extension(iext, next, want_ext[i]);
+        if (!surfaces) nwant = 0;
+    }
 #endif
     free(iext);
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "OpenSmash", 1, "OpenSmash runtime", 1, VK_API_VERSION_1_1};
@@ -245,13 +259,18 @@ int vk_probe(void *window, char *what, size_t size) {
             goto done;
         }
     }
+#else
+    if (window && surfaces && vk.GetPhysicalDeviceSurfaceSupportKHR && vk.DestroySurfaceKHR && !rt_vk_create_surface(inst, &surface)) {
+        snprintf(what, size, "SDL could not make a Vulkan surface on the game's window");
+        goto done;
+    }
 #endif
     if (window && surface == VK_NULL_HANDLE) {
         snprintf(what, size, "this Vulkan driver cannot draw into a window (no %s)",
 #ifdef _WIN32
                  VK_KHR_WIN32_SURFACE_EXTENSION_NAME
 #else
-                 "window surface support in this build"
+                 "VK_KHR_surface and the window system's surface extension, as SDL names them"
 #endif
         );
         goto done;

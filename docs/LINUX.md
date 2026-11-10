@@ -5,7 +5,9 @@
 The same recompiled game as the Windows build, as a native x86-64 Linux program. It is
 **experimental**.
 
-- The renderer is still the Direct3D 11 one, running on Vulkan through **DXVK**.
+- The renderer is still the Direct3D 11 one, running on Vulkan through **DXVK**. The Vulkan
+  renderer that is in development can be asked for instead; on Linux it is untested
+  ([Trying the Vulkan renderer](#trying-the-vulkan-renderer)).
 - Shaders are compiled by **vkd3d-shader** when they aren't already in the shader cache. The
   cache from the Windows build comes with this folder.
 - The window, controllers and sound use **SDL2**.
@@ -323,7 +325,7 @@ log names each pad as it connects, with its type and GUID.
 | `pacing = display` | Follows the monitor's refreshes on Windows; on Linux, it's the clock. |
 | `latency`, `hide_cursor` | As on Windows: 1–3 frames the GPU may work ahead, and hiding the idle mouse pointer. |
 | `render_scale` | As on Windows: draws the picture this many times bigger than 1920 × 1080 (`0.5`–`4`, or `auto` to match the screen at start). On a software Vulkan driver such as llvmpipe, keep `1`. |
-| `renderer` | `dxvk` (default): Direct3D 11 through DXVK, as above. `vulkan` asks for the Vulkan renderer that is in development; the Linux build has no Vulkan renderer of its own yet, so the log says so and DXVK draws. |
+| `renderer` | `dxvk` (default): Direct3D 11 through DXVK, as above. `vulkan`: the Vulkan renderer that is in development, experimental and so far not run on Linux ([below](#trying-the-vulkan-renderer)). If it can't start, DXVK draws and the log says why. |
 
 **Shaders:** this folder carries the Windows build's compiled shaders that the game has used. Any
 other shader is compiled the first time it's needed, so a new effect can show a moment late once.
@@ -331,6 +333,31 @@ The Windows build's start-up shader prewarm is off here: under DXVK it made a Vu
 every cached shader at once and held up the first frame (`SSBU_SHADER_PREWARM=1` turns it on).
 The Windows build's ahead-of-time shaders (`launchers\Prepare Shaders.bat`) aren't in the package (about
 1.5 GB).
+
+### Trying the Vulkan renderer
+
+> [!WARNING]
+> Experimental. The Linux build compiles the Vulkan renderer, but nobody has run it on Linux yet:
+> it was only checked to compile (against stand-in headers, on a Mac), never linked, started or
+> compared with DXVK. Expect it not to work.
+
+Set `renderer = vulkan` in `display.ini` (or start with `SSBU_RENDERER=vulkan ./run.sh`, or pick
+it on the settings' Display page; it counts from the next start). The game then draws with the
+same Vulkan back end as on Windows ([technical guide](TECHNICAL.md#a-second-back-end-vulkan)),
+into the same SDL window: SDL names the Vulkan surface extensions (X11's or Wayland's) and makes
+the surface. Its shaders are the same DXBC as DXVK's, turned into SPIR-V by vkd3d-shader. If it
+can't start (no Vulkan loader, no `VK_KHR_dynamic_rendering`, no surface), DXVK draws and the log's
+`[gfx] renderer = vulkan` line says why. `renderer = dxvk` goes back.
+
+Differences from DXVK here: `pacing = clock` and `display` show each frame with Vulkan's mailbox
+mode when the driver has it (no tearing), `vrr` and `SSBU_SPEED` with immediate; `display` is the
+clock, as with DXVK. The `[status] vulkan drawing thread` line gives the drawing thread's CPU time
+in nanoseconds a draw, not cycles as on Windows.
+
+If you try it, please report the log's `[vulkan]` and `[gfx]` lines, `vulkaninfo --summary`, your
+desktop (X11 or Wayland) and what you saw; a run with Khronos' validation layer
+(`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`) and frame times against DXVK
+(`--status 30`) are what [CONTRIBUTING](../CONTRIBUTING.md) asks of a renderer change.
 
 ## Other launchers
 
@@ -370,7 +397,10 @@ On Linux, `install-windowsmash.sh` builds it ([Installing on Linux](#installing-
 (`tools/recomp.py all --generate-only`) and runs `build_vkd3d.py` and `build_linux.py` below with
 the system's clang and lld. The third-party parts then live in `deps/linux-toolchain`, where the
 installer puts them, and the overlay's font is drawn from the system's monospace font
-(`tools/linux/make_overlay_font.py`, with Pillow).
+(`tools/linux/make_overlay_font.py`, with Pillow). With Khronos' Vulkan headers in
+`third_party/vulkan-headers` (they are in the checkout), `build_linux.py` compiles the Vulkan
+renderer too (`SSBU_HAVE_VULKAN`, `SSBU_HAVE_VKD3D`); it links no Vulkan library and loads the
+system's `libvulkan.so.1` only when `renderer = vulkan` asks for it.
 
 Both compile for the instruction set [`tools/isa.py`](../tools/isa.py) chooses: `avx2`, or `x86-64-v2` on a processor
 without AVX2 ([the instruction set](BUILDING.md#the-instruction-set)). Set `SSBU_ISA` to choose, for example for a

@@ -11,7 +11,11 @@
  * full screen for borderless and fullscreen alike (the monitor keeps its mode). F11 or Alt+Enter
  * switches between the two, as on Windows. The window's inside in pixels goes to the renderer,
  * whose swap chain follows it (the picture then 16:9 within); the pointer hides after 2 s
- * without moving (hide_cursor). */
+ * without moving (hide_cursor).
+ *
+ * With display.ini's renderer = vulkan the Vulkan back end (gpu_vk.c) presents into the same window:
+ * SDL names its instance extensions and makes its surface (rt_vk_*, gpu_vulkan.h), as it does for
+ * DXVK's SDL2 window system, from the renderer's thread. */
 #define _GNU_SOURCE 1
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -23,6 +27,7 @@
 
 #include "../display.h"
 #include "../gpu_menu.h"
+#include "../gpu_vulkan.h"
 
 static SDL_Window *window;
 static volatile int focused;
@@ -33,6 +38,7 @@ static int cursor_hidden;
 static Uint64 mouse_moved_at;
 
 void gfx_hotkey(int n);   /* (gpu_d3d11.c) F1 + n was pressed */
+void gfx_closing(void);   /* (gpu_backend.c) the game is about to end: the Vulkan back end saves its pipeline cache */
 
 /* ---- display.ini's window ----------------------------------------------------------------- */
 static void note_size(void) {   /* the window's inside, in pixels, for the swap chain */
@@ -104,6 +110,36 @@ SHORT GetAsyncKeyState(int vk) {
 HWND GetForegroundWindow(void) { return focused ? (HWND)window : NULL; }
 void *rt_window(void) { return window; }
 
+/* ---- the Vulkan back end's surface (gpu_vulkan.h) ------------------------------------------- */
+unsigned rt_vk_instance_extensions(const char **names, unsigned max) {
+    unsigned n = 0;
+    if (!window || !SDL_Vulkan_GetInstanceExtensions(window, &n, NULL) || !n || n > max ||
+        !SDL_Vulkan_GetInstanceExtensions(window, &n, names)) {
+        fprintf(stderr, "[vulkan] SDL names no instance extensions for a surface on the window (%u): %s\n", n, SDL_GetError());
+        return 0;
+    }
+    return n;
+}
+
+int rt_vk_create_surface(void *instance, void *surface) {
+    VkSurfaceKHR s;
+    _Static_assert(sizeof s == 8, "a VkSurfaceKHR is 64 bits");
+    if (!window || !SDL_Vulkan_CreateSurface(window, (VkInstance)instance, &s)) {
+        fprintf(stderr, "[vulkan] SDL cannot make a Vulkan surface on the window (%s video driver): %s\n",
+                SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", SDL_GetError());
+        return 0;
+    }
+    memcpy(surface, &s, sizeof s);
+    return 1;
+}
+
+void rt_vk_drawable_size(unsigned *width, unsigned *height) {
+    int w = 0, h = 0;
+    if (window) SDL_Vulkan_GetDrawableSize(window, &w, &h);
+    *width = w > 0 ? (unsigned)w : 0;
+    *height = h > 0 ? (unsigned)h : 0;
+}
+
 /* The settings menu's keys (gpu_menu.c): Esc always, the others while it is open. */
 static void menu_key_of(const SDL_KeyboardEvent *k) {
     int key = 0;
@@ -125,6 +161,11 @@ static void menu_key_of(const SDL_KeyboardEvent *k) {
 /* ---- start-up and the event loop ---------------------------------------------------- */
 int rt_window_init(void) {
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* (DXVK's native build asks which window system) */
+    /* SSBU_VULKAN_LOADER (gpu_vulkan.c: another Vulkan loader, for the Vulkan back end): SDL loads a loader of its
+     * own for the window (SDL_WINDOW_VULKAN) and makes the surface with it, from the back end's instance, so it
+     * must be the same library. Only with renderer = vulkan: DXVK's surfaces are left to SDL's default. */
+    const char *loader = getenv("SSBU_VULKAN_LOADER");
+    if (loader && *loader && display_renderer() == RENDERER_VULKAN) setenv("SDL_VULKAN_LIBRARY", loader, 1);
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");   /* positional, as hle_pad.c expects */
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* (controllers.ini's background = ... decides) */
     SDL_SetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS, "0");              /* hle_pad.c's input thread updates the pads */
@@ -168,6 +209,7 @@ void rt_window_loop(int every, void (*status)(void)) {
             switch (e.type) {
             case SDL_QUIT:
                 fprintf(stderr, "[gfx] window closed\n");
+                gfx_closing();   /* (as Windows' WM_CLOSE: the Vulkan back end's pipeline cache is written) */
                 ExitProcess(0);
             case SDL_WINDOWEVENT:
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) focused = 1;
