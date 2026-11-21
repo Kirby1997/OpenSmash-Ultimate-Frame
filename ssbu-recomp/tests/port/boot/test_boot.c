@@ -353,9 +353,13 @@ static void t_resolve(void) {
     dp_set_cli(DP_DATA, P("DUMP"));                              /* the case of a folder copied from Windows */
     CHECK(dp_resolve(DP_DATA, out, sizeof out, &s) && s == DP_SRC_CLI && same(out, P("dump")));
 
-    SECTION("resolver DP_FONTS: explicit > beside the dump (root or RomFS chosen) > <exe>/../sysdata/fonts > none");
+    SECTION("resolver DP_FONTS: explicit > beside the dump (root or RomFS chosen) > <exe>/../sysdata/fonts > <exe>/fonts_open > none");
     fresh();
     CHECK(dp_resolve(DP_FONTS, out, sizeof out, &s) == 0 && s == DP_SRC_NONE);
+    put(P("build/work/fonts_open/nintendo_ext_003.ttf"), "F", 1);   /* the shipped open-source set counts only when complete */
+    CHECK(dp_resolve(DP_FONTS, out, sizeof out, &s) == 0 && s == DP_SRC_NONE);
+    put_fonts(P("build/work/fonts_open"));
+    CHECK(dp_resolve(DP_FONTS, out, sizeof out, &s) && s == DP_SRC_LAYOUT && same(out, P("build/work/fonts_open")));
     put_fonts(P("build/sysdata/fonts"));
     CHECK(dp_resolve(DP_FONTS, out, sizeof out, &s) && s == DP_SRC_LAYOUT && same(out, P("build/sysdata/fonts")));
     setenv("SSBU_DATA", P("dump"), 1);
@@ -456,7 +460,9 @@ static void t_validate(void) {
     CHECK(!dp_validate(P("dump"), "13.0.4", &r) && r.status == DP_MISSING_FONTS);
     rmrf(P("dump/sysdata"));
     CHECK(!dp_validate(P("dump"), "13.0.4", &r) && r.status == DP_MISSING_FONTS && !strcmp(r.missing, P("dump/sysdata/fonts")));
-    put_fonts(P("build/sysdata/fonts"));                        /* the build's copy (setup.py convert) */
+    put_fonts(P("build/work/fonts_open"));                      /* a dump without fonts: the open-source set staged beside the exe */
+    CHECK(dp_validate(P("dump"), "13.0.4", &r) && r.fonts_source == DP_SRC_LAYOUT && same(r.fonts, P("build/work/fonts_open")));
+    put_fonts(P("build/sysdata/fonts"));                        /* the build's copy (setup.py convert) wins over it */
     CHECK(dp_validate(P("dump"), "13.0.4", &r) && r.fonts_source == DP_SRC_LAYOUT && same(r.fonts, P("build/sysdata/fonts")));
     setenv("SSBU_FONTS", P("nofonts"), 1);                      /* an explicit choice wins, even a bad one */
     CHECK(!dp_validate(P("dump"), "13.0.4", &r) && r.status == DP_MISSING_FONTS && r.fonts_source == DP_SRC_ENV);

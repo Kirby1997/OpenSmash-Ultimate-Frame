@@ -407,14 +407,19 @@ static void dump_root(const char *data, char *root, size_t n) {
     absolute(root, n);
     if (find(p, sizeof p, root, "data.arc", 0)) { snprintf(p, sizeof p, "%s", root); parent_of(p, root, n); }
 }
+static int fonts_complete(const char *dir, const char **missing);
 static int fonts_for(const char *data, char *out, size_t n, dp_source *src) {
     char root[DP_PATH];
+    const char *missing;
     if (explicit_value(DP_FONTS, out, n, src)) return 1;
     if (data && data[0]) {
         dump_root(data, root, sizeof root);
         if (find(out, n, root, "sysdata/fonts", 1)) { *src = DP_SRC_DUMP; return 1; }
     }
     if (dp_exe_path("../sysdata/fonts", out, n) && dp_is_dir(out)) { *src = DP_SRC_LAYOUT; return 1; }
+    /* last, as in nnpl.c: the open-source replacements setup.py stages beside the exe (../third_party/fonts_open), so a
+     * dump without sysdata/fonts (the installer was given no firmware) starts with them: no Chinese, Japanese or Korean */
+    if (dp_exe_path("fonts_open", out, n) && dp_is_dir(out) && fonts_complete(out, &missing)) { *src = DP_SRC_LAYOUT; return 1; }
     out[0] = 0;
     *src = DP_SRC_NONE;
     return 0;
