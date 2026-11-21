@@ -456,6 +456,15 @@ void pcache_save_at(int where, int marker);
 void pcache_save(void);
 extern int g_prep_marked;
 extern int g_prep_loadall;
+/* 2026-11 (Frame first boot): the game is closing. Set once on every exit path (vk_shutdown_at_exit, the window's close
+ * request); read between stages by the workers, the preparation thread and the first-run screens, so that the render thread's
+ * shutdown job (which saves the driver's pipeline cache) runs within seconds. Acquire / release only (no full fence). */
+extern volatile LONG g_prep_stop;
+extern volatile LONG g_display_close;                    /* display.c: the window was closed */
+static inline int prep_stopped(void) { return __atomic_load_n(&g_prep_stop, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_display_close, __ATOMIC_ACQUIRE); }
+void nvn_vk_prep_stop(void);
+int nvn_vk_prep_mode(void);                              /* nvn_vk_draw.c: shader_prepare: 0 first_run, 1 background, 2 off */
+void prep_early_start(void);                             /* nvn_vk_draw.c: the first-run screen before the game's first frame */
 /* nvn_vk_menu.c */
 void menu_vk_views_drop(void);                          /* U1: its views of the swapchain images */
 void menu_vk_draw(uint32_t index);                      /* U1: the settings menu */

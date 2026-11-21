@@ -490,6 +490,9 @@ static bool SDLCALL close_watch(void *user, SDL_Event *e) {
         static volatile LONG once;
         if (InterlockedExchange(&once, 1)) return true;
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+        /* 2026-11 (Frame first boot): as WM_CLOSE does on Windows: a hold of ours (the first-run shader preparation,
+         * nvn_vk_draw.c prep_first_hold) ends at once and the workers leave the preparation (nvn_vk_int.h prep_stopped) */
+        __atomic_store_n(&g_display_close, 1, __ATOMIC_RELEASE);
         if (!oe_exit_request()) report_and_exit(0);
     }
     return true;

@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include "tex_decode.h"
+#include "nvn_vk_prepscreen.h"                    /* 2026-11: the first-run screen's numbers and text (tests/port/prepscreen) */
 static int have_targets_live(void);
 
 #define X(n) PFN_##n pfn_##n;      /* VKD and the names its calls use: nvn_vk_int.h */
@@ -3480,7 +3481,7 @@ static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void
 /* Session 14: text of the first-run preparation screen. A built-in 5x7 dot font (digits, capitals, % / : . -), each lit dot
  * one blit of the overlay's light layer; no game asset. */
 static void ovl_text(uint32_t index, int x, int y, int dot, const char *s) {
-    static const char k_ch[] = "0123456789%/:.-ABCDEFGHIKLMNOPRSTUVWXY";
+    static const char k_ch[] = PS_FONT_CHARS;      /* nvn_vk_prepscreen.h: the glyphs below are in this order */
     static const uint8_t k_gl[][7] = {
         {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
         {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
@@ -3644,11 +3645,29 @@ void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = fra
  * the next start shows the screen again and finds the stage records and the cache of the part already done.
  * NOT covered (said in the log line at the end): pipelines of pairs never drawn on this PC are still linked at their first
  * loading screen or draw (a link is 0.011 ms on NVIDIA, up to 3.9 ms on Intel). */
-extern volatile LONG g_display_close;              /* display.c */
-static void prep_first_hold(LONG64 frame) {
-    static int done, mode = -1;
-    if (done) return;
+/* 2026-11 (Frame first boot, 36 minutes of a black window): the screen is also shown BEFORE the game's first frame, from
+ * the preparation's start (prep_early_start, below): the game takes minutes to reach its first present on a first run
+ * (data.arc read into the store, then ~7,800 programs set at frame 1, each waiting for its stages on the workers: 291 s on
+ * the Frame), and the hold below begins only at that present. The numbers and the text: nvn_vk_prepscreen.h. */
+int nvn_vk_prep_mode(void) {
+    static int mode = -1;
     if (mode < 0) { const char *e = getenv("SSBU_VK_PREPARE"); mode = e ? (!_stricmp(e, "background") ? 1 : !_stricmp(e, "off") ? 2 : 0) : gfx_options()->shader_prepare; }
+    return mode;
+}
+static PsEta g_ps_eta;                             /* render thread: the rate window, shared by the screen before the first frame and the hold */
+static volatile LONG g_game_presented;             /* the game's first present has begun (vk_present2): the hold owns the screen from then on */
+static void prep_screen_fill(int loadall, PsOut *o) {
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    PsIn in;
+    memset(&in, 0, sizeof in);
+    in.loadall = loadall; in.st = g_prep_state; in.store_pct = g_store_pct; in.nfiles = g_prep_nfiles; in.nread = g_prep_read; in.done = g_pq_done; in.queued = g_pq_queued;
+    ps_compute(&in, &g_ps_eta, (double)tk() / (double)fq.QuadPart, o);
+    memcpy(g_ovl.text, o->text, sizeof g_ovl.text);
+}
+static void prep_first_hold(LONG64 frame) {
+    static int done;
+    if (done) return;
+    int mode = nvn_vk_prep_mode();
     /* 2026-10-16: on a PREPARED start with shader_load = start (g_prep_loadall, nvn_vk_m4.c prep_start) the same screen
      * says "LOADING SHADERS": the game's first present waits until every container is in memory (the work began at the
      * device's creation, during the white screen of the game's own boot; this shows what is left) */
@@ -3660,54 +3679,90 @@ static void prep_first_hold(LONG64 frame) {
     int stopped = 0, stuck = 0;
     done = 1;
     if (loadall) printf("nvn_vk_prep: LOADING SHADERS: the game is held at its first frame (%lld) until every container of the game's data is in memory (%lld of %lld stage jobs done, %d of %d files read so far); %d workers at normal priority\n", (long long)frame, (long long)g_pq_done, (long long)g_pq_queued, g_prep_read, g_prep_nfiles, g_pw_nthread);
-    else printf("nvn_vk_prep: FIRST-RUN PREPARATION: no marker %s for this GPU, driver and version (first start here, a new driver, or new game data): the game is held at its first frame (%lld) until every shader is prepared; %d workers at normal priority\n", g_prep_marker, (long long)frame, g_pw_nthread);
+    else printf("nvn_vk_prep: FIRST-RUN PREPARATION: no marker %s for this GPU, driver and version (first start here, a new driver, or new game data): the game is held at its first frame (%lld) until every shader is prepared; %d workers at normal priority (%lld presents of this screen before the game's first frame)\n", g_prep_marker, (long long)frame, g_pw_nthread, (long long)g_ovl_presents);
     fflush(stdout);
     g_ovl.screen = 1;
     for (;;) {
         int st = g_prep_state;
         if (st == 2 || st == 3) break;
-        if (g_display_close || g_m4_quit) { stopped = 1; break; }
+        if (prep_stopped() || g_m4_quit) { stopped = 1; break; }      /* 2026-11: every exit path (display.c close request, nvn_front.c vk_shutdown_at_exit), not only the Windows close */
         g_prep_urgent = 1;
         WakeAllConditionVariable(&g_jq_cv);
-        LONG64 dn = g_pq_done, qd = g_pq_queued, left_files = g_prep_nfiles - g_prep_read;
-        double el = (double)(tk() - t0) / (double)fq.QuadPart, f;
         if (loadall) {   /* a safety net, never seen: no job done and no file read for 30 s = let the game go on (the loading screens make the rest) */
+            LONG64 dn = g_pq_done;
             if (dn + g_prep_read != dn_last) { dn_last = dn + g_prep_read; tprog = tk(); }
             else if (tk() - tprog > 30 * fq.QuadPart) { stuck = 1; break; }
         }
-        /* the store (reading data.arc) is the first tenth; then jobs done of jobs known + about 90 a file not read yet */
-        if (st == 5 || !g_prep_nfiles) f = 0.10 * (double)g_store_pct / 100.0;
-        else f = 0.10 + 0.90 * (qd > 0 ? (double)dn / (double)(qd + left_files * 90) : 0.0);
-        if (f > 0.999) f = 0.999;
-        int pct = (int)(f * 100.0), eta = f > 0.03 && el > 3 ? (int)(el * (1.0 - f) / f) : -1;
-        if (loadall) f = qd > 0 ? (double)dn / (double)(qd + left_files * 90) : 0.0;
-        if (f > 0.999) f = 0.999;
-        pct = (int)(f * 100.0); eta = f > 0.03 && el > 3 ? (int)(el * (1.0 - f) / f) : -1;
-        snprintf(g_ovl.text[0], sizeof g_ovl.text[0], loadall ? "LOADING SHADERS %d %%" : "PREPARING SHADERS %d %%", pct);
-        if (st == 5 || !g_prep_nfiles) snprintf(g_ovl.text[1], sizeof g_ovl.text[1], "READING THE GAME DATA");
-        else snprintf(g_ovl.text[1], sizeof g_ovl.text[1], "%lld / %lld", (long long)dn, (long long)(qd + left_files * 90));
-        if (eta >= 0) snprintf(g_ovl.text[2], sizeof g_ovl.text[2], "ABOUT %d:%02d LEFT", eta / 60, eta % 60); else snprintf(g_ovl.text[2], sizeof g_ovl.text[2], "TIME LEFT: ...");
-        snprintf(g_ovl.text[3], sizeof g_ovl.text[3], loadall ? "NO SHADER LOADING BEFORE A FIGHT" : "FIRST START ONLY");
-        present_progress((float)f);
-        if (tk() - tlog > 10 * fq.QuadPart) { tlog = tk(); printf("nvn_vk_prep: %s screen: %d %%, %lld of about %lld stages, %.0f s so far, about %d s left\n", loadall ? "loading" : "first-run", pct, (long long)dn, (long long)(qd + left_files * 90), el, eta); fflush(stdout); }
+        PsOut o;
+        prep_screen_fill(loadall, &o);
+        present_progress(o.frac);
+        if (tk() - tlog > 10 * fq.QuadPart) { tlog = tk(); printf("nvn_vk_prep: %s screen: %d %%, %lld of about %lld stages, %.0f s so far, about %d s left\n", loadall ? "loading" : "first-run", o.pct, (long long)g_pq_done, (long long)o.total, (double)(tk() - t0) / (double)fq.QuadPart, o.eta); fflush(stdout); }
         Sleep(100);
     }
     g_prep_urgent = 0;
     g_ovl.screen = 0;
     double el = (double)(tk() - t0) / (double)fq.QuadPart;
     if (loadall) {
-        if (stopped) printf("nvn_vk_prep: LOADING SHADERS stopped after %.1f s (the window was closed)\n", el);
+        if (stopped) printf("nvn_vk_prep: LOADING SHADERS stopped after %.1f s (the game is closing)\n", el);
         else if (stuck) printf("nvn_vk_prep: LOADING SHADERS: no progress for 30 s (%lld of %lld jobs, %d of %d files): the game goes on, the rest is made at the loading screens\n", (long long)g_pq_done, (long long)g_pq_queued, g_prep_read, g_prep_nfiles);
         else printf("nvn_vk_prep: SHADERS LOADED AT START: the game's first frame waited %.1f s; %lld stage jobs, every container of the game's data in memory (memory: the FINISHED line above)\n", el, (long long)g_pq_done);
         fflush(stdout);
         return;
     }
-    if (stopped) printf("nvn_vk_prep: FIRST-RUN PREPARATION STOPPED after %.1f s (the window was closed): the pipeline cache is saved on the exit path, no marker: the next start goes on from the stage records and the cache\n", el);
+    if (stopped) printf("nvn_vk_prep: FIRST-RUN PREPARATION STOPPED after %.1f s (the game is closing): the pipeline cache is saved on the exit path, no marker: the next start goes on from the stage records and the cache\n", el);
     else {
         printf("nvn_vk_prep: FIRST-RUN PREPARATION FINISHED in %.1f s on %d workers (state %d): %lld stage jobs; the pipeline cache and the marker are written now; pipelines of pairs never drawn on this PC are NOT made here (linked at their first loading screen)\n", el, g_pw_nthread, g_prep_state, (long long)g_pq_done);
         if (InterlockedExchange(&g_pcsave_want, 0)) pcache_save_at(1, 1);
     }
     fflush(stdout);
+}
+/* 2026-11: THE SCREEN BEFORE THE GAME'S FIRST FRAME. A thread of its own (prep_early_main) posts a job to the render thread
+ * five times a second (nvn_front.c nvn_front_post_prep_screen: in order with the game's jobs, as the on-screen keyboard's
+ * redraw); the job presents the same dark screen through the same present path (vk_present2, progress = 1, no window
+ * texture), so the swapchain stays the renderer's alone. At most one such job is queued (g_early_posted). It stops for good
+ * at the game's first present (the hold above takes over), when the preparation ends, or when the game is closing.
+ * Off on Windows by default (its window has a loading animation of its own until the first frame: loading_anim.c);
+ * SSBU_VK_EARLY_SCREEN=0 / 1 decides on every system. */
+static volatile LONG g_early_posted;
+static PresentJob g_early_job;                      /* win = NULL: no game picture, only the screen */
+static int prep_early_wanted_now(void) {
+    return ps_early_wanted(nvn_vk_prep_mode(), g_prep_thread != NULL, g_prep_marked, g_prep_limited, __atomic_load_n(&g_prep_state, __ATOMIC_ACQUIRE),
+                           prep_stopped() || g_m4_quit, (int)__atomic_load_n(&g_game_presented, __ATOMIC_ACQUIRE));
+}
+void nvn_vk_prep_early_job(void *arg) {             /* render thread (nvn_front.c) */
+    static LONG64 tlog;
+    (void)arg;
+    if (V.alive && prep_early_wanted_now()) {
+        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        PsOut o;
+        prep_screen_fill(0, &o);
+        g_ovl.screen = 1; g_ovl.frac = o.frac; g_ovl.thick = 8;
+        vk_present2(&g_early_job, 1);
+        g_ovl.thick = 0; g_ovl.screen = 0;
+        if (!tlog || tk() - tlog > 10 * fq.QuadPart) { tlog = tk(); printf("nvn_vk_prep: first-run screen (before the game's first frame): %d %%, %lld of about %lld stages, about %d s left\n", o.pct, (long long)g_pq_done, (long long)o.total, o.eta); fflush(stdout); }
+    }
+    __atomic_store_n(&g_early_posted, 0, __ATOMIC_RELEASE);
+}
+static DWORD WINAPI prep_early_main(void *arg) {
+    void nvn_front_post_prep_screen(void);          /* nvn_front.c */
+    (void)arg;
+    while (prep_early_wanted_now()) {
+        if (!__atomic_load_n(&g_early_posted, __ATOMIC_ACQUIRE)) { __atomic_store_n(&g_early_posted, 1, __ATOMIC_RELEASE); nvn_front_post_prep_screen(); }      /* this thread alone sets it */
+        Sleep(200);
+    }
+    return 0;
+}
+void prep_early_start(void) {                       /* nvn_vk_m4.c prep_start, after the preparation thread is made (no marker) */
+    const char *e = getenv("SSBU_VK_EARLY_SCREEN");
+#ifdef _WIN32
+    int on = e && atoi(e);
+#else
+    int on = !(e && !atoi(e));
+#endif
+    if (!on || !prep_early_wanted_now()) return;
+    HANDLE h = CreateThread(NULL, 0, prep_early_main, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+    printf("nvn_vk_prep: first-run screen shown from now on, before the game's first frame too (SSBU_VK_EARLY_SCREEN=0: only from the game's first frame)\n");
 }
 static void vk_present(void *arg) { vk_present2(arg, 0); }
 static void vk_present2(void *arg, int progress) {
@@ -3730,6 +3785,7 @@ static void vk_present2(void *arg, int progress) {
     if (g_pt_on > 0 && g_in_fight) g_pt_frames++;
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
     g_ovl.bar_arg = arg;
+    if (!g_game_presented) __atomic_store_n(&g_game_presented, 1, __ATOMIC_RELEASE);      /* 2026-11: the screen before the first frame ends here */
     g_wd_where = 1;
     m4_barrier(frame, R.frame_draws);
     prep_first_hold(frame);                        /* session 14: the first-run preparation screen (returns at once on every later present) */

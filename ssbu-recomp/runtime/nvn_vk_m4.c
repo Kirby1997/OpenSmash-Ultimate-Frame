@@ -1178,7 +1178,7 @@ void m4_barrier(LONG64 frame, LONG64 draws) {
         int keep = frame >= 300 && g_pk_queued != g_pk_done;
         if (keep) { g_prep_urgent = 1; g_bar_keep_n++; WakeAllConditionVariable(&g_jq_cv); }
         LONG64 d0 = g_jq_done + g_bq_done, tlast = t0;
-        while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done || (keep && g_pk_queued != g_pk_done)) && tk() - t0 < 20 * fq.QuadPart) {
+        while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done || (keep && g_pk_queued != g_pk_done && !prep_stopped())) && tk() - t0 < 20 * fq.QuadPart) {      /* 2026-11: closing: no worker takes those any more */
             WD_SLEEP(&g_sh_cv, &g_sh_lock, 20);
             if (tk() - t0 > fq.QuadPart * 15 / 100 && tk() - tlast > fq.QuadPart / 10) {      /* session 11: held longer than 150 ms: the same picture again, with the progress bar, ten times a second */
                 LONG64 tot = g_jq_queued + g_bq_queued - d0, dn = g_jq_done + g_bq_done - d0;
@@ -1429,17 +1429,25 @@ static PrepSt prep_stage(const SSrc *src, uint32_t fo, int alone) {
     LeaveCriticalSection(&g_sh_lock);
     return r;
 }
+volatile LONG g_prep_stop;                         /* nvn_vk_int.h prep_stopped(): the game is closing */
+void nvn_vk_prep_stop(void) { __atomic_store_n(&g_prep_stop, 1, __ATOMIC_RELEASE); }
 static void job_prep(Job *j) {
     static const uint32_t zero[4];
+    /* 2026-11: the game is closing: the rest of this job is left (a stage takes up to ~1 s on the Frame; the exit path's
+     * m4_stop waits for every worker before it saves the pipeline cache). Checked BEFORE a stage, never inside one, so a
+     * g_prep_st slot is never claimed and left undone (a worker waiting for that key would wait for ever). */
+    if (prep_stopped()) return;
     if (j->has[2]) {
         int how;
         VStage *c = stage_ensure(&j->src[2], ssrc_hb(&j->src[2]), zero, 0, &how);
         if (c->ok && !c->images && c->nsmp <= 32) compute_pipe_ensure(c);
     }
-    if (!j->has[0]) return;
+    if (!j->has[0] || prep_stopped()) return;
     PrepSt vs = prep_stage(&j->src[0], 0, !j->has[1]), fs;
     memset(&fs, 0, sizeof fs);
+    if (prep_stopped()) return;
     if (j->has[1]) fs = prep_stage(&j->src[1], 0, 0);
+    if (prep_stopped()) return;
     if (vs.ok && fs.ok && (fs.in_attr & ~vs.out_attr)) prep_stage(&j->src[0], fs.in_attr & ~vs.out_attr, 0);      /* fragment inputs the vertex code never writes: the variant that declares them */
 }
 static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (its SSBU_VK_PREWARM_PROFILE record) */
@@ -1481,8 +1489,9 @@ static DWORD WINAPI pw_main(void *arg) {           /* arg: the worker's number (
         }
         EnterCriticalSection(&g_sh_lock);
         /* session 10: a preparation job may be taken when nothing else waits; in a fight by at most g_prep_fight_cap workers */
-#define PQ_OK (g_pq_head && g_pq_running < (g_prep_urgent ? 64 : fight_recent() ? g_prep_fight_cap : g_prep_cap))
-        while (!g_jq_head && !g_bq_head && !PQ_OK && !g_m4_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, g_pq_head ? 50 : INFINITE);
+        /* 2026-11: none once the game is closing (prep_stopped); the game's own jobs (g_jq) are still taken until m4_stop */
+#define PQ_OK (g_pq_head && g_pq_running < (g_prep_urgent ? 64 : fight_recent() ? g_prep_fight_cap : g_prep_cap) && !prep_stopped())
+        while (!g_jq_head && !g_bq_head && !PQ_OK && !g_m4_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, g_pq_head && !prep_stopped() ? 50 : INFINITE);
         Job *j = g_jq_head;
         int bg = 0;
         if (j) { g_jq_head = j->next; if (!g_jq_head) g_jq_tail = NULL; }
@@ -2383,7 +2392,7 @@ static DWORD WINAPI prep_main(void *arg) {
     {   /* the index: every stage code of every file -> its file (hashing only) */
         LONG64 ti = tk();
         long long bytes = 0;
-        for (int i = 0; i < g_prep_nfiles && !g_m4_quit; i++) {
+        for (int i = 0; i < g_prep_nfiles && !g_m4_quit && !prep_stopped(); i++) {
             snprintf(path, sizeof path, "%s/%s", dir, g_prep_file[i].name);
             FILE *fp = fopen(path, "rb");
             if (!fp) continue;
@@ -2433,7 +2442,7 @@ static DWORD WINAPI prep_main(void *arg) {
     for (int i = g_prep_nfiles - 1; i >= (g_prep_keep > 0 ? g_prep_keep : 0); i--) if (!g_prep_file[i].late && g_prep_file[i].layout) { ord[no++] = i; nlay++; }
     for (int i = g_prep_keep > 0 ? g_prep_keep : 0; i < g_prep_nfiles; i++) if (!g_prep_file[i].late && !g_prep_file[i].layout) ord[no++] = i;
     printf("nvn_vk_prep: order: %d file(s) whose pool an earlier run saw laid inside a fight, then %d layout-archive containers (smallest first), then %d others (largest first)\n", nlate, nlay, no - nlate - nlay);
-    for (int oi = 0; oi < todo && !g_m4_quit; oi++) {
+    for (int oi = 0; oi < todo && !g_m4_quit && !prep_stopped(); oi++) {
         int i = ord[oi];
         snprintf(path, sizeof path, "%s/%s", dir, g_prep_file[i].name);
         FILE *fp = fopen(path, "rb");
@@ -2449,19 +2458,19 @@ static DWORD WINAPI prep_main(void *arg) {
         g_prep_read = oi + 1;
         if (i == g_prep_keep - 1) {                /* the containers made into memory alone, so that their end is in the log */
             EnterCriticalSection(&g_sh_lock);
-            while (g_pq_done < g_pq_queued && !g_m4_quit) SleepConditionVariableCS(&g_sh_cv, &g_sh_lock, 100);
+            while (g_pq_done < g_pq_queued && !g_m4_quit && !prep_stopped()) SleepConditionVariableCS(&g_sh_cv, &g_sh_lock, 100);
             LeaveCriticalSection(&g_sh_lock);
             prep_line("the containers made into memory (the largest first) are done");
         }
         EnterCriticalSection(&g_sh_lock);          /* not more than 600 copies of code waiting */
-        while (g_pq_queued - g_pq_done > 600 && !g_m4_quit) {
+        while (g_pq_queued - g_pq_done > 600 && !g_m4_quit && !prep_stopped()) {
             SleepConditionVariableCS(&g_sh_cv, &g_sh_lock, 200);
             if (tk() - last > 10 * fq.QuadPart) { last = tk(); LeaveCriticalSection(&g_sh_lock); prep_line("progress"); EnterCriticalSection(&g_sh_lock); }
         }
         LeaveCriticalSection(&g_sh_lock);
     }
     EnterCriticalSection(&g_sh_lock);
-    while (g_pq_done < g_pq_queued && !g_m4_quit) {
+    while (g_pq_done < g_pq_queued && !g_m4_quit && !prep_stopped()) {
         SleepConditionVariableCS(&g_sh_cv, &g_sh_lock, 200);
         if (tk() - last > 10 * fq.QuadPart) { last = tk(); LeaveCriticalSection(&g_sh_lock); prep_line("progress"); EnterCriticalSection(&g_sh_lock); }
     }
@@ -2469,9 +2478,9 @@ static DWORD WINAPI prep_main(void *arg) {
     LeaveCriticalSection(&g_sh_lock);
     {   /* TEST ONLY, SSBU_VK_PREP_END_AT=<frame>: the end below is held back until that game frame (to place it in a fight or a loading screen) */
         LONG64 at = getenv("SSBU_VK_PREP_END_AT") ? atoll(getenv("SSBU_VK_PREP_END_AT")) : 0;
-        while (whole && at > 0 && nvn_front_frame_next() < at && !g_m4_quit) Sleep(5);
-        while (whole && at < 0 && g_battle_frames < -at && !g_m4_quit) Sleep(1);      /* a negative value: that many battle frames after the first one */
-        if (g_m4_quit && at) whole = 0;
+        while (whole && at > 0 && nvn_front_frame_next() < at && !g_m4_quit && !prep_stopped()) Sleep(5);
+        while (whole && at < 0 && g_battle_frames < -at && !g_m4_quit && !prep_stopped()) Sleep(1);      /* a negative value: that many battle frames after the first one */
+        if ((g_m4_quit || prep_stopped()) && at) whole = 0;
     }
     g_prep_t1 = tk();
     printf("nvn_vk_prep: into the cache only: %lld stage variants (%lld read from a record of an earlier run, the others translated now), %lld stage libraries compiled and released, %lld met again in a later variation, %lld left to the game's own path (already handed over); worker time: %.0f s stages, %.0f s libraries; at most %d workers at a time (%d in a fight)\n",
@@ -2563,6 +2572,7 @@ static void prep_start(void) {
     }
     if (!on || !g_m4_on) { printf("nvn_vk_prep: the preparation of every container is off (%s)\n", e ? "SSBU_VK_PREP=0" : "no stage libraries: SSBU_VK_GPL is not 2 or the driver lacks VK_EXT_graphics_pipeline_library"); return; }
     g_prep_thread = CreateThread(NULL, 0, prep_main, NULL, 0, NULL);
+    if (g_prep_thread && !g_prep_marked) prep_early_start();      /* 2026-11: the first-run screen from now on, not only from the game's first frame */
 }
 /* `ssbu_vk1.exe --prepare-shaders [folder]` (boot.c): no game, no window, no Vulkan device. Every *.bnsh file of the folder
  * (tools_vk/bnsh_extract.py writes them from data.arc) is walked as the scan above walks a container in the game's memory

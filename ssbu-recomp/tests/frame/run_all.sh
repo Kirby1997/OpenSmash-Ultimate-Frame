@@ -34,13 +34,14 @@ KIT_VERSION="frame-kit 1"
 
 # ---------------------------------------------------------------------------------------------------- the suites
 # name | what it checks | timeout seconds (full) | (quick)
-SUITE_NAMES="crash fs nnfs boot plat winshim modules services io threads picker lifter"
+SUITE_NAMES="crash fs nnfs boot prepscreen plat winshim modules services io threads picker lifter"
 suite_desc() {
     case $1 in
     crash)   echo "crash reports: signal handler, alternate stack, report file (gcc, clang, FORTIFY, PAC); the A64 decoder of the fake audit" ;;
     fs)      echo "file layer of plat_posix.c: case-insensitive paths, write-through rename, Windows error codes" ;;
     nnfs)    echo "nn::fs on the file layer: romfs tree, journaled save data, Commit under kill -9, failed moves / deletions / marker removals, two processes, folder listing order (nnfs.c, nnfsdir.c)" ;;
     boot)    echo "game-data lookup (datapaths.c) and boot.c's launch defaults, with synthetic fixtures" ;;
+    prepscreen) echo "first-run shader preparation screen: percentage, time left from the last minute's rate, text in the dot font, when the screen before the first frame is shown (nvn_vk_prepscreen.h)" ;;
     plat)    echo "platform layer: VirtualAlloc below 2^47, write watch, plat_selftest (interlocked, threads, fibers, Vulkan loader, SHA-256)" ;;
     winshim) echo "Win32 stand-in layer: header order, VirtualAlloc / Query / Protect, IsBadReadPtr vs the kernel, game library binding, hashes (SHA-256 NRR check, SHA-1, MD5)" ;;
     modules) echo "nn::ro: NRR hash check, LoadModule through LoadLibraryA, relocation, unload, two modules with the same internal names (fake modules built as build.py does)" ;;
@@ -53,9 +54,9 @@ suite_desc() {
 }
 suite_timeout() {
     if [ -n "$QUICK" ]; then
-        case $1 in crash) echo 300 ;; fs) echo 180 ;; nnfs) echo 300 ;; boot) echo 300 ;; plat) echo 300 ;; winshim) echo 300 ;; modules) echo 300 ;; services) echo 300 ;; io) echo 300 ;; threads) echo 600 ;; picker) echo 600 ;; lifter) echo 900 ;; esac
+        case $1 in crash) echo 300 ;; fs) echo 180 ;; nnfs) echo 300 ;; boot) echo 300 ;; prepscreen) echo 120 ;; plat) echo 300 ;; winshim) echo 300 ;; modules) echo 300 ;; services) echo 300 ;; io) echo 300 ;; threads) echo 600 ;; picker) echo 600 ;; lifter) echo 900 ;; esac
     else
-        case $1 in crash) echo 900 ;; fs) echo 300 ;; nnfs) echo 900 ;; boot) echo 600 ;; plat) echo 600 ;; winshim) echo 600 ;; modules) echo 600 ;; services) echo 600 ;; io) echo 600 ;; threads) echo 1800 ;; picker) echo 1500 ;; lifter) echo 3600 ;; esac
+        case $1 in crash) echo 900 ;; fs) echo 300 ;; nnfs) echo 900 ;; boot) echo 600 ;; prepscreen) echo 120 ;; plat) echo 600 ;; winshim) echo 600 ;; modules) echo 600 ;; services) echo 600 ;; io) echo 600 ;; threads) echo 1800 ;; picker) echo 1500 ;; lifter) echo 3600 ;; esac
     fi
 }
 suite_cmd() {   # what the child runs (for the plan and the report)
@@ -64,6 +65,7 @@ suite_cmd() {   # what the child runs (for the plan and the report)
     fs)      echo "sh tests/port/fs/run.sh native  (per compiler)" ;;
     nnfs)    echo "sh tests/port/nnfs/run.sh native  (per compiler)" ;;
     boot)    echo "sh tests/port/boot/run.sh native  (per compiler)" ;;
+    prepscreen) echo "sh tests/port/prepscreen/run.sh native  (per compiler)" ;;
     plat)    echo "sh tests/cspike/c3_build.sh native; c3_low; plat_selftest  (per compiler)" ;;
     winshim) echo "sh tests/port/winshim/run.sh native  (per compiler)" ;;
     modules) echo "sh tests/port/modules/run.sh native  (per compiler)" ;;
@@ -129,7 +131,7 @@ child_main() {
     threads) sh tests/port/threads/run_frame.sh --local || rc=$? ;;
     picker) sh tests/port/picker/run_frame.sh --local || rc=$? ;;
     lifter) sh tests/arm_host/run_frame.sh --local "$FK_PAIRS" "$FK_ITERS" || rc=$? ;;
-    fs | nnfs | boot | winshim | modules | services | io)
+    fs | nnfs | boot | prepscreen | winshim | modules | services | io)
         for cc in $CCS; do
             echo "######## $NAME CC=$cc"
             CC=$cc OUT="$FRAME_WORK/$cc" sh "tests/port/$NAME/run.sh" native 2>&1

@@ -141,7 +141,7 @@ static DWORD WINAPI vks_thread(void *arg) {
     uint64_t nslice = (VKS.total + VKS_SLICE - 1) / VKS_SLICE;
     for (;;) {
         uint64_t s = (uint64_t)InterlockedIncrement64(&VKS.next_slice) - 1;
-        if (s >= nslice || g_m4_quit) break;
+        if (s >= nslice || g_m4_quit || prep_stopped()) break;      /* 2026-11: also when the game is closing during the first-run screen */
         uint64_t lo = s * VKS_SLICE, hi = lo + VKS_SLICE < VKS.total ? lo + VKS_SLICE : VKS.total;
         uint64_t vlen = hi + VKS_ROOM < VKS.total ? hi + VKS_ROOM - lo : VKS.total - lo;
         const uint8_t *v = MapViewOfFile(VKS.map, FILE_MAP_READ, (DWORD)(lo >> 32), (DWORD)lo, (SIZE_T)vlen);
@@ -268,10 +268,10 @@ int vks_build(const char *dir) {
         printf("nvn_vk_store: %d container(s) built into the executable %s%s\n", (int)(VKS.ncont - before), elf, ef ? "" : " (the file cannot be opened)");
     }
     g_store_pct = 100;
-    int whole = !g_m4_quit && !VKS.fail && (uint64_t)VKS.scanned == VKS.total;
+    int whole = !g_m4_quit && !prep_stopped() && !VKS.fail && (uint64_t)VKS.scanned == VKS.total;
     printf("nvn_vk_store: data.arc read in %.1f s (frame %lld): %lld zstd frames (%lld not decodable), %lld effect / container / layout files decoded whole (%lld MB), %d distinct containers (%lld of them stored uncompressed, %lld repeats), %.1f MB written to %s%s\n",
            (double)(tk() - t0) / (double)fq.QuadPart, (long long)nvn_front_frame_next(), (long long)VKS.frames, (long long)VKS.bad, (long long)VKS.wanted, (long long)(VKS.bytes_dec >> 20), (int)VKS.ncont, (long long)VKS.raw, (long long)VKS.dup, (double)VKS.bytes_out / 1048576.0, dir,
-           whole ? "" : g_m4_quit ? ": STOPPED (the game is closing); the next start builds it again" : ": NOT COMPLETE (a file could not be mapped or written); the next start builds it again");
+           whole ? "" : g_m4_quit || prep_stopped() ? ": STOPPED (the game is closing); the next start builds it again" : ": NOT COMPLETE (a file could not be mapped or written); the next start builds it again");
     fflush(stdout);
     if (whole) DeleteFileA(mark);
     DeleteCriticalSection(&VKS.lock);

@@ -1559,6 +1559,10 @@ void nvn_vk_osk_redraw_job(void *arg);                 /* nvn_vk_draw.c */
 long long nvn_vk_presents(void);                       /* nvn_vk_draw.c */
 int nvn_front_osk_ready(void) { return g_vk != 0; }
 void nvn_front_osk_redraw(void) { if (g_vk) gl_post(nvn_vk_osk_redraw_job, NULL, 0); }
+/* 2026-11, the first-run screen before the game's first frame (nvn_vk_draw.c prep_early_main): one present of it, as a job of
+ * the render thread (in order with the game's jobs; nobody waits for it) */
+void nvn_vk_prep_early_job(void *arg);                 /* nvn_vk_draw.c */
+void nvn_front_post_prep_screen(void) { if (g_vk) gl_post(nvn_vk_prep_early_job, NULL, 0); }
 long long nvn_front_presents(void) { return g_vk ? nvn_vk_presents() : 0; }
 /* ---- Track L1 (input latency), early present. The game submits the commands of a frame's picture BEFORE it waits for the
  * window texture (nvnSyncWait on the acquire sync = display_wait_refresh), then reads the pad, runs that frame's logic and
@@ -2335,6 +2339,10 @@ static void job_vk_shutdown(void *arg) { (void)arg; nvn_vk_shutdown(); }
  * in a job at that moment is left alone (the process is ending) and that is said. */
 static void vk_shutdown_at_exit(void) {
     static Job j;
+    /* 2026-11 (Frame first boot: "shutdown NOT finished after 63 s", the pipeline cache lost): the render thread may be
+     * held in the first-run screen (nvn_vk_draw.c prep_first_hold), which on Linux and macOS never saw the window's close.
+     * Said first: the hold ends within 0.1 s, the workers leave the preparation between two stages, the job below runs. */
+    { void nvn_vk_prep_stop(void); nvn_vk_prep_stop(); }
     if (GetCurrentThreadId() == g_render_tid) { nvn_vk_shutdown(); return; }
     j.fn = job_vk_shutdown; j.arg = NULL; j.next = NULL; j.done = CreateEventA(NULL, FALSE, FALSE, NULL);
     EnterCriticalSection(&g_job_lock);
