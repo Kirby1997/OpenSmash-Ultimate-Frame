@@ -46,7 +46,7 @@ static void sockaddr_loop(uint8_t sa[16], uint16_t port_host) { memset(sa, 0, 16
 
 int main(void) {
 #ifdef __APPLE__                                          /* Linux: nnnet_c4a.inc sends with MSG_NOSIGNAL, the "peer closed" check below proves it */
-    signal(SIGPIPE, SIG_IGN);                             /* macOS has no MSG_NOSIGNAL; the exe ignores SIGPIPE in plat_crash.c, this test does not call that */
+    signal(SIGPIPE, SIG_IGN);                             /* macOS has no MSG_NOSIGNAL and the exe does not ignore SIGPIPE either: open there */
 #endif
     c4a_register();
     CHECK(svc_nimports > 20);
