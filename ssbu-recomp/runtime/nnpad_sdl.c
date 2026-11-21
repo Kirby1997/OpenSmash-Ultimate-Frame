@@ -44,7 +44,7 @@ typedef struct {
 typedef struct {
     int used, ignored;
     SDL_JoystickID id; SDL_Gamepad *gp; SDL_Joystick *js;
-    int slot, wireless, dropped, nbtn, naxes, nhats, gtype, has_accel, has_gyro, virt, gca;      /* gca: a port of the GameCube adapter (nnpad_gca.c) */
+    int slot, wireless, dropped, nbtn, naxes, nhats, gtype, has_accel, has_gyro, virt, gca, valve_abxy;      /* gca: a port of the GameCube adapter (nnpad_gca.c); valve_abxy: see eff_layout */
     char guid[40], name[80];
     Uint16 rl, rh; ULONGLONG rsent;
 } Dev;
@@ -142,7 +142,8 @@ static const char *const g_default_ini =
 "\r\n"
 "[general]\r\n"
 "; Face buttons. positional = the button in Nintendo's A position (right) acts as A: right = A, bottom = B, top = X, left = Y.\r\n"
-";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers, positional otherwise.\r\n"
+";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers and for Valve's own\r\n"
+";   pads (Steam Frame controllers, Steam Deck, Steam Controller; also through Steam Input), positional otherwise (Xbox pads too).\r\n"
 "layout = auto\r\n"
 "; Radial dead zone and outer zone of the sticks (fractions of full travel): inside the dead zone nothing, beyond the outer\r\n"
 "; zone full deflection; the stick is rescaled in between and its length is limited to 1 (circular gate).\r\n"
@@ -388,7 +389,13 @@ static float eff_f(const Dev *d, size_t off, float def) {
 static int eff_layout(const Dev *d) {
     const DevCfg *c = dev_cfg(d), *t = type_cfg(d);
     int l = c && c->layout >= 0 ? c->layout : t->layout >= 0 ? t->layout : g_cfg.def.layout;
-    if (l == 2) l = d->gtype == SDL_GAMEPAD_TYPE_GAMECUBE;
+    /* auto: positional keeps a Switch player's hands where they are used to (an Xbox pad's B, at the right, is Pro A), except on
+     * GameCube controllers and on Valve's own pads whose bottom button is labelled A (valve_abxy, set in dev_add): the Steam
+     * Frame's controllers, Steam Deck, Steam Controller. Those are the device's own controls, where SteamOS and every other game
+     * confirm with the A at the bottom. Through Steam Input (a game Steam starts sees each pad as Steam's virtual pad 28de:11ff)
+     * SDL reports the real pad's vendor from Steam's virtualgamepadinfo: the Frame's are 28de:11e0 "Steam Frame Controllers",
+     * type unknown to SDL; an Xbox pad through Steam stays Microsoft's and positional, a PlayStation or Switch pad stays positional. */
+    if (l == 2) l = d->gtype == SDL_GAMEPAD_TYPE_GAMECUBE || d->valve_abxy;
     return l;
 }
 static int eff_rumble(const Dev *d) { const DevCfg *c = dev_cfg(d), *t = type_cfg(d); return c && c->rumble >= 0 ? c->rumble : t->rumble >= 0 ? t->rumble : g_cfg.def.rumble; }
@@ -431,7 +438,7 @@ static void apply_player_index(Dev *d) {
     SDL_SetGamepadLED(d->gp, col[d->slot][0], col[d->slot][1], col[d->slot][2]);
 }
 static const char *type_name(int t) {
-    static const char *const n[] = {"unknown", "standard", "Xbox 360", "Xbox One", "PS3", "PS4", "PS5", "Switch Pro", "Joy-Con left", "Joy-Con right", "Joy-Con pair", "GameCube"};
+    static const char *const n[] = {"unknown", "standard", "Xbox 360", "Xbox One", "PS3", "PS4", "PS5", "Switch Pro", "Joy-Con left", "Joy-Con right", "Joy-Con pair", "GameCube", "Steam"};
     return t >= 0 && t < (int)(sizeof n / sizeof n[0]) ? n[t] : "other";
 }
 static void dev_add(SDL_JoystickID id) {
@@ -454,6 +461,7 @@ static void dev_add(SDL_JoystickID id) {
     if (d->gp) {
         d->gtype = SDL_GetGamepadType(d->gp);
         if (d->gca) d->gtype = SDL_GAMEPAD_TYPE_GAMECUBE;
+        d->valve_abxy = SDL_GetJoystickVendorForID(id) == 0x28DE && SDL_GetGamepadButtonLabel(d->gp, SDL_GAMEPAD_BUTTON_SOUTH) == SDL_GAMEPAD_BUTTON_LABEL_A;
         d->has_accel = SDL_GamepadHasSensor(d->gp, SDL_SENSOR_ACCEL); d->has_gyro = SDL_GamepadHasSensor(d->gp, SDL_SENSOR_GYRO);
         if (d->has_accel) SDL_SetGamepadSensorEnabled(d->gp, SDL_SENSOR_ACCEL, true);
         if (d->has_gyro) SDL_SetGamepadSensorEnabled(d->gp, SDL_SENSOR_GYRO, true);
@@ -461,8 +469,8 @@ static void dev_add(SDL_JoystickID id) {
     d->wireless = SDL_GetJoystickConnectionState(d->js) == SDL_JOYSTICK_CONNECTION_WIRELESS;
     d->slot = assign_slot(d);
     if (d->slot >= 0) { remember(d->guid, d->slot); apply_player_index(d); }
-    say("nn::pad: connected \"%s\" (%s, %s%s) GUID %s -> %s", d->name, d->gp ? "gamepad" : "joystick WITHOUT mapping (guessed layout)", d->gp ? type_name(d->gtype) : "raw",
-        d->has_gyro ? ", gyro" : "", d->guid, d->slot >= 0 ? "player " : "no free slot\n");
+    say("nn::pad: connected \"%s\" (%s, %s%s%s) GUID %s -> %s", d->name, d->gp ? "gamepad" : "joystick WITHOUT mapping (guessed layout)", d->gp ? type_name(d->gtype) : "raw",
+        d->has_gyro ? ", gyro" : "", d->valve_abxy ? ", Valve pad: layout auto = labels" : "", d->guid, d->slot >= 0 ? "player " : "no free slot\n");
     if (d->slot >= 0) say("%d\n", d->slot + 1);
 }
 static void dev_remove(Dev *d) {
@@ -1211,6 +1219,73 @@ int nnpad_selftest(const NnHidHooks *h) {
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_GUIDE, true); settle(); h->state(0, &btn, st, &attr);
         check(btn == 0, "guide/home is not mapped (no Pro bit)");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
+    }
+
+    /* ---- layout auto by kind of pad (default controllers.ini): Valve's own pads with A at the bottom take the printed letters,
+     * everything else keeps positions. The real Steam Frame controllers under Steam: 28de:11e0 "Steam Frame Controllers", type
+     * unknown, Xbox face (SDL labels south A) */
+    {
+        static const struct { Uint16 vid, pid; const char *name, *type_hint; int labels; SDL_GamepadButtonLabel south; const char *what; } k[] = {
+            {0x28DE, 0x11E0, "Steam Frame Controllers", NULL, 1, SDL_GAMEPAD_BUTTON_LABEL_A,
+             "layout auto, Steam Frame controllers (Valve 28de:11e0, south labelled A): printed letters, south = A, east = B, west = X, north = Y"},
+            {0x28DE, 0x1205, "Steam Deck Controller", NULL, 1, SDL_GAMEPAD_BUTTON_LABEL_A,
+             "layout auto, Steam Deck controls (Valve 28de:1205): printed letters"},
+            {0x28DE, 0x11FF, "Selftest Valve pad, Nintendo face", "0x28de/0x11ff=SwitchPro", 0, SDL_GAMEPAD_BUTTON_LABEL_B,
+             "layout auto, a Valve vendor id with a Nintendo face (SDL labels south B): stays positional"},
+            {0x045E, 0x028E, "Xbox 360 Controller", NULL, 0, SDL_GAMEPAD_BUTTON_LABEL_A,
+             "layout auto, Xbox 360 pad (Microsoft 045e:028e, south labelled A): stays positional as before, east = A, south = B"},
+            {0x057E, 0x2009, "Pro Controller", NULL, 0, SDL_GAMEPAD_BUTTON_LABEL_B,
+             "layout auto, Switch Pro Controller (057e:2009): positional, east = A (labels would give the same)"},
+        };
+        static const int face[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
+        static const int lab[4] = {0, 1, 2, 3}, pos[4] = {1, 0, 3, 2};          /* Pro bit: A 0, B 1, X 2, Y 3 */
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+            SDL_VirtualJoystickDesc d;
+            SDL_JoystickID vid;
+            SDL_Joystick *vjs;
+            SDL_Gamepad *g;
+            SDL_GamepadButtonLabel south = SDL_GAMEPAD_BUTTON_LABEL_UNKNOWN;
+            int p = -1, ok = 1;
+            if (k[i].type_hint) SDL_SetHint(SDL_HINT_GAMECONTROLLERTYPE, k[i].type_hint);
+            SDL_INIT_INTERFACE(&d);
+            d.type = SDL_JOYSTICK_TYPE_GAMEPAD; d.vendor_id = k[i].vid; d.product_id = k[i].pid;
+            d.naxes = SDL_GAMEPAD_AXIS_COUNT; d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+            d.name = k[i].name; d.userdata = (void *)(intptr_t)14; d.Rumble = vj_rumble;
+            vid = SDL_AttachVirtualJoystick(&d);
+            settle();
+            vjs = SDL_OpenJoystick(vid);
+            g = SDL_OpenGamepad(vid);
+            if (g) { south = SDL_GetGamepadButtonLabel(g, SDL_GAMEPAD_BUTTON_SOUTH); SDL_CloseGamepad(g); }
+            for (int s = 1; s < 8 && p < 0; s++) if (nnpad_present(s)) p = s;
+            for (int j = 0; j < 4 && p > 0; j++) {
+                int want = k[i].labels ? lab[j] : pos[j];
+                vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
+                SDL_SetJoystickVirtualButton(vjs, face[j], true);
+                settle();
+                h->state((uint32_t)p, &btn, st, &attr);
+                if (btn != 1ull << want) { ok = 0; printf("    %s, face button %d: got %llx expected bit %d\n", k[i].name, j, (unsigned long long)btn, want); }
+            }
+            if (south != k[i].south) printf("    %s: SDL labels south %d, expected %d\n", k[i].name, (int)south, (int)k[i].south);
+            check(p > 0 && south == k[i].south && ok, k[i].what);
+            if (i == 0 && p > 0) {      /* an explicit layout = positional still wins over auto on a Valve pad */
+                char text[256];
+                snprintf(text, sizeof text, "[general]\r\nlayout = positional\r\n[keyboard]\r\nplayer = none\r\n");
+                Sleep(1100); write_text(path, text); Sleep(1100); nnpad_poll(1);
+                vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
+                SDL_SetJoystickVirtualButton(vjs, SDL_GAMEPAD_BUTTON_SOUTH, true); settle(); h->state((uint32_t)p, &btn, st, &attr);
+                check(btn == 1ull << 1, "layout = positional in [general] wins over auto on the Steam Frame controllers: south = B");
+                Sleep(1100); write_text(path, g_default_ini); Sleep(1100); nnpad_poll(1);
+                vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
+                SDL_SetJoystickVirtualButton(vjs, SDL_GAMEPAD_BUTTON_SOUTH, true); settle(); h->state((uint32_t)p, &btn, st, &attr);
+                check(btn == 1ull << 0, "default controllers.ini written back: layout auto, south = A on the Steam Frame controllers again");
+            }
+            vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
+            SDL_CloseJoystick(vjs);
+            SDL_DetachVirtualJoystick(vid);
+            settle();
+            if (k[i].type_hint) SDL_ResetHint(SDL_HINT_GAMECONTROLLERTYPE);
+        }
+        check(!nnpad_present(1) && nnpad_present(0), "layout auto pads unplugged: only player 1 left");
     }
 
     /* ---- axes */

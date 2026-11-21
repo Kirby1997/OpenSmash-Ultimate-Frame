@@ -173,7 +173,10 @@ players, hot-plug. The keyboard is one more player:
 
 Remapping, player slots, dead zones and rumble: `build-linux/config/controllers.ini`. It is written on the first
 start, explains itself, and is re-read within a second of being saved. `build-linux/work/ssbu_native --pad-test` shows
-what a pad sends.
+what a pad sends. Face buttons (`layout = auto`, the default): Valve's own pads (the Steam Frame's controllers, Steam
+Deck, Steam Controller, also through Steam Input) go by their printed letters, so their A is A; other pads go by
+position, as on a Switch controller (an Xbox pad's B, on the right, is A). `layout = labels` or `positional` in
+`[general]`, `[type ...]` or `[device <GUID>]` sets it.
 
 Window: `build-linux/config/graphics.ini` (`window = windowed | borderless | fullscreen`, size, vsync), or F1 > Display.
 Only `windowed` was tested on Linux.
