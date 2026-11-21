@@ -677,7 +677,8 @@ int main(int argc, char **argv) {
                 printf("[chain] %s: x0=%llx\n", spec, (unsigned long long)p);
                 for (char *o = colon ? colon + 1 : NULL; p; o = o ? strchr(o, ',') : NULL) {
                     MEMORY_BASIC_INFORMATION mi;
-                    if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi) || mi.State != MEM_COMMIT) { printf("[chain]   %llx not mapped\n", (unsigned long long)p); break; }
+                    if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+                        (uintptr_t)mi.BaseAddress + mi.RegionSize < p + 0x130) { printf("[chain]   %llx not mapped\n", (unsigned long long)p); break; }
                     printf("[chain]   %llx:", (unsigned long long)p);
                     for (int w = 0; w < 0x130; w += 8) printf("%s%016llx", w % 0x40 ? " " : "\n[chain]     ", (unsigned long long)rd64(p + w));
                     printf("\n");

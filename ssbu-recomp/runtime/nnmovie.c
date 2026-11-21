@@ -31,7 +31,7 @@ static void virtual_call(Ctx *c) {
                 for (int r = 1; r <= 2; r++) {                    /* show arguments that are readable strings (file paths) */
                     MEMORY_BASIC_INFORMATION mi;
                     const char *s = (const char *)(uintptr_t)c->x[r];
-                    if (c->x[r] > 0x10000 && VirtualQuery(s, &mi, sizeof mi) && mi.State == MEM_COMMIT &&
+                    if (c->x[r] > 0x10000 && VirtualQuery(s, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
                         (const char *)mi.BaseAddress + mi.RegionSize - s >= 64 && s[0] >= 0x20 && s[0] < 0x7f)
                         printf("movie:   x%d -> \"%.60s\"\n", r, s);
                 }

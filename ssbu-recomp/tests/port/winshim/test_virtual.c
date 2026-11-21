@@ -13,6 +13,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 static sigjmp_buf g_jb;
 static void on_segv(int sig, siginfo_t *si, void *uc) { (void)sig; (void)si; (void)uc; siglongjmp(g_jb, 1); }
@@ -145,6 +148,21 @@ static void test_query_host(void) {
     CHECK(VirtualQuery(&local, &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE);
     CHECK(VirtualQuery((void *)(uintptr_t)&test_query_host, &mi, sizeof mi) && mi.State == MEM_COMMIT && (mi.Protect == PAGE_EXECUTE_READ || mi.Protect == PAGE_EXECUTE_READWRITE));
     CHECK(VirtualQuery(&g_global, &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE);
+#ifdef __linux__
+    {   /* the old protection of a code page plat did not map is its real one: the test's own text and a libc function it never
+         * names (no canonical PLT entry in this -no-pie exe; libc lies at 0xffff... on aarch64, above 2^47). PAGE_READWRITE here
+         * made a restore take execute away. */
+        uintptr_t hp = (uintptr_t)sysconf(_SC_PAGESIZE);
+        void *code[2] = { (void *)(uintptr_t)&test_query_host, dlsym(RTLD_DEFAULT, "strverscmp") };
+        for (int k = 0; k < 2; k++) {
+            DWORD old = 0, old2 = 0;
+            void *pg = (void *)((uintptr_t)code[k] & ~(hp - 1));
+            CHECK(code[k] && VirtualProtect(pg, hp, PAGE_EXECUTE_READ, &old) && (old == PAGE_EXECUTE_READ || old == PAGE_EXECUTE_READWRITE));
+            /* restored with what it said, only if that keeps execute (the old bug's PAGE_READWRITE would kill the test mid-run) */
+            CHECK(code[k] && VirtualProtect(pg, hp, (old & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) ? old : PAGE_EXECUTE_READ, &old2) && old2 == PAGE_EXECUTE_READ);
+        }
+    }
+#endif
     CHECK(VirtualQuery(NULL, &mi, sizeof mi) && mi.State == MEM_FREE);
     CHECK(VirtualQuery((void *)(uintptr_t)(1ull << 48), &mi, sizeof mi) == 0);
     CHECK(VirtualQuery(&local, &mi, sizeof mi - 1) == 0);                                      /* a buffer that is too small */
