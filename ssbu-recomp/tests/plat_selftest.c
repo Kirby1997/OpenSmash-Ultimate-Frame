@@ -177,8 +177,13 @@ int main(void) {
 #ifdef __linux__                 /* the comparison reads /proc (Linux only) */
     {   /* untracked memory against the text of /proc/self/maps: every mapping (start and middle) and every gap */
         static unsigned long lo[4096], hi[4096]; static char perm[4096][8]; int n = 0, bad = 0, asked = 0;
+#ifdef __aarch64__               /* the host's user address space: 48 bits on aarch64 (stack, ld.so and libraries at 0xffff...), 47 on x86-64 */
+        const unsigned long end = 1UL << 48;
+#else
+        const unsigned long end = 0x800000000000UL;
+#endif
         FILE *f = fopen("/proc/self/maps", "r"); char line[512];
-        while (f && n < 4096 && fgets(line, sizeof line, f)) if (sscanf(line, "%lx-%lx %7s", &lo[n], &hi[n], perm[n]) == 3 && hi[n] <= 0x800000000000UL) n++;
+        while (f && n < 4096 && fgets(line, sizeof line, f)) if (sscanf(line, "%lx-%lx %7s", &lo[n], &hi[n], perm[n]) == 3 && hi[n] <= end) n++;
         if (f) fclose(f);
         for (int k = 0; k < n; k++) {
             if (lo[k] < (uintptr_t)any + 0x10000 && hi[k] > (uintptr_t)any) continue;          /* the tracked allocation above */

@@ -1790,6 +1790,18 @@ static DWORD prot_from_maps(const char *perm) {
     if (x) return w ? PAGE_EXECUTE_READWRITE : r ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
     return w ? PAGE_READWRITE : r ? PAGE_READONLY : PAGE_NOACCESS;
 }
+/* The end of the host's user address space, for VirtualQuery of memory plat did not map: at and above it there is nothing
+ * (0, as Windows answers above lpMaximumApplicationAddress). x86-64 Linux and macOS end at 2^47, where Windows does. aarch64
+ * Linux has 48 bits: the main thread's stack, ld.so, the shared libraries and every mmap(NULL) of host code (SDL, the Vulkan
+ * driver, libc) lie at 0xffff_xxxx_xxxx, and host code asks about its own memory there (IsBadReadPtr of a local, the crash
+ * report's host stack, VirtualProtect's old protection of a .so's code page). Stopping at 2^47 told it that its own stack did
+ * not exist. What the guest is given stays below 2^47 (low_place, low_stack; GetSystemInfo still ends at 0x7ffffffeffff,
+ * the whole-address-space walks stop there) and skyline.c's svcQueryMemory answers only below 2^47. */
+#if defined(__aarch64__) && !defined(__APPLE__)
+#define HOST_VA_END (1ULL << 48)
+#else
+#define HOST_VA_END 0x800000000000ULL
+#endif
 /* Memory from VirtualAlloc answers with its allocation base, state and protection as on Windows; any other mapping (the exe,
  * libraries, malloc, stacks) is one committed MEM_PRIVATE region with its real protection (Windows: MEM_IMAGE / MEM_MAPPED). */
 SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
@@ -1810,7 +1822,7 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
     }
     uintptr_t next_tracked = i < g_nseg ? g_seg[i].lo : UINTPTR_MAX;
     vm_unlock();
-    if (a >= 0x800000000000ULL) return 0;
+    if (a >= HOST_VA_END) return 0;
 #ifdef PROCMAP_QUERY
     /* Linux 6.11+: the mapping that holds a (or the next one) asked of the kernel directly. Reading and parsing the text
      * below (1,400+ lines) was 4.7% of the game thread in a 2-fighter match (2026-10-15). -2 = not opened yet,
@@ -1839,7 +1851,7 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
             return sizeof *mi;
         }
         if (errno == ENOENT) {                             /* no mapping at or above a */
-            mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = (next_tracked != UINTPTR_MAX ? next_tracked : 0x800000000000ULL) - a;
+            mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = (next_tracked != UINTPTR_MAX ? next_tracked : HOST_VA_END) - a;
             return sizeof *mi;
         }
         if (errno == ENOTTY || errno == EINVAL || errno == EOPNOTSUPP) __atomic_store_n(&pmq_fd, -1, __ATOMIC_RELEASE);
@@ -1853,7 +1865,7 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
         if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &obj) != KERN_SUCCESS) {
-            mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = (next_tracked != UINTPTR_MAX ? next_tracked : 0x800000000000ULL) - a;
+            mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = (next_tracked != UINTPTR_MAX ? next_tracked : HOST_VA_END) - a;
             return sizeof *mi;
         }
         if (ra > a) {                                  /* in a gap */
@@ -1889,7 +1901,7 @@ SIZE_T VirtualQuery(LPCVOID addr, MEMORY_BASIC_INFORMATION *mi, SIZE_T len) {
     }
     fclose(f);
     (void)prev_end;
-    if (!found) { mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = (next_tracked != UINTPTR_MAX ? next_tracked : 0x800000000000ULL) - a; }
+    if (!found) { mi->State = MEM_FREE; mi->Protect = PAGE_NOACCESS; mi->RegionSize = (next_tracked != UINTPTR_MAX ? next_tracked : HOST_VA_END) - a; }
     return sizeof *mi;
 }
 #if defined(__APPLE__) && defined(__aarch64__)      /* arm64 does not keep code coherent with data writes */

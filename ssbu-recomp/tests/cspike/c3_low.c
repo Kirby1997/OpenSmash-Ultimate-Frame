@@ -97,7 +97,14 @@ int main(void) {
     }
     MEMORY_BASIC_INFORMATION mi; SYSTEM_INFO si; GetSystemInfo(&si);
     if ((uint64_t)(uintptr_t)si.lpMaximumApplicationAddress >= LIM) { g_bad++; printf("FAIL GetSystemInfo max\n"); }
+#if defined(__aarch64__) && !defined(__APPLE__)
+    /* 2^47 ends what the guest is given, not the host: aarch64 Linux has 48 bits (stack, libraries at 0xffff...) and VirtualQuery
+     * answers for them; at 2^47 lies the free gap below them, and nothing answers at or past 2^48 */
+    if (!VirtualQuery((void *)LIM, &mi, sizeof mi) || mi.State != MEM_FREE) { g_bad++; printf("FAIL VirtualQuery at 2^47: not the free gap below the host's libraries\n"); }
+    if (VirtualQuery((void *)(LIM << 1), &mi, sizeof mi) != 0) { g_bad++; printf("FAIL VirtualQuery at 2^48 answered\n"); }
+#else
     if (VirtualQuery((void *)LIM, &mi, sizeof mi) != 0) { g_bad++; printf("FAIL VirtualQuery at 2^47 answered\n"); }
+#endif
     if (!VirtualQuery(w, &mi, sizeof mi) || mi.State != MEM_COMMIT) { g_bad++; printf("FAIL VirtualQuery of ww\n"); }
     printf("c3_low: %d addresses checked, %d bad, writewatch %s -> %s\n", g_n, g_bad, ww_ok > 0 ? "ok" : "skipped", g_bad ? "FAIL" : "ok");
     return g_bad != 0;
