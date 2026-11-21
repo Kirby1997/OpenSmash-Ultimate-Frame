@@ -391,7 +391,7 @@ scrape() {   # scrape <log>: "checks failed" scraped from the output (approximat
       s = $0
       while (match(s, /[0-9]+ failed/)) {   # not failed checks: "N failed stxr" (lifter litmus: store-exclusive retries), "N failed-apply runs" (nnfs prose)
           n = substr(s, RSTART, RLENGTH) + 0; s = substr(s, RSTART + RLENGTH)
-          if (s !~ /^ stxr/ && s !~ /^-/) f += n }
+          if (s !~ /^ stxr/ && s !~ /^-apply runs/) f += n }
       if ($0 ~ /^ok   /) c++
       if ($0 ~ /^FAIL / && $0 !~ /^FAIL line [0-9]+:/) f++ }
     END { printf "%.0f %.0f\n", c, f }' "$1"
