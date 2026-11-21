@@ -357,7 +357,7 @@ static void cfg_load(int first) {                 /* lock held */
     strcpy(n.path, g_cfg.path);
     n.mtime = mt;
     {   const char *l = getenv("SSBU_PAD_LAYOUT");
-        if (l && l[0]) n.def.layout = !_stricmp(l, "label") || !_stricmp(l, "labels") ? 1 : 0; }
+        if (l && l[0]) n.def.layout = !_stricmp(l, "label") || !_stricmp(l, "labels") ? 1 : !_stricmp(l, "auto") ? 2 : 0; }
     g_cfg = n;
 }
 
@@ -438,7 +438,7 @@ static void apply_player_index(Dev *d) {
     SDL_SetGamepadLED(d->gp, col[d->slot][0], col[d->slot][1], col[d->slot][2]);
 }
 static const char *type_name(int t) {
-    static const char *const n[] = {"unknown", "standard", "Xbox 360", "Xbox One", "PS3", "PS4", "PS5", "Switch Pro", "Joy-Con left", "Joy-Con right", "Joy-Con pair", "GameCube", "Steam"};
+    static const char *const n[] = {"unknown", "standard", "Xbox 360", "Xbox One", "PS3", "PS4", "PS5", "Switch Pro", "Joy-Con left", "Joy-Con right", "Joy-Con pair", "GameCube"};
     return t >= 0 && t < (int)(sizeof n / sizeof n[0]) ? n[t] : "other";
 }
 static void dev_add(SDL_JoystickID id) {
