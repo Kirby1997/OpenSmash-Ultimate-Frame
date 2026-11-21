@@ -20,7 +20,11 @@ ns = {'__file__': os.path.join(sys.argv[1], 'runtime', 'build.py')}
 # take the module prologue up to the link helpers, with pkg-config stubbed (no pkg-config on WSL)
 start = src.index('HOST_SOURCES = ['); end = src.index('def debug_link_flags')
 pro = src[:src.index('HOST_SOURCES = [')]
-code = 'import os, sys, subprocess\nCLANG="clang"\nHERE=%r\nGEN=HERE\nTARGET_LINUX=True\nPLAT_FLAGS=[]\nOPT_BASE="-O1"\nCODEGEN_FLAGS=[]\nTARGET_ARM64=False\nTARGET_FLAGS=[]\n' % os.path.join(sys.argv[1], 'runtime')
+# the TARGET_* switches come from build.py itself (RECOMP_TARGET=linux), so a new one there is not missed here
+t0 = src.index("TARGET = os.environ.get('RECOMP_TARGET'"); t1 = src.index('TARGET_POSIX =')
+t1 = src.index('\n', t1) + 1
+code = 'import os, sys, subprocess\nCLANG="clang"\nHERE=%r\nGEN=HERE\nPLAT_FLAGS=[]\nOPT_BASE="-O1"\nCODEGEN_FLAGS=[]\nTARGET_FLAGS=[]\n' % os.path.join(sys.argv[1], 'runtime')
+code += src[t0:t1]
 code += src[start:end].replace("subprocess.run(['pkg-config']", "(lambda *a, **k: type('R', (), {'stdout': ''})())(['pkg-config']")
 exec(code, ns)
 gen = {'sdkdata.c', 'nro_registry.c', 'sdklift_gen.c', 'game_data.c'}

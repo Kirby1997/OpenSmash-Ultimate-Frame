@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 /* ---- what boot.c and nnmisc.c reach in the rest of the runtime on the paths run here */
+int g_game_build = -1;                               /* hostrt.c owns it (not linked here); nnmisc.c reads it for GetDisplayVersion */
 static ImportDef g_imp[512];
 static int g_nimp;
 void register_imports(const ImportDef *d, int n) { for (int i = 0; i < n && g_nimp < 512; i++) g_imp[g_nimp++] = d[i]; }

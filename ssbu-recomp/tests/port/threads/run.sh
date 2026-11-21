@@ -17,7 +17,7 @@ MODE=${1:-native}
 OUT=${OUT:-/tmp/ssbu-c3b-$MODE}; mkdir -p "$OUT"
 OPT=${OPT:--O2}
 T=tests/port/threads
-F="$OPT -g -w -fno-strict-aliasing -fno-omit-frame-pointer -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat -I runtime -I $T/stub ${CFLAGS_EXTRA:-}"
+F="$OPT -g -w -D_GNU_SOURCE -fno-strict-aliasing -fno-omit-frame-pointer -fvisibility=hidden -include runtime/plat/plat_pre.h -I runtime/plat -I runtime -I $T/stub ${CFLAGS_EXTRA:-}"
 L="-lm -lpthread -ldl"
 P=""                                               # symbol prefix of nm output
 case "$MODE" in

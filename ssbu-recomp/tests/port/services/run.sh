@@ -35,12 +35,13 @@ mac)
 *) echo "mode: native | mac"; exit 2 ;;
 esac
 $CC $F -c runtime/plat_posix.c -o "$OUT/plat_posix.o"
+$CC $F -c runtime/datapaths.c -o "$OUT/datapaths.o"                # nnmisc.c (test_misc) resolves its data paths through it
 $CC $(echo "$F" | sed 's#-include runtime/plat/plat_pre.h##; s#-I runtime/plat ##') -std=gnu11 -c runtime/plat_crash.c -o "$OUT/plat_crash.o"
 for t in test_time test_mii test_net test_applet test_misc; do
     $CC $F $GT -I $T -c $T/$t.c -o "$OUT/$t.o"
     nat_stubs "$OUT/$t-stubs.c" "$OUT/plat_posix.o" "$OUT/$t.o"
     $CC $F -c "$OUT/$t-stubs.c" -o "$OUT/$t-stubs.o"
-    $CC $F "$OUT/$t.o" "$OUT/plat_posix.o" "$OUT/plat_crash.o" "$OUT/$t-stubs.o" $L -o "$OUT/$t"
+    $CC $F "$OUT/$t.o" "$OUT/plat_posix.o" "$OUT/plat_crash.o" "$OUT/datapaths.o" "$OUT/$t-stubs.o" $L -o "$OUT/$t"
 done
 fail=0
 run() { echo "== $*"; timeout 300 "$@" || { echo "$1: exit $?"; fail=1; }; }

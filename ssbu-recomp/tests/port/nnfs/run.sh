@@ -14,7 +14,7 @@ OUT=${OUT:-${TMPDIR:-/tmp}/ssbu-nnfs-$MODE}; mkdir -p "$OUT"
 T=tests/port/nnfs
 . tests/port/native_env.sh
 GT="-include tests/port/threads/game_tables.h -I tests/cspike/stubs"
-BASE="-O1 -g -w -fvisibility=hidden -fno-omit-frame-pointer -include runtime/plat/plat_pre.h -I runtime/plat -I runtime ${CFLAGS_EXTRA:-}"
+BASE="-O1 -g -w -D_GNU_SOURCE -fvisibility=hidden -fno-omit-frame-pointer -include runtime/plat/plat_pre.h -I runtime/plat -I runtime ${CFLAGS_EXTRA:-}"
 case "$MODE" in
 native)
     CC=${CC:-cc}
