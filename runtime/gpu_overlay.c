@@ -18,13 +18,15 @@
 #include "gpu_menu.h"
 #include "net.h"
 
+#include "ui_font.h"
+
 #define CELL_W 24                 /* the atlas's cells */
 #define CELL_H 48
 #define TEXT_W 12                 /* the overlay's own letters: half size */
 #define TEXT_H 24
-#define COLS 16
+#define COLS UI_FONT_COLS
 #define ATLAS_W (CELL_W * COLS)
-#define ATLAS_H (CELL_H * 6)      /* ' '..'~', then the solid cell (127) */
+#define ATLAS_H (CELL_H * UI_FONT_ROWS)      /* ' '..'~', then the solid cell (127) */
 #define MAX_QUADS 8192
 #define HISTORY 240
 
@@ -90,6 +92,21 @@ static int make_coverage(void) {
         char ch = (char)c;
         TextOutA(dc, (c - 32) % COLS * CELL_W, (c - 32) / COLS * CELL_H + 2, &ch, 1);
     }
+    HFONT unicode_font = CreateFontW(-38, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    HFONT japanese_font = CreateFontW(-38, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
+    HFONT korean_font = CreateFontW(-38, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Malgun Gothic");
+    for (unsigned i = 0; i < UI_GLYPH_COUNT; i++) {
+        unsigned cp = ui_glyphs[i], cell = 96 + i * 2;
+        SelectObject(dc, cp >= 0xac00 && cp <= 0xd7af ? korean_font :
+            cp >= 0x3040 && cp <= 0x30ff ? japanese_font : ui_columns(cp) > 1 ? unicode_font : font);
+        WCHAR chars[2]; int count = 1;
+        if (cp > 0xffff) { cp -= 0x10000; chars[0] = (WCHAR)(0xd800 + (cp >> 10)); chars[1] = (WCHAR)(0xdc00 + (cp & 1023)); count = 2; }
+        else chars[0] = (WCHAR)cp;
+        TextOutW(dc, cell % COLS * CELL_W, cell / COLS * CELL_H + 2, chars, count);
+    }
     GdiFlush();
     const unsigned *px = bits;
     for (int i = 0; i < ATLAS_W * ATLAS_H; i++) coverage[i] = (unsigned char)(px[i] >> 16);   /* red */
@@ -101,6 +118,9 @@ static int make_coverage(void) {
 #ifdef _WIN32
     SelectObject(dc, old_font);
     SelectObject(dc, old_bmp);
+    DeleteObject(japanese_font);
+    DeleteObject(korean_font);
+    DeleteObject(unicode_font);
     DeleteObject(font);
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -153,8 +173,9 @@ static int init(ID3D11Device *dev) {
 static void quad(float x, float y, float w, float h, int cell, unsigned color) {
     if (nverts + 6 > MAX_QUADS * 6) return;
     float u0 = (float)(cell % COLS * CELL_W) / ATLAS_W, v0 = (float)(cell / COLS * CELL_H) / ATLAS_H;
-    float u1 = u0 + (float)CELL_W / ATLAS_W, v1 = v0 + (float)CELL_H / ATLAS_H;
+    float u1 = u0 + (float)(CELL_W * ui_font_span(cell)) / ATLAS_W, v1 = v0 + (float)CELL_H / ATLAS_H;
     if (cell == 127 - 32) { u0 = u1 = u0 + 0.5f * CELL_W / ATLAS_W; v0 = v1 = v0 + 0.5f * CELL_H / ATLAS_H; }   /* solid: its middle */
+    else { u0 += 0.5f / ATLAS_W; u1 -= 0.5f / ATLAS_W; v0 += 0.5f / ATLAS_H; v1 -= 0.5f / ATLAS_H; }   /* a letter: half a texel in, so the linear filter never reads the next cell (a 'g' above a 'w', ...) */
     Vertex a = {x, y, u0, v0, color}, b = {x + w, y, u1, v0, color}, c = {x, y + h, u0, v1, color}, d = {x + w, y + h, u1, v1, color};
     Vertex *o = &verts[nverts];
     o[0] = a; o[1] = b; o[2] = c; o[3] = c; o[4] = b; o[5] = d;
@@ -167,14 +188,15 @@ static void rect(float x, float y, float w, float h, unsigned color) { quad(x, y
 /* Text at (x, y), letters size high, one line per '\n'; returns the y below it. */
 static float text_sized(float x, float y, float size, unsigned color, const char *s) {
     float cx = x, w = size / 2, shadow = size >= 32 ? 2.0f : 1.0f;
-    for (; *s; s++) {
-        if (*s == '\n') { cx = x; y += size; continue; }
-        int c = (unsigned char)*s;
-        if (c > 32 && c < 127) {
-            quad(cx + shadow, y + shadow, w, size, c - 32, RGBA(0, 0, 0, 200));   /* shadow */
-            quad(cx, y, w, size, c - 32, color);
+    while (*s) {
+        unsigned c = ui_utf8_next(&s);
+        if (c == '\n') { cx = x; y += size; continue; }
+        int columns = ui_columns(c), cell = ui_font_cell(c);
+        if (c > 32 && columns) {
+            quad(cx + shadow, y + shadow, w * columns, size, cell, RGBA(0, 0, 0, 200));
+            quad(cx, y, w * columns, size, cell, color);
         }
-        cx += w;
+        cx += w * columns;
     }
     return y + size;
 }
@@ -189,6 +211,35 @@ static int lines_of(const char *s, int *widest) {
     for (; *s; s++) { if (*s == '\n') { n++; cur = 0; } else if (++cur > w) w = cur; }
     *widest = w;
     return n;
+}
+
+/* A message in the middle of the picture (the start-up shader preparation): text and a bar. */
+static char message[160];
+static float message_progress = -1;
+void overlay_message(const char *text, float progress) {
+    if (!text || !*text) { message[0] = 0; message_progress = -1; return; }
+    snprintf(message, sizeof message, "%s", text);
+    message_progress = progress;
+}
+
+static void message_draw(float w, float h) {
+    if (!message[0]) return;
+    int widest = 0, lines = lines_of(message, &widest);
+    float size = 30, tw = widest * size / 2;
+    float bw = tw + 64;
+    if (bw < 520) bw = 520;
+    if (bw > w - 40) bw = w - 40;
+    float bh = 20 + lines * size + (message_progress >= 0 ? 34 : 0);
+    float x = (w - bw) / 2, y = (h - bh) / 2;
+    rect(x, y, bw, bh, RGBA(0, 0, 0, 210));
+    rect(x, y, bw, 2, RGBA(120, 200, 255, 255));
+    float ty = text_sized(x + 24, y + 20, size, RGBA(240, 240, 240, 255), message);
+    if (message_progress >= 0) {
+        float p = message_progress < 0 ? 0 : message_progress > 1 ? 1 : message_progress;
+        float bx = x + 24, by = ty + 8, bw2 = bw - 48, bh2 = 16;
+        rect(bx, by, bw2, bh2, RGBA(40, 40, 40, 255));
+        rect(bx, by, bw2 * p, bh2, RGBA(90, 200, 120, 255));
+    }
 }
 
 /* ---- the frame ---------------------------------------------------------------------- */
@@ -244,14 +295,15 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
         if (filled < HISTORY) filled++;
     }
     last = now;
-    int menu = menu_visible(), ping = !menu && badge_wanted();
-    if (!show && !menu && !ping) return;
+    int menu = menu_visible(), ping = !menu && badge_wanted(), msg = message[0] != 0;
+    if (!show && !menu && !ping && !msg) return;
     if (!state) state = init(dev) ? 1 : -1;
     if (state < 0) return;
     nverts = 0;
     if (show && !menu_blocks_input()) hud(detail);   /* (an open menu instead of the overlay) */
     if (ping) badge((float)w);
     if (menu) menu_draw((float)w, (float)h);
+    if (msg) message_draw((float)w, (float)h);
     draw(ctx, rtv, x0, y0, w, h);
 }
 
@@ -269,13 +321,14 @@ unsigned overlay_quads(unsigned w, unsigned h, int show, const char *detail, con
         if (filled < HISTORY) filled++;
     }
     last = now;
-    int menu = menu_visible(), ping = !menu && badge_wanted();
+    int menu = menu_visible(), ping = !menu && badge_wanted(), msg = message[0] != 0;
     *verts = (const OverlayVertex *)verts_out();
-    if (!show && !menu && !ping) return 0;
+    if (!show && !menu && !ping && !msg) return 0;
     nverts = 0;
     if (show && !menu_blocks_input()) hud(detail);
     if (ping) badge((float)w);
     if (menu) menu_draw((float)w, (float)h);
+    if (msg) message_draw((float)w, (float)h);
     return nverts;
 }
 

@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
+using System.Text.Json;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,7 +16,7 @@ namespace OpenSmash.Launcher
     // ProjectSetup: what OpenSmash.exe needs when it runs on its own (the release
     // download) instead of from a copy of the project. It finds the project folder
     // (the exe's own, or the one remembered from the first start) and gets a new
-    // one: GitHub's ZIP of main, the download the Update button's installer step
+    // one: GitHub's ZIP of the latest release (main while there is none), as the Update button's installer step
     // makes (tools\install_windowsmash.ps1, Update-FromZip), checked the same way,
     // unpacked into an empty folder. Its download is the one the mod browser uses.
     // ============================================================================
@@ -22,6 +24,94 @@ namespace OpenSmash.Launcher
     {
         public const string Repo = "OpenSmash-Ultimate/OpenSmash-Ultimate";
         public const string MainZipUrl = "https://codeload.github.com/" + Repo + "/zip/refs/heads/main";
+
+        // The ZIP a new folder is made from: the latest release's (what Update follows on the release channel), or
+        // main's while there is none or when OPENSMASH_UPDATE_CHANNEL=main asks for it. Before this, a new player got
+        // main, newer than the release, and Update then had nothing to offer until the next release.
+        public static string ReleaseZipUrl(string tag) => "https://codeload.github.com/" + Repo + "/zip/refs/tags/" + Uri.EscapeDataString(tag);
+
+        public static async Task<string> ProjectZipUrlAsync(CancellationToken ct = default)
+        {
+            if (string.Equals(Environment.GetEnvironmentVariable("OPENSMASH_UPDATE_CHANNEL"), "main", StringComparison.OrdinalIgnoreCase)) return MainZipUrl;
+            // (v0.5.0) the stable channel's release first: its manifest names the commit whose archive this is
+            // (tools/source_version.txt in it), the one Update compares with (OpenSmash.Core.Releases)
+            try
+            {
+                using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                limit.CancelAfter(TimeSpan.FromSeconds(20));
+                var r = await OpenSmash.Core.Releases.LatestAsync("stable", limit.Token);
+                if (r != null && !string.IsNullOrEmpty(r.SourceZipUrl)) return r.SourceZipUrl;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { }
+            string? tag = (await LatestReleaseAsync(null, ct)).Tag;   // (none, or GitHub not reachable: main, whose download then says what is wrong)
+            return tag == null ? MainZipUrl : ReleaseZipUrl(tag);
+        }
+
+        // The latest release's tag, or null when there is none. The API first; when it does not answer (no network
+        // to it, its hourly limit), github.com's own releases/latest page, which redirects to the release's tag.
+        // What GitHub says the latest release is. Three answers, not two: its tag; no release at all (the API's 404, or the
+        // releases/latest page landing on the release list), the only answer that means "follow main"; or unknown (no
+        // network, the API's hourly limit and the page not answering either), which must never be read as main: a copy of
+        // the release compared with main was told its finished update "did not finish" (Discord, 2026-11-18).
+        public readonly record struct LatestRelease(string? Tag, bool NoRelease, string Problem)
+        {
+            public bool Known => Tag != null || NoRelease;
+        }
+
+        public static async Task<LatestRelease> LatestReleaseAsync(HttpClient? client = null, CancellationToken outer = default)
+        {
+            client ??= DownloadClient;
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(outer);
+            limit.CancelAfter(TimeSpan.FromSeconds(20));   // (the download client waits up to 30 minutes: not for this)
+            var ct = limit.Token;
+            string problem = "";
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/repos/" + Repo + "/releases/latest");
+                request.Headers.Add("User-Agent", "OpenSmash-Launcher/1.0");
+                request.Headers.Accept.ParseAdd("application/vnd.github+json");
+                using var response = await client.SendAsync(request, ct);
+                if (response.StatusCode == HttpStatusCode.NotFound) return new LatestRelease(null, true, "");   // no release yet
+                if (response.IsSuccessStatusCode)
+                {
+                    using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+                    if (doc.RootElement.TryGetProperty("tag_name", out var t) && t.GetString() is string tag && tag.Trim().Length > 0)
+                        return new LatestRelease(tag.Trim(), false, "");
+                    problem = "GitHub's answer names no release";
+                }
+                else problem = "GitHub answered " + (int)response.StatusCode + " (" + response.ReasonPhrase + ")";
+            }
+            catch (OperationCanceledException) when (outer.IsCancellationRequested) { throw; }
+            catch (Exception ex) { problem = ex is OperationCanceledException ? "GitHub did not answer in time" : ex.Message; }
+            try
+            {
+                // (github.com's own page, outside the API's limit: it redirects to the release's tag)
+                using var request = new HttpRequestMessage(HttpMethod.Head, "https://github.com/" + Repo + "/releases/latest");
+                request.Headers.Add("User-Agent", "OpenSmash-Launcher/1.0");
+                using var response = await client.SendAsync(request, ct);
+                if (response.IsSuccessStatusCode)
+                {
+                    string path = response.RequestMessage?.RequestUri?.AbsolutePath ?? "";
+                    if (ReleaseTagFromPath(path) is string tag) return new LatestRelease(tag, false, "");
+                    if (path.TrimEnd('/').EndsWith("/" + Repo + "/releases", StringComparison.OrdinalIgnoreCase))
+                        return new LatestRelease(null, true, "");   // (no release: GitHub shows the empty list instead)
+                }
+            }
+            catch (OperationCanceledException) when (outer.IsCancellationRequested) { throw; }
+            catch { }
+            return new LatestRelease(null, false, problem.Length > 0 ? problem : "GitHub could not be reached");
+        }
+
+        // The tag of a github.com/<repo>/releases/tag/<tag> address, or null.
+        internal static string? ReleaseTagFromPath(string path)
+        {
+            const string marker = "/releases/tag/";
+            int at = path.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (at < 0 || path.Length <= at + marker.Length) return null;
+            string tag = Uri.UnescapeDataString(path[(at + marker.Length)..]).Trim('/').Trim();
+            return tag.Length > 0 ? tag : null;
+        }
         const string WorkName = ".opensmash-download";   // inside the chosen folder while it is filled; removed after
 
         // Downloads can be hundreds of megabytes, so they get their own client with a
@@ -168,7 +258,7 @@ namespace OpenSmash.Launcher
                 string zip = source;
                 if (!File.Exists(source))
                 {
-                    zip = Path.Combine(work, "OpenSmash-Ultimate-main.zip");
+                    zip = Path.Combine(work, "OpenSmash-Ultimate.zip");
                     string partial = zip + ".partial";
                     await DownloadAsync(source, partial, (got, total) => { onProgress("download", got, total); return Task.CompletedTask; }, ct);
                     File.Move(partial, zip);
@@ -243,17 +333,16 @@ namespace OpenSmash.Launcher
         }
 
         // ---------------------------------------------------------------------------
-        // Shortcuts: OpenSmash (the launcher, with its own icon) and Play SSBU (OpenSmash.exe --play: the game
-        // straight away, or the installer while it is not built; WindowSmash's icon, the game window's).
-        // Into the desktop and a Start menu folder named OpenSmash, each left out when its folder is "". Returns the files.
+        // Shortcuts, both with OpenSmash's icon: OpenSmash-Launcher (the launcher) and OpenSmash-Ultimate
+        // (OpenSmash.exe --play: the game straight away, or the installer while it is not built). Into the desktop
+        // and a Start menu folder named OpenSmash, each left out when its folder is "". An older installer's
+        // OpenSmash / Play SSBU shortcuts there that point at this folder's OpenSmash.exe are removed (Play SSBU
+        // had WindowSmash's icon). Returns the files made.
         public static List<string> MakeShortcuts(string folder, string desktop, string startMenu)
         {
             folder = Path.GetFullPath(folder).TrimEnd('\\');
             string launcher = Path.Combine(folder, "OpenSmash.exe");
-            string gameIcon = Path.Combine(folder, "docs", "assets", "windowsmash.ico");
             string appIcon = File.Exists(launcher) ? launcher + ",0" : Path.Combine(folder, "media", "opensmash.ico");
-            if (!File.Exists(gameIcon)) gameIcon = appIcon;
-            else gameIcon += ",0";
             var made = new List<string>();
             var places = new List<string>();
             if (desktop != "") places.Add(desktop);
@@ -263,10 +352,24 @@ namespace OpenSmash.Launcher
             foreach (string dir in places)
             {
                 Directory.CreateDirectory(dir);
-                foreach (var (name, args, icon, what) in new[]
+                foreach (string oldName in new[] { "Play SSBU.lnk", "OpenSmash.lnk" })
                 {
-                    ("OpenSmash.lnk", "", appIcon, "OpenSmash: play, settings and mods"),
-                    ("Play SSBU.lnk", "--play", gameIcon, "Super Smash Bros. Ultimate (OpenSmash)"),
+                    string old = Path.Combine(dir, oldName);
+                    try
+                    {
+                        if (File.Exists(old))
+                        {
+                            dynamic o = shell.CreateShortcut(old);
+                            if (string.Equals(Path.GetFullPath((string)o.TargetPath), launcher, StringComparison.OrdinalIgnoreCase))
+                                File.Delete(old);
+                        }
+                    }
+                    catch { }
+                }
+                foreach (var (name, args, what) in new[]
+                {
+                    ("OpenSmash-Launcher.lnk", "", "OpenSmash launcher: play, settings and mods"),
+                    ("OpenSmash-Ultimate.lnk", "--play", "Super Smash Bros. Ultimate (OpenSmash), without the launcher"),
                 })
                 {
                     string lnk = Path.Combine(dir, name);
@@ -274,7 +377,7 @@ namespace OpenSmash.Launcher
                     s.TargetPath = launcher;
                     s.Arguments = args;
                     s.WorkingDirectory = folder;
-                    s.IconLocation = icon;
+                    s.IconLocation = appIcon;
                     s.Description = what;
                     s.Save();
                     made.Add(lnk);
@@ -288,12 +391,14 @@ namespace OpenSmash.Launcher
 
         // ---------------------------------------------------------------------------
         // OpenSmash.exe --fetch-project <folder> [--from <zip or url>]: InstallAsync without a window, for tests.
+        // Without --from it downloads what the first start does (ProjectZipUrlAsync) and says which first ("from <url>").
         // Prints "ok <folder>" (exit 0), "refused <why>" (exit 2) or "error <why>" (exit 1).
         // OpenSmash.exe --find-project: prints the folder Program would use, or nothing.
+        // OpenSmash.exe --launcher-fingerprint <folder>: "fingerprint <hex>", or "none" without a launcher project.
         // OpenSmash.exe --make-shortcuts <folder> --desktop <dir> [--start-menu <dir>]: prints each shortcut made.
         public static bool IsHeadless(string[] args) =>
             args.Any(a => a.Equals("--fetch-project", StringComparison.OrdinalIgnoreCase) || a.Equals("--find-project", StringComparison.OrdinalIgnoreCase)
-                       || a.Equals("--make-shortcuts", StringComparison.OrdinalIgnoreCase));
+                       || a.Equals("--make-shortcuts", StringComparison.OrdinalIgnoreCase) || a.Equals("--launcher-fingerprint", StringComparison.OrdinalIgnoreCase));
 
         public static int RunHeadless(string[] args)
         {
@@ -306,6 +411,13 @@ namespace OpenSmash.Launcher
             {
                 Console.Out.WriteLine(FindProject(AppContext.BaseDirectory) ?? "");
                 return 0;
+            }
+            if (After(args, "--launcher-fingerprint") is string fpFolder)
+            {
+                // what Update compares before and after (LauncherForm.LauncherBuildInputsFingerprint): "none" for a folder
+                // without the launcher's project, such as a WindowSmash copy
+                try { string fp = LauncherForm.LauncherBuildInputsFingerprint(fpFolder); Console.Out.WriteLine(fp.Length == 0 ? "none" : "fingerprint " + fp); return 0; }
+                catch (Exception ex) { Console.Out.WriteLine("error " + ex.Message); return 1; }
             }
             if (After(args, "--make-shortcuts") is string target)
             {
@@ -325,7 +437,9 @@ namespace OpenSmash.Launcher
             try
             {
                 string last = "";
-                InstallAsync(folder, After(args, "--from") ?? MainZipUrl, (phase, done, total) =>
+                string source = After(args, "--from") ?? ProjectZipUrlAsync().GetAwaiter().GetResult();
+                if (!File.Exists(source)) Console.Out.WriteLine("from " + source);
+                InstallAsync(folder, source, (phase, done, total) =>
                 {
                     string line = phase + (total > 0 ? $" {done * 100 / total}%" : $" {done / 1048576} MB");
                     if (line != last) { last = line; Console.Out.WriteLine(line); }

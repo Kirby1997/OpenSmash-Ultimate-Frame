@@ -10,6 +10,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include "ipc.h"
 #include "present.h"
@@ -80,15 +81,48 @@ static u32 shown_size;
 static u64 shown_mark;
 static int speed_mode, report_draws;   /* SSBU_SPEED (not 1), SSBU_SEQ: decided at start */
 
+/* SSBU_LAT_TRACE=<file> (tests: tools/latency_trace.py): the times, in ms, of each refresh signalled to
+ * the game ("R"), each frame it queues ("Q"), each frame shown ("S <ms before the present> <ms after>
+ * <frames shown> <fight frame>") and each change of player 1's buttons as the game reads them ("P <ms>
+ * <frames shown> <fight frame> <buttons>"): with SSBU_PRESENT_HASH of the same run and of one without
+ * the press, the delay from a press to the first picture that shows it. */
+extern volatile long long test_fight_frame;
+static FILE *lat_tf;
+static SRWLOCK lat_lock = SRWLOCK_INIT;
+static double lat_ms(void) { LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f); return (double)t.QuadPart * 1000.0 / (double)f.QuadPart; }
+static void lat_open(void) {
+    const char *t = getenv("SSBU_LAT_TRACE");
+    if (t && *t && !(lat_tf = fopen(t, "w"))) fprintf(stderr, "[latency] SSBU_LAT_TRACE: cannot write %s\n", t);
+}
+static void lat_line(const char *fmt, ...) {
+    if (!lat_tf) return;
+    va_list a;
+    va_start(a, fmt);
+    AcquireSRWLockExclusive(&lat_lock);
+    vfprintf(lat_tf, fmt, a);
+    ReleaseSRWLockExclusive(&lat_lock);
+    va_end(a);
+}
+/* (hle_hid.c: player 1's buttons as the game reads them) */
+void vi_lat_poll(u64 buttons) {
+    static u64 last = ~0ull;
+    if (!lat_tf || buttons == last) return;
+    last = buttons;
+    lat_line("P %.3f %llu %lld %llx\n", lat_ms(), (unsigned long long)queue.frames, test_fight_frame, (unsigned long long)buttons);
+}
+
 /* Under the queue's lock: the oldest queued buffer becomes the one shown (copied to `shown`) and
  * the one shown before is free again. Returns its slot, or -1 if none is queued. */
+static int vi_reacq = -1;   /* (rollback: the slot on screen when a catch-up's load freed it - vi_rb_load) */
 static int take_oldest(void) {
     int oldest = -1;
     for (int i = 0; i < SLOTS; i++)
         if (queue.slots[i].state == QUEUED && (oldest < 0 || queue.slots[i].queued_at < queue.slots[oldest].queued_at)) oldest = i;
     if (oldest >= 0) {
+        vi_reacq = -1;   /* (another picture is on screen now) */
         for (int i = 0; i < SLOTS; i++) if (queue.slots[i].state == ACQUIRED) queue.slots[i].state = FREE;
         queue.slots[oldest].state = ACQUIRED;
+        WakeAllConditionVariable(&queue.freed);   /* (a buffer came free: DEQUEUE_BUFFER's wait, SSBU_VI_DEQUEUE_WAIT_MS) */
         if (queue.slots[oldest].keep) { queue.slots[oldest].keep = 0; keep_pending = 0; }
         queue.frames++;
         shown_size = queue.slots[oldest].buffer_size;
@@ -108,8 +142,11 @@ static void show(void) {
     QueryPerformanceCounter(&w1);
     show_waited = w1.QuadPart - w0.QuadPart;
     if (report_draws) input_seq_presented(gpu_queue_draws(shown_mark));
+    double p0 = lat_tf ? lat_ms() : 0;
     present_frame(shown, shown_size);
     test_fight_presented();
+    { void perf_frame_shown(void); perf_frame_shown(); }   /* (debug_perf_session.c: the session's summary) */
+    if (lat_tf) lat_line("S %.3f %.3f %llu %lld\n", p0, lat_ms(), (unsigned long long)queue.frames, test_fight_frame);
     kernel_signal_event(queue.buffer_event);
     WakeAllConditionVariable(&queue.freed);
 }
@@ -202,6 +239,9 @@ static LONG64 ll_delay(void) {   /* ticks to hold the signal past the refresh */
         if (display_low_latency()) fprintf(stderr, "[display] low_latency: the game starts each frame as late as it can (margin %.1f ms)\n", (double)ll_margin * 1000 / ll_freq);
     }
     if (!display_low_latency() || speed_mode || ll_count < 16) return 0;
+    /* (vrr: the present IS the refresh, so a start moved by a varying amount - which is what this delay is - shows as a
+     * varying refresh interval. Frames start at the refresh instead, evenly spaced, which is what the display needs.) */
+    if (display_pacing_vrr()) return 0;
     if (ll_backoff > 0) { ll_backoff--; return 0; }
     LONG64 most = 0;
     for (int i = 0; i < ll_count; i++) if (ll_spans[i] > most) most = ll_spans[i];
@@ -263,6 +303,7 @@ static DWORD WINAPI vsync_thread(LPVOID unused) {
         queue_lock();
         ll_release = fast ? 0 : qpc_now();
         queue_unlock();
+        if (lat_tf && !fast) lat_line("R %.3f\n", lat_ms());
         kernel_signal_event(queue.vsync_event);
     }
 }
@@ -277,6 +318,7 @@ static void start(void) {
     double speed = display_speed();
     speed_mode = speed != 1;
     report_draws = input_seq_on();
+    lat_open();
     if (speed_mode) fprintf(stderr, "[display] SSBU_SPEED=%g: one refresh per frame shown and none without one, %s\n", speed, speed > 0 ? "paced at n x 60 a second" : "uncapped");
     CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
 }
@@ -297,6 +339,19 @@ void *vi_rb_save(void) {
 void vi_rb_load(const void *p) {
     const ViSlot *s = p;
     queue_lock();
+    /* (round 6) The slot on screen now. The catch-up needs every slot free, to give its frames the slots of their first
+     * pass (rb_dequeue_pick), so the one on screen is let go below with the queued ones. But it stayed free after the
+     * catch-up: the first real frame after a rollback found a buffer at once, did not wait for the display, and the
+     * frame after it ran straight on in the same refresh (its save too): a rollback's frame and the next one back to
+     * back, 28-31 ms of work with no wait in between, where the first pass had a wait. Now the first DequeueBuffer after
+     * the catch-up takes that slot as on screen again, if no picture was shown meanwhile and it is still free: the queue
+     * is then as on the first pass (one in the game's hands, the catch-up's last picture queued, one on screen), and the
+     * game waits for the refresh as in any frame. SSBU_RB_VI_REACQ=0: as before. */
+    static int reacq_on = -1;
+    if (reacq_on < 0) { const char *e = getenv("SSBU_RB_VI_REACQ"); reacq_on = e && *e ? atoi(e) : 1; }   /* (on by default since v0.5.0, round 7) */
+    int on_screen = -1;
+    for (int i = 0; i < SLOTS; i++) if (queue.slots[i].state == ACQUIRED) on_screen = i;
+    vi_reacq = reacq_on && rb_vi_catchup() ? on_screen : -1;
     for (int i = 0; i < SLOTS; i++) { queue.slots[i].state = s[i].state; queue.slots[i].queued_at = s[i].queued_at; queue.slots[i].gpu_mark = s[i].gpu_mark; queue.slots[i].keep = 0; }
     keep_pending = 0;
     /* (a rollback's load: the frames the save had queued, and the one shown, were shown on the first pass. Let
@@ -375,9 +430,35 @@ static void transact(u32 code, In *in, Out *out, Cpu *c) {
     case DEQUEUE_BUFFER: {   /* never blocks: "would block" sends the client back to the event */
         int slot = -1;
         u64 freemask = 0;
+        if (vi_reacq >= 0 && rb_fast <= 0) {   /* (the first real frame after a catch-up: see vi_rb_load) */
+            if (queue.slots[vi_reacq].has_buffer && queue.slots[vi_reacq].state == FREE) queue.slots[vi_reacq].state = ACQUIRED;
+            vi_reacq = -1;
+        }
         for (int i = 0; i < SLOTS; i++)
             if (queue.slots[i].has_buffer && queue.slots[i].state == FREE) { freemask |= 1ull << i; if (slot < 0) slot = i; }
+        /* (round 4, SSBU_VI_DEQUEUE_WAIT_MS=<ms>, off unless set: with no free buffer the answer was "would block" at
+         * once, and the buffer event stays signalled, so the game's main thread asked again some 3200 times a frame -
+         * 8-9 ms of every frame at full speed on one core, measured by the rollback bench. With a wait, the call sleeps
+         * here until a buffer comes free, at most that long, and only then says "would block": the same buffer at the
+         * same moment, the core left to the workers and the GPU's threads meanwhile.) */
+        static int wait_ms = -1;
+        if (wait_ms < 0) { const char *e = getenv("SSBU_VI_DEQUEUE_WAIT_MS"); wait_ms = e && atoi(e) > 0 ? atoi(e) : 0; if (wait_ms > 20) wait_ms = 20; }
+        if (slot < 0 && wait_ms > 0) {
+            extern void (*kernel_pace_hook)(int phase);
+            if (kernel_pace_hook) kernel_pace_hook(2);   /* (the bench: the wait for the display begins here) */
+            SleepConditionVariableSRW(&queue.freed, &queue.lock, (DWORD)wait_ms, 0);
+            for (int i = 0; i < SLOTS; i++)
+                if (queue.slots[i].has_buffer && queue.slots[i].state == FREE) { freemask |= 1ull << i; if (slot < 0) slot = i; }
+        }
         if (slot >= 0) slot = rb_dequeue_pick(freemask, slot);   /* (a catch-up's frame: its first pass's slot) */
+        {   /* (the rollback bench: the game waits for a buffer from the first "would block" to the next buffer handed out) */
+            extern void (*kernel_pace_hook)(int phase);
+            if (kernel_pace_hook) kernel_pace_hook(slot < 0 ? 2 : 3);
+        }
+#ifdef _WIN32
+        {   extern volatile LONG rb_vi_point; extern volatile LONG rb_fast;   /* (hle_rb_core.c rb_wait_point, called once this request is answered) */
+            if (rb_fast <= 0) rb_vi_point = slot < 0 ? 2 : 1; }
+#endif
         if (slot < 0) {
             w32(out, 0xFFFFFFFF);
             w32(out, 0);
@@ -399,6 +480,7 @@ static void transact(u32 code, In *in, Out *out, Cpu *c) {
             queue.slots[slot].state = QUEUED;
             queue.slots[slot].queued_at = rt_now_ns();
             ll_queued();
+            if (lat_tf && rb_fast <= 0) lat_line("Q %.3f\n", lat_ms());
             queue.slots[slot].gpu_mark = gpu_queue_mark();
             /* (rollback build, M4: a frame of a catch-up is not shown. Freed here and the game told at
              * once - buffer free, a refresh - rather than through the vsync thread: the game's frame end

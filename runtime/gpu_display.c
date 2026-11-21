@@ -40,8 +40,12 @@
 #include "display.h"
 #include "host.h"
 #include "testrun.h"
+#include <wchar.h>
 #ifndef __APPLE__
 #include <dxgi.h>
+#endif
+#ifdef _WIN32
+#include "gpu_display_loading.inc"   /* (the loading animation until the game's first present, Windows) */
 #endif
 
 enum { MODE_WINDOWED = DISPLAY_WINDOWED, MODE_BORDERLESS = DISPLAY_BORDERLESS, MODE_FULLSCREEN = DISPLAY_FULLSCREEN };
@@ -54,7 +58,11 @@ static struct {
     float render_scale;   /* 0: auto */
     double speed;         /* SSBU_SPEED (test runs): 1 normal */
     int renderer;         /* RENDERER_* (renderer.h) */
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, 1.0, RENDERER_DEFAULT};
+    char aspect[16];      /* the picture shape: "16:9", "auto" or "W:H" (docs/ULTRAWIDE-CONTEXT.md) */
+    int view;             /* VIEW_* (display.h) */
+    int uw_online;        /* experimental_ultrawide_online: the picture shape kept in online matches (read at the start) */
+    int timer;            /* TIMER_* (display.h): where a fight's timer is drawn */
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, 1.0, RENDERER_DEFAULT, "16:9", VIEW_HYBRID, 0, TIMER_RIGHT};
 
 static int cfg_runahead;   /* display.ini's runahead (display_runahead) */
 
@@ -116,22 +124,20 @@ static const char DEFAULT_INI[] =
 #endif
     "pacing = clock\n"
     "; latency = 1-3: how many frames the graphics card may work ahead. Lower is more responsive.\n"
+    ";   (the Vulkan renderer keeps 2 at least: with 1 the processor and the card wait for each other every frame)\n"
     "latency = 3\n"
     "; low_latency = 1: the game starts each frame later, as late as it can and still be ready for the next\n"
     ";   refresh, so it reads the controller later: up to most of a frame less input delay. 0: at the refresh.\n"
     "low_latency = 1\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
     "hide_cursor = 1\n"
-#ifdef _WIN32
-    "; runahead = 0-3: in fights, show each frame this many frames ahead (less input delay; the settings menu's\n"
-    ";   Display page: off, 1, 2). 1 shows the real frame one frame sooner, 2 also predicts one frame on the\n"
-    ";   controls held now. Each frame ahead costs a frame of the game's work more per frame shown, and a savestate.\n"
-    "runahead = 0\n"
-#endif
     "; overlay = 1: show the frame rate in the corner from the start (F1 shows or hides it while playing).\n"
     "overlay = 1\n"
     "; volume = 0-100: the game's whole sound, over its own sound settings (0 is silent). The settings menu changes it while playing.\n"
     "volume = 100\n"
+    "; ui_language: auto follows the system UI language; en and zh-CN are supplied (locales/ adds more).\n"
+    ";   Shared by the launcher and external menu; independent of the game's language. SSBU_UI_LANGUAGE overrides it.\n"
+    "ui_language = auto\n"
     "; overlay_scale = 0.25-2: the overlay's size (0.5: half as big, out of the way of the game).\n"
     "overlay_scale = 1\n"
     "\n"
@@ -147,6 +153,20 @@ static const char DEFAULT_INI[] =
     ";   monitor with window = borderless), at least 1. A bigger picture than the window is shrunk to fit.\n"
 #endif
     "render_scale = 1\n"
+    "\n"
+    "; aspect = 16:9 | auto | 21:9 | 32:9 (or any width:height up to 32:9)\n"
+    ";   The picture's shape. 16:9 is the game as it was made. A wider shape shows more at the sides\n"
+    ";   without stretching anything, and fights play exactly as at 16:9. 21:9 and 32:9 match the\n"
+    ";   monitor when it is close to that shape; auto is the monitor's. Online matches are at 16:9.\n"
+    "aspect = 16:9\n"
+    "; view = wide | zoomed | hybrid (with a picture wider than 16:9)\n"
+    ";   wide:   the 16:9 view with the sides added at the same zoom (it can show past the stage).\n"
+    ";   zoomed: the game frames the fight for the wider picture: closer, kept on the stage.\n"
+    ";   hybrid: wide, but zoomed in just enough to keep the picture on the stage.\n"
+    "view = hybrid\n"
+    "; timer = right | center | left | hidden\n"
+    ";   Where a fight's timer is drawn: right is the game's own place, at the picture's top-right corner.\n"
+    "timer = right\n"
 #ifdef _WIN32
     "\n"
     "; gpu = auto, or part of a graphics card's name (e.g. nvidia, radeon, intel)\n"
@@ -157,14 +177,17 @@ static const char DEFAULT_INI[] =
 #ifndef __APPLE__
     "\n"
 #ifdef _WIN32
-    "; renderer = d3d11 | vulkan\n"
-    ";   d3d11:  Direct3D 11, the renderer the game is played and tested with.\n"
+    "; renderer = auto | direct3d11 | vulkan\n"
+    ";   auto:       Vulkan on an AMD, NVIDIA or Intel graphics card, Direct3D 11 on any other (and whenever Vulkan cannot\n"
+    ";               start, or stopped the game in its first seconds twice in a row).\n"
+    ";   direct3d11: Direct3D 11 on any card.\n"
+    ";   vulkan:     Vulkan on any card (Direct3D 11 if it cannot start; the log says why).\n"
 #else
     "; renderer = dxvk | vulkan\n"
     ";   dxvk:   Direct3D 11 through DXVK, the renderer the game is played and tested with.\n"
-#endif
     ";   vulkan: the Vulkan renderer, in development. Until it can draw the game, the game checks Vulkan\n"
     ";           on this PC at its start, says what it found in its log, and draws as before.\n"
+#endif
     "renderer = " RENDERER_DEFAULT_NAME "\n"
 #endif
     ;
@@ -192,10 +215,31 @@ static void parse_render_scale(const char *v) {
     else { fprintf(stderr, "[display] render_scale is auto or a number from 0.5 to 4, not '%s': 1 it is\n", v); cfg.render_scale = 1; }
 }
 
+/* view = wide | zoomed | hybrid */
+static void parse_view(const char *v, const char *where) {
+    if (!_stricmp(v, "wide")) cfg.view = VIEW_WIDE;
+    else if (!_stricmp(v, "zoomed")) cfg.view = VIEW_ZOOMED;
+    else if (!_stricmp(v, "hybrid")) cfg.view = VIEW_HYBRID;
+    else fprintf(stderr, "[display] %s: view is wide, zoomed or hybrid, not '%s': hybrid it is\n", where, v);
+}
+
+/* timer = right | center | left | hidden */
+static void parse_timer(const char *v, const char *where) {
+    if (!_stricmp(v, "right")) cfg.timer = TIMER_RIGHT;
+    else if (!_stricmp(v, "center")) cfg.timer = TIMER_CENTER;
+    else if (!_stricmp(v, "left")) cfg.timer = TIMER_LEFT;
+    else if (!_stricmp(v, "hidden")) cfg.timer = TIMER_HIDDEN;
+    else fprintf(stderr, "[display] %s: timer is right, center, left or hidden, not '%s': right it is\n", where, v);
+}
+
 /* renderer = d3d11 | dxvk | metal (the system's own: renderer.h) | vulkan */
 static void parse_renderer(const char *v, const char *where) {
     int r = renderer_parse(v);
+#ifdef _WIN32
+    if (r < 0) fprintf(stderr, "[display] %s: renderer is auto, direct3d11 or vulkan, not '%s': auto it is\n", where, v);
+#else
     if (r < 0) fprintf(stderr, "[display] %s: renderer is %s or vulkan, not '%s': %s it is\n", where, RENDERER_DEFAULT_NAME, v, RENDERER_DEFAULT_NAME);
+#endif
     cfg.renderer = r < 0 ? RENDERER_DEFAULT : r;
 }
 
@@ -230,7 +274,7 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         if (w) { fputs(DEFAULT_INI, w); fclose(w); fprintf(stderr, "[display] wrote the default %s\n", path); }
         f = fopen(path, "r");
     }
-    char line[256];
+    char line[256], renderer_line[64] = "", renderer_menu[64] = "";
     while (f && fgets(line, sizeof line, f)) {
         char *s = trim(line), *eq;
         if (*s == ';' || *s == '#' || *s == '[' || !(eq = strchr(s, '='))) continue;
@@ -243,17 +287,36 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "pacing")) parse_pacing(value);
         else if (!_stricmp(key, "latency")) cfg.latency = atoi(value);
         else if (!_stricmp(key, "low_latency")) cfg.low_latency = atoi(value) != 0;
-        else if (!_stricmp(key, "runahead")) cfg_runahead = atoi(value);
+        else if (!_stricmp(key, "runahead")) (void)value;   /* (ignored: run-ahead is off for everyone, issue #250; SSBU_RUNAHEAD only) */
         else if (!_stricmp(key, "hide_cursor")) cfg.hide_cursor = atoi(value) != 0;
         else if (!_stricmp(key, "overlay")) cfg.overlay = atoi(value) != 0;
         else if (!_stricmp(key, "overlay_scale")) parse_overlay_scale(value);
         else if (!_stricmp(key, "gpu")) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", value);
         else if (!_stricmp(key, "render_scale")) parse_render_scale(value);
-        else if (!_stricmp(key, "renderer")) parse_renderer(value, path);
+        else if (!_stricmp(key, "renderer")) { parse_renderer(value, path); snprintf(renderer_line, sizeof renderer_line, "%s", value); }
+        else if (!_stricmp(key, "renderer_menu")) snprintf(renderer_menu, sizeof renderer_menu, "%s", value);
+        else if (!_stricmp(key, "ui_language")) {}   /* (ui_locale.h reads it for the external menu) */
+        else if (!_stricmp(key, "aspect")) snprintf(cfg.aspect, sizeof cfg.aspect, "%s", value);
+        else if (!_stricmp(key, "view")) parse_view(value, path);
+        else if (!_stricmp(key, "timer")) parse_timer(value, path);
         else if (!_stricmp(key, "volume")) {}   /* (the master volume: ipc_audio.c's audio_master_volume reads it) */
+        else if (!_stricmp(key, "language")) {}   /* (the game's language: hle_env.c reads it) */
+        else if (!_stricmp(key, "experimental_ultrawide_online")) cfg.uw_online = atoi(value) != 0;
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
+#ifdef _WIN32
+    /* (#429) renderer = d3d11 is the old spelling, auto since #245 (renderer.h). The launcher of the v0.3.0 alphas still
+     * writes it at every Play for its "Direct3D 11 (default)", which also put the settings menu's choice back to auto -
+     * Vulkan on an AMD card - at the next start. renderer_menu is the menu's last choice, a key that launcher never
+     * writes: under that old spelling the menu's choice stands. Any other renderer value (auto, direct3d11, vulkan:
+     * the menu's, today's launcher's, a hand-written one) is taken as it is, and a d3d11 never touched stays auto. */
+    if (renderer_menu[0] && !_stricmp(renderer_line, "d3d11") && renderer_parse(renderer_menu) >= 0) {
+        cfg.renderer = renderer_parse(renderer_menu);
+        fprintf(stderr, "[display] %s: renderer = d3d11 (written by an older launcher) and renderer_menu = %s (the settings menu's choice): %s\n",
+                path, renderer_menu, renderer_name(cfg.renderer));
+    }
+#endif
     if ((env = getenv("SSBU_GPU")) && *env) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", env);
     if ((env = getenv("SSBU_WINDOW")) && *env) parse_window(env);
     if ((env = getenv("SSBU_PACING")) && *env) parse_pacing(env);
@@ -261,6 +324,9 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     if ((env = getenv("SSBU_WINDOW_SIZE")) && *env) sscanf(env, "%dx%d", &cfg.width, &cfg.height);
     if ((env = getenv("SSBU_RENDER_SCALE")) && *env) parse_render_scale(env);
     if ((env = getenv("SSBU_RENDERER")) && *env) parse_renderer(env, "SSBU_RENDERER");
+    if ((env = getenv("SSBU_ASPECT")) && *env) snprintf(cfg.aspect, sizeof cfg.aspect, "%s", env);
+    if ((env = getenv("SSBU_VIEW")) && *env) parse_view(env, "SSBU_VIEW");
+    if ((env = getenv("SSBU_TIMER")) && *env) parse_timer(env, "SSBU_TIMER");
     if (!speed_parse(env = getenv("SSBU_SPEED"), &cfg.speed))
         fprintf(stderr, "[display] SSBU_SPEED is a number of times 60 frames a second, up to %g (0: uncapped), not '%s': normal speed\n", SPEED_MAX, env);
     if (cfg.width < 320) cfg.width = 320;
@@ -290,14 +356,120 @@ Pacing display_pacing(void) { load(); return cfg.pacing; }
 const char *display_gpu(void) { load(); return cfg.gpu; }
 float display_render_scale(void) { load(); return cfg.render_scale; }
 int display_renderer(void) { load(); return cfg.renderer; }
+/* The picture shape (display.ini aspect, SSBU_ASPECT over it): "W:H", a number, or auto (the primary
+ * monitor's shape); 16:9 for anything not wider, at most 32:9 (the widest supported). 16:9 for online
+ * matches (display_aspect_take) and, for the whole session, on macOS (Metal not ported yet): display_shape_locked. */
+int game_fight_on(void);     /* (hle_fight_test.c) */
+static void window_follow_shape(void);   /* (the window section: a windowed window takes the new shape) */
+static volatile LONG size_pending;       /* (the menu's window size: the window's timer takes it, after an online fight) */
+static volatile LONG window_sizing;      /* (Windows: the window or its edge being dragged) */
+int display_window_sizing(void) { return window_sizing; }
+int net_match_now(void);     /* (host.c: a networked match set up or under way) */
+int display_shape_locked(void) {
+    static int locked = -1;
+    if (locked < 0) {
+        load();
+#ifdef __APPLE__
+        locked = 1;   /* (Direct3D 11 and Vulkan draw wider pictures, on Windows and Linux; Metal not yet) */
+#else
+        locked = 0;
+#endif
+        if (locked && _stricmp(cfg.aspect, "16:9"))
+            fprintf(stderr, "[display] picture shape 16:9 (aspect = %s set): not on macOS yet\n", cfg.aspect);
+    }
+    return locked;
+}
+/* The shape a setting names on a monitor of shape `monitor` (0: unknown). "21:9" is a name for several
+ * shapes (2560x1080 is 2.37, 3440x1440 2.39, true 21:9 2.33: docs/ULTRAWIDE-CONTEXT.md), so a shape in
+ * one of these ranges takes the monitor's own when that is in the same range: no bars in fullscreen. */
+static float shape_for(const char *e, float monitor) {
+    static const float RANGES[][2] = {{2.22f, 2.45f}, {3.38f, 3.73f}};   /* (the 21:9 class, the 32:9 class) */
+    float a = 0, w, h;
+    if (!_stricmp(e, "auto")) a = monitor;
+    else if (sscanf(e, "%f:%f", &w, &h) == 2 && h > 0) a = w / h;
+    else a = (float)atof(e);
+    for (int i = 0; i < 2; i++)
+        if (a >= RANGES[i][0] && a <= RANGES[i][1] && monitor >= RANGES[i][0] && monitor <= RANGES[i][1]) a = monitor;
+    if (a > 32.0f / 9) a = 32.0f / 9;
+    return a > 16.0f / 9 + 1e-3f ? a : 16.0f / 9;
+}
+static float shape_of(const char *e) {
+    float monitor = 0;
+#ifdef _WIN32
+    int mw = GetSystemMetrics(SM_CXSCREEN), mh = GetSystemMetrics(SM_CYSCREEN);   /* ponytail: the primary monitor's; the window's own if that matters */
+    if (mw > 0 && mh > 0) monitor = (float)mw / (float)mh;
+#elif defined(__linux__)
+    float rt_monitor_shape(void);   /* (linux/window.c: the window's monitor, 0 before SDL's video starts) */
+    monitor = rt_monitor_shape();
+#endif
+    return shape_for(e, monitor);
+}
+/* The shape drawn now, and the one asked for (the settings menu): the renderer takes it between two
+ * frames (display_aspect_take). Offline at once, in fights too (only the picture changes: the fight is
+ * the same, checked by replay); 16:9 for an online match, and around one never in its fight (a hitch). */
+static volatile float shape_now, shape_want;
+float display_aspect(void) {
+    if (shape_now == 0) {
+        load();
+        shape_want = display_shape_locked() ? 16.0f / 9 : shape_of(cfg.aspect);
+        shape_now = shape_want;
+        if (shape_now != 16.0f / 9) fprintf(stderr, "[display] picture shape %.4g (aspect = %s), view %s\n", shape_now, cfg.aspect,
+                                            cfg.view == VIEW_WIDE ? "wide" : cfg.view == VIEW_ZOOMED ? "zoomed" : "hybrid");
+    }
+    return shape_now;
+}
+int display_aspect_take(void) {
+    display_aspect();
+    /* SSBU_TEST_ASPECT_CYCLE=<s> (test): 16:9, 21:9 and 32:9 asked for in turn, every s seconds */
+    static double cycle = -1;
+    if (cycle < 0) { const char *e = getenv("SSBU_TEST_ASPECT_CYCLE"); cycle = e ? atof(e) : 0; }
+    if (cycle > 0 && !display_shape_locked()) {
+        static const float SHAPES[] = {16.0f / 9, 21.0f / 9, 32.0f / 9};
+        shape_want = SHAPES[(unsigned long long)((double)rt_now_ns() / (cycle * 1e9)) % 3];
+    }
+    static int for_online;   /* (the shape now is the one taken for an online match) */
+    int net = !display_shape_locked() && net_match_now(), online = net && !cfg.uw_online;
+    static int was_net;
+    if (net != was_net) {   /* (the shape and view of each online match, in the log: docs/adr/0002) */
+        was_net = net;
+        if (net) fprintf(stderr, "[display] online match: picture shape %.4g, view %s%s\n", online ? 16.0f / 9 : shape_want,
+                         cfg.view == VIEW_WIDE ? "wide" : cfg.view == VIEW_ZOOMED ? "zoomed" : "hybrid",
+                         cfg.uw_online ? " (experimental: ultrawide online)" : " (held at 16:9)");
+    }
+    float want = online ? 16.0f / 9 : shape_want;   /* (online matches: 16:9, owner 2026-11-11; unless the experimental unlock) */
+    if (want == shape_now || ((net || for_online) && game_fight_on())) return 0;   /* (an online fight: never a hitch in it) */
+    fprintf(stderr, "[display] picture shape now %.4g (was %.4g)%s%s\n", want, shape_now, online ? ", for an online match" : "",
+            game_fight_on() ? ", in a fight" : "");
+    shape_now = want;
+    for_online = net;
+    window_follow_shape();
+    return 1;
+}
+int display_view(void) { load(); return cfg.view; }
+const char *display_aspect_setting(void) { load(); return cfg.aspect; }
+/* The experimental unlock (settings' Experimental tab): this session's, and the one saved for the next start. */
+static int uw_online_saved = -1;
+int display_uw_online(void) { load(); return cfg.uw_online; }
+int display_uw_online_saved(void) { load(); return uw_online_saved < 0 ? cfg.uw_online : uw_online_saved; }
+void display_set_uw_online(int on) { uw_online_saved = on != 0; }
+void display_set_aspect(const char *text) {
+    display_aspect();
+    snprintf(cfg.aspect, sizeof cfg.aspect, "%s", text);
+    if (!display_shape_locked()) shape_want = shape_of(text);   /* (taken at the next frame: display_aspect_take) */
+}
+void display_set_view(int view) { load(); cfg.view = view; }   /* (at once: the views read it every frame) */
+int display_timer(void) { load(); return cfg.timer; }
+void display_set_timer(int timer) { load(); cfg.timer = timer; }   /* (at once: the HUD reads it every frame) */
 
 /* (the settings menu) the render scale it saved: shown from now on, the renderer's own counts
  * only at the next start */
 static float saved_render_scale;
 static int render_scale_saved;
-void display_set_render_scale(float scale) { saved_render_scale = scale; render_scale_saved = 1; }
+void display_set_render_scale(float scale) { load(); saved_render_scale = scale; render_scale_saved = 1; cfg.render_scale = scale; }
 static int saved_renderer = -1;   /* (the same for the renderer: -1 none saved) */
-void display_set_renderer(int renderer) { saved_renderer = renderer == RENDERER_VULKAN ? RENDERER_VULKAN : RENDERER_DEFAULT; }
+void display_set_renderer(int renderer) { saved_renderer = renderer == RENDERER_VULKAN || renderer == RENDERER_D3D11 ? renderer : RENDERER_DEFAULT; }
+static char saved_gpu[64];   /* (and the graphics card: the menu shows its choice at once, the card is picked at the next start) */
+void display_set_gpu(const char *gpu) { snprintf(saved_gpu, sizeof saved_gpu, "%s", gpu && *gpu ? gpu : "auto"); }
 int display_overlay(void) { load(); return cfg.overlay; }
 float display_overlay_scale(void) { load(); return overlay_scale; }
 
@@ -311,7 +483,7 @@ void display_note_mode(int mode) { shown_mode = mode; }
 void display_settings(DisplaySettings *out) {
     load();
     *out = (DisplaySettings){shown_mode >= 0 ? shown_mode : cfg.mode, cfg.width, cfg.height, cfg.latency, cfg.hide_cursor, cfg.overlay, cfg.pacing, "", render_scale_saved ? saved_render_scale : cfg.render_scale};
-    snprintf(out->gpu, sizeof out->gpu, "%s", cfg.gpu);
+    snprintf(out->gpu, sizeof out->gpu, "%s", saved_gpu[0] ? saved_gpu : cfg.gpu);
     out->renderer = saved_renderer >= 0 ? saved_renderer : cfg.renderer;
 }
 
@@ -347,7 +519,10 @@ static int have_place;
 static POINT last_mouse;
 static ULONGLONG last_mouse_at;
 
-static const DWORD WINDOWED_STYLE = WS_OVERLAPPEDWINDOW | WS_VISIBLE, FULL_STYLE = WS_POPUP | WS_VISIBLE;
+/* (FULL_STYLE's WS_MINIMIZEBOX | WS_SYSMENU: without them the borderless or full-screen window does not minimise from
+ * its taskbar button or with Win+Down; with them it does, seen with the borderless window (the Alt+Space menu still
+ * has no Minimize entry). Nothing is drawn, a WS_POPUP window has no title bar) */
+static const DWORD WINDOWED_STYLE = WS_OVERLAPPEDWINDOW | WS_VISIBLE, FULL_STYLE = WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX | WS_SYSMENU;
 static HWND game_window;
 
 /* The frame's thickness around a client area at this DPI. */
@@ -368,10 +543,14 @@ static RECT windowed_rect(HWND h) {
     UINT dpi = GetDpiForWindow(h);
     MONITORINFO mi = {sizeof mi};
     GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
-    int cw = MulDiv(cfg.width, (int)dpi, 96), ch = MulDiv(cfg.height, (int)dpi, 96);
+    /* (the height is the setting; the width the picture's shape, so a wider shape gets no bars) */
+    int ch = MulDiv(cfg.height, (int)dpi, 96), cw = (int)((float)ch * display_aspect() + 0.5f);
     RECT f = frame_of(WINDOWED_STYLE, dpi);
-    int ww = cw + f.right - f.left, wh = ch + f.bottom - f.top;
     RECT wa = mi.rcWork;
+    int aw = wa.right - wa.left - (f.right - f.left), ah = wa.bottom - wa.top - (f.bottom - f.top);
+    if (cw > aw && aw > 0) { ch = (int)((float)ch * aw / cw); cw = aw; }   /* (wider than the monitor: smaller, same shape) */
+    if (ch > ah && ah > 0) { cw = (int)((float)cw * ah / ch); ch = ah; }
+    int ww = cw + f.right - f.left, wh = ch + f.bottom - f.top;
     int x = wa.left + ((wa.right - wa.left) - ww) / 2, y = wa.top + ((wa.bottom - wa.top) - wh) / 2;
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
@@ -411,6 +590,30 @@ static void set_mode(HWND h, int mode) {
 /* (the window thread) the menu's choice: the window's mode now, and F11's full-screen form */
 #define WM_DISPLAY_MODE (WM_APP + 1)
 #define WM_DISPLAY_SHOW (WM_APP + 2)
+#define WM_DISPLAY_SIZE (WM_APP + 3)
+
+/* The windowed size (display.ini height; the width follows the picture's shape), now if windowed, else
+ * the next time it is: the menu's Window size, and a new picture shape. */
+static void window_follow_shape(void) {
+    HWND h = (HWND)gfx_window_handle();
+    if (h) PostMessageW(h, WM_DISPLAY_SIZE, 0, 0);
+}
+void display_set_window_height(int height) {
+    load();
+    cfg.height = height;
+    cfg.width = (int)((float)height * display_aspect() + 0.5f);
+    InterlockedExchange(&size_pending, 1);   /* (the window's timer takes it, never inside an online fight) */
+}
+/* Whether a windowed window of this height (at 100% scaling) fits the game window's monitor at the shape now. */
+int display_window_height_fits(int height) {
+    HWND h = (HWND)gfx_window_handle();
+    MONITORINFO mi = {sizeof mi};
+    if (!h || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return height <= 1080;
+    UINT dpi = GetDpiForWindow(h);
+    RECT f = frame_of(WINDOWED_STYLE, dpi ? dpi : 96);
+    int ch = MulDiv(height, (int)(dpi ? dpi : 96), 96), cw = (int)((float)ch * display_aspect() + 0.5f);
+    return cw + f.right - f.left <= mi.rcWork.right - mi.rcWork.left && ch + f.bottom - f.top <= mi.rcWork.bottom - mi.rcWork.top;
+}
 
 void display_set_mode(int mode) {
     load();
@@ -441,6 +644,7 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
         SetWindowPos(h, NULL, -32000, -32000, 640, 360, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         /* (not shown: a test watchdog takes any visible window for one on screen; Direct3D draws and presents a hidden one alike) */
         SetTimer(h, 1, 500, NULL);
+        InterlockedExchange(&g_la_off, 1);   /* (no loading animation off screen) */
         return h;
     }
     RECT r = windowed_rect(h);
@@ -449,6 +653,7 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
     if (!probe && cfg.mode != MODE_WINDOWED) set_mode(h, cfg.mode);
     if (!probe) ShowWindow(h, SW_SHOW);
     SetTimer(h, 1, 500, NULL);   /* the idle pointer */
+    la_start(h, !probe);         /* the loading animation (gpu_display_loading.inc) */
     return h;
 }
 
@@ -471,8 +676,9 @@ int display_take_size(unsigned *w, unsigned *h) {
 }
 
 void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw, unsigned *fh) {
-    if ((unsigned long long)w * 9 > (unsigned long long)h * 16) { *fh = h; *fw = h * 16 / 9; }   /* wider: bars left and right */
-    else { *fw = w; *fh = w * 9 / 16; }
+    float a = display_aspect();
+    if ((float)w > (float)h * a) { *fh = h; *fw = (unsigned)((float)h * a + 0.5f); }   /* wider: bars left and right */
+    else { *fw = w; *fh = (unsigned)((float)w / a + 0.5f); }
     if (!*fw) *fw = 1;
     if (!*fh) *fh = 1;
     *x = (w - *fw) / 2;
@@ -481,6 +687,7 @@ void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw,
 
 #ifdef _WIN32
 int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
+    if (la_wndproc(h, msg, w)) { *result = 0; return 1; }   /* (the loading animation's paint and timer) */
     switch (msg) {
     case WM_KEYDOWN:
         if (w != VK_F11 || (l & (1 << 30))) return 0;
@@ -497,6 +704,29 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
         set_mode(h, (int)w);
         *result = 0;
         return 1;
+    case WM_ENTERSIZEMOVE:  /* (a drag of the window or its edge: the render scale's auto waits for its end) */
+    case WM_EXITSIZEMOVE:
+        InterlockedExchange(&window_sizing, msg == WM_ENTERSIZEMOVE);
+        return 0;
+    case WM_DISPLAY_SIZE:   /* (window_follow_shape) */
+        have_place = 0;     /* (back to windowed later: the new size, not the old placement) */
+        if (current_mode == MODE_WINDOWED && !win_headless()) {
+            RECT now, r = windowed_rect(h);
+            if (GetWindowRect(h, &now)) {   /* (around the window's centre, kept on its monitor's work area) */
+                MONITORINFO mi = {sizeof mi};
+                GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
+                int ww = r.right - r.left, wh = r.bottom - r.top;
+                int x = (now.left + now.right - ww) / 2, y = (now.top + now.bottom - wh) / 2;
+                if (x + ww > mi.rcWork.right) x = mi.rcWork.right - ww;
+                if (y + wh > mi.rcWork.bottom) y = mi.rcWork.bottom - wh;
+                if (x < mi.rcWork.left) x = mi.rcWork.left;
+                if (y < mi.rcWork.top) y = mi.rcWork.top;
+                r = (RECT){x, y, x + ww, y + wh};
+            }
+            SetWindowPos(h, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        *result = 0;
+        return 1;
     case WM_DISPLAY_SHOW: {
         /* Once: ensure taskbar style and a single raise. Do not keep forcing foreground. */
         LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
@@ -510,13 +740,17 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
     case WM_MENUCHAR:     /* (no "ding" for Alt+key) */
         *result = MAKELRESULT(0, MNC_CLOSE);
         return 1;
+    case WM_SYSCOMMAND:   /* (borderless / full screen have WS_SYSMENU, for minimising: a lone Alt press there must not
+                           * open the window's menu mode and swallow the next key, Alt being a key players bind) */
+        if (current_mode != MODE_WINDOWED && (w & 0xFFF0) == SC_KEYMENU && l == 0) { *result = 0; return 1; }
+        return 0;
     case WM_SIZING: {     /* a windowed frame keeps the picture's shape */
         if (current_mode != MODE_WINDOWED) return 0;
         RECT *r = (RECT *)l, f = frame_of((DWORD)GetWindowLongPtrW(h, GWL_STYLE), GetDpiForWindow(h));
         int fw = f.right - f.left, fh = f.bottom - f.top;
         int cw = r->right - r->left - fw, ch = r->bottom - r->top - fh;
-        if (w == WMSZ_TOP || w == WMSZ_BOTTOM) cw = ch * 16 / 9;
-        else ch = cw * 9 / 16;
+        if (w == WMSZ_TOP || w == WMSZ_BOTTOM) cw = (int)((float)ch * display_aspect() + 0.5f);
+        else ch = (int)((float)cw / display_aspect() + 0.5f);
         if (w == WMSZ_TOP || w == WMSZ_TOPLEFT || w == WMSZ_TOPRIGHT) r->top = r->bottom - ch - fh;
         else r->bottom = r->top + ch + fh;
         if (w == WMSZ_LEFT || w == WMSZ_TOPLEFT || w == WMSZ_BOTTOMLEFT) r->left = r->right - cw - fw;
@@ -565,6 +799,7 @@ int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
         return 0;
     case WM_TIMER:
         if (w != 1) return 0;
+        if (size_pending && !(net_match_now() && game_fight_on()) && InterlockedExchange(&size_pending, 0)) window_follow_shape();
         if (win_headless()) {   /* (put back off screen if anything moved it) */
             RECT r;
             if (GetWindowRect(h, &r) && (r.left != -32000 || r.top != -32000))
@@ -605,7 +840,27 @@ void display_note_size(unsigned w, unsigned h) {
     if (w && h && w < 0x8000 && h < 0x10000) InterlockedExchange(&pending_size, (LONG)(w << 16 | h));
 }
 void display_note_refresh(int hz) { InterlockedExchange(&refresh_hz, hz); }
+/* The windowed size (display.ini height; the width follows the picture's shape): SDL's window takes it on the
+ * main thread (linux/window.c, display_take_window_size), never inside an online fight. */
+static volatile LONG follow_pending;
+static void window_follow_shape(void) { InterlockedExchange(&follow_pending, 1); }
+void display_set_window_height(int height) {
+    load();
+    cfg.height = height;
+    cfg.width = (int)((float)height * display_aspect() + 0.5f);
+    window_follow_shape();
+}
+int display_take_window_size(int *w, int *h) {
+    if (!follow_pending || (net_match_now() && game_fight_on()) || !InterlockedExchange(&follow_pending, 0)) return 0;
+    load();
+    *h = cfg.height;
+    *w = (int)((float)cfg.height * display_aspect() + 0.5f);
+    return 1;
+}
+int display_window_height_fits(int height) { return height <= 1080; }   /* ponytail: the monitor's own size if Linux players ask */
 #endif
+
+static volatile LONG vblank_extra, vblank_hz;   /* (display_tick_stretch: monitor refreshes to add to the next ticks; the monitor's rate, 0: not paced by it) */
 
 /* ---- pacing ----------------------------------------------------------------------------- */
 static int tearing;
@@ -617,6 +872,25 @@ unsigned display_present_flags(void) {
     /* (SSBU_SPEED too: a frame is shown at once, not held to the monitor's refresh rate) */
     return (cfg.pacing == PACING_VRR || cfg.speed != 1) && tearing ? 0x200u /* DXGI_PRESENT_ALLOW_TEARING */ : 0;
 }
+
+/* (vblank_tick: the monitor's refreshes cannot be waited for here, or its rate is no multiple of 60) */
+static volatile LONG vblank_failed_flag, vblank_odd_rate;
+int display_present_sync(void) {   /* (only while `display` pacing is chosen and the game runs at its speed: a pacing changed
+                                     * in the menu, or SSBU_SPEED's test runs, present as they did before - and only when the
+                                     * wait for the monitor's refreshes FAILED, so nothing else paces the frames. A monitor
+                                     * whose rate 60 does not divide (165 Hz) keeps mailbox/immediate on purpose: a blocking
+                                     * present adds a whole refresh to every frame that arrives a little late, and this PC's
+                                     * frames occasionally do (page faults, asset I/O), so a slight unevenness became 33 and
+                                     * 124 ms stutters where mailbox shows the newest frame at the next refresh instead -
+                                     * owner's log, 2026-11-17: avg 17.45 ms, worst 107 ms off a 60 Hz frame) */
+    load();
+    return cfg.pacing == PACING_DISPLAY && cfg.speed == 1 && vblank_failed_flag != 0;
+}
+
+int display_pacing_vrr(void) { load(); return cfg.pacing == PACING_VRR && cfg.speed == 1; }
+/* (`display` pacing on a monitor whose rate 60 does not divide: the renderer presents without blocking, but only where that
+ * is tear-free - mailbox. A card without mailbox gets FIFO there, as before, rather than immediate's tearing) */
+int display_present_odd_rate(void) { load(); return cfg.pacing == PACING_DISPLAY && cfg.speed == 1 && vblank_odd_rate != 0; }
 
 void *gfx_display_output(void);   /* gpu_d3d11.c: the swap chain's output (IDXGIOutput, referenced), or NULL */
 
@@ -635,28 +909,68 @@ static int monitor_hz(void) {
 /* `display` pacing: the next vblank the game should see, or 0 to use the clock this time. */
 static int vblank_tick(void) {
     static IDXGIOutput *output;
-    static int divisor, failed;
-    if (failed) return 0;
+    static int divisor, failed, hz_now;
+    static LONGLONG last;   /* (the refresh the last tick returned at, performance counter; 0 none) */
+    if (failed) { InterlockedExchange(&vblank_hz, 0); return 0; }
     if (InterlockedExchange(&monitor_changed, 0) || !output) {
         if (output) IDXGIOutput_Release(output);
         output = (IDXGIOutput *)gfx_display_output();
         int hz = monitor_hz();
+        hz_now = hz;
+        last = 0;
         divisor = hz >= 58 && hz <= 61 ? 1 : hz >= 118 && hz <= 121 ? 2 : hz >= 238 && hz <= 241 ? 4 : 0;
         static int logged_hz = -1;
         if (hz != logged_hz && output) {
             logged_hz = hz;
             fprintf(stderr, "[display] %d Hz monitor: %s\n", hz, divisor ? "display pacing" : "clock pacing (display pacing needs 60, 120 or 240 Hz)");
+            /* (a rate the game's 60 frames do not divide: 165 Hz is 2.75 refreshes a frame, so a frame is shown for two
+             * refreshes and then three. The presents stay non-blocking, so a late frame costs no extra refresh) */
+            if (!divisor && hz > 61)
+                fprintf(stderr, "[display] %d Hz is not a multiple of 60 (%g refreshes a frame): paced 60 times a second and presented at the next "
+                                "refresh; a 60/120/240 Hz mode or VRR is evenly paced\n", hz, hz / 60.0);
         }
     }
-    if (!output || !divisor) return 0;
+    /* (again at each monitor change: a window moved to a 60 Hz one. Kept for the log: it no longer changes the present mode.) */
+    InterlockedExchange(&vblank_odd_rate, !divisor && hz_now > 61 ? 1 : 0);
+    InterlockedExchange(&vblank_hz, output && divisor ? hz_now : 0);
+    if (!output || !divisor) { last = 0; return 0; }
+    int extra = vblank_extra > 0 && InterlockedDecrement(&vblank_extra) >= 0;   /* (one refresh more this tick, at most: a 120 Hz monitor's 8 ms) */
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
-    for (int i = 0; i < divisor; i++)
-        if (FAILED(IDXGIOutput_WaitForVBlank(output))) { failed = 1; break; }
+    /* The divisor-th refresh after the one the last tick returned at, not after now: the vsync thread comes
+     * back here late when its frame's work - or low_latency's held signal, up to most of a 60 Hz frame - ran
+     * past the monitor's next refresh, and "two refreshes from now" at 120 Hz was then three after the last
+     * tick, 25 ms (a fight on a 120 Hz monitor: up to ~1 frame in 100 shown 1.5 frames late). Refreshes are counted
+     * by their times, so a wait that returns at once or misses one is counted as what it was. */
+    LONGLONG period = freq.QuadPart / hz_now;
+    /* (A wait that runs past what the refreshes say cannot resolve - the monitor changed rate under us, or the driver's
+     * vblank is not arriving - ends at a time bound and takes the clock path, instead of falling through the old
+     * "never more than a few refreshes" cap: at 120 Hz every tick then waited ~44.6 ms (five refreshes) and 295 frames
+     * in 80 s were 46 ms hitches, all of them inside this loop - owner's log, 2026-11-17.) */
+    LONGLONG budget = period * (divisor + extra + 2);
+    static int over_budget;
+    int over = 0;
+    for (;;) {
+        if (FAILED(IDXGIOutput_WaitForVBlank(output))) { failed = 1; InterlockedExchange(&vblank_failed_flag, 1); break; }
+        QueryPerformanceCounter(&t1);
+        if (!last) break;   /* (the first tick: one refresh is the answer) */
+        if ((t1.QuadPart - last + period / 2) / period >= divisor + extra) break;
+        if (t1.QuadPart - t0.QuadPart > budget) { over = 1; break; }   /* (the vblanks are not what the rate says) */
+    }
+    /* (one wait past its bound is a stall - this tick returns late, as the old cap did; several in a row are a monitor
+     * whose vblanks do not match its rate: clock pacing from then on, below) */
+    over_budget = over ? over_budget + 1 : 0;
+    if (over_budget >= 3) failed = 1;
     QueryPerformanceCounter(&t1);
+    last = t1.QuadPart;
+    /* (a wait that took too long - a stall, not a monitor that cannot be waited for - goes to clock pacing as before, without
+     * the renderer's sync: FIFO against a clock a little faster than the monitor would queue frames up) */
     if (!failed && (t1.QuadPart - t0.QuadPart) * 1000 / freq.QuadPart > 50 * divisor) failed = 1;
-    if (failed) fprintf(stderr, "[display] waiting for the monitor's refresh failed: clock pacing from now on\n");
+    if (failed) InterlockedExchange(&vblank_hz, 0);
+    if (failed) fprintf(stderr, vblank_failed_flag ? "[display] waiting for the monitor's refresh failed (its panel is another card's?): "
+                                                     "the renderer's own sync paces the frames from now on\n"
+                                                   : "[display] waiting for the monitor's refresh took too long: clock pacing from now on\n");
     return !failed;
 }
 #elif defined __APPLE__
@@ -691,6 +1005,33 @@ static int vblank_tick(void) {
 }
 #endif
 
+static volatile LONG64 tick_stretch_us;   /* (display_tick_stretch: owed to the clock's schedule, us) */
+static double tick_owed;   /* (display pacing: what is owed short of one of the monitor's refreshes, ms; the main thread's) */
+/* Returns 1 when a whole 60 Hz refresh is owed on a 60 Hz monitor held to it: the caller leaves one out (ipc_vi.c's
+ * rb_vsync_skip, which this file does not link against). */
+int display_tick_stretch(double ms) {
+    load();
+    if (ms <= 0) return 0;
+    int hz = (int)vblank_hz;   /* (0: the clock paces the ticks - clock or vrr, or display pacing fallen back to it) */
+    if (cfg.pacing == PACING_DISPLAY && hz) {   /* (held to the monitor: whole refreshes, the monitor's own where it is faster than 60 Hz) */
+        double step = hz >= 118 ? 1000.0 / hz : 1000.0 / 60;
+        tick_owed += ms;
+        if (tick_owed >= step) {
+            tick_owed -= step;
+            if (hz < 118) return 1;
+            InterlockedIncrement(&vblank_extra);
+        }
+        return 0;
+    }
+    InterlockedExchangeAdd64(&tick_stretch_us, (LONG64)(ms * 1000));
+    return 0;
+}
+void display_tick_stretch_reset(void) {   /* (a fight starts: nothing owed from the last one) */
+    tick_owed = 0;
+    InterlockedExchange64(&tick_stretch_us, 0);
+    InterlockedExchange(&vblank_extra, 0);
+}
+
 void display_wait_tick(void) {
     static LARGE_INTEGER freq, base;
     static long long ticks;
@@ -710,6 +1051,8 @@ void display_wait_tick(void) {
                 cfg.pacing == PACING_VRR ? "vrr" : cfg.pacing == PACING_DISPLAY ? "display" : "clock",
                 cfg.pacing == PACING_VRR && !tearing ? " (no tearing support: as clock)" : "");
     }
+    /* (`display` at a rate 60 does not divide - 165 Hz: vblank_tick notes it and returns 0 until the monitor changes, and
+     * this is the clock's own path, as clock pacing is, with the renderer presenting in sync instead of this wait) */
     if (cfg.pacing == PACING_DISPLAY && vblank_tick()) {   /* the clock restarts from here if it is needed later */
         QueryPerformanceCounter(&base);
         ticks = 0;
@@ -718,11 +1061,16 @@ void display_wait_tick(void) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     long long period = freq.QuadPart / 60;
-    if (now.QuadPart - (base.QuadPart + ticks * freq.QuadPart / 60) > 2 * period) {   /* late by two refreshes: skip, don't burst */
+    /* (late by two refreshes: skip, don't burst. With the renderer presenting in sync (display_present_sync) a present that
+     * waited for the monitor is what made it late: the clock starts again from here at once, so it neither sends refreshes
+     * back to back nor stays behind - rollback's time sync below, which moves the clock later, then still slows the game) */
+    if (now.QuadPart - (base.QuadPart + ticks * freq.QuadPart / 60) > (display_present_sync() ? period / 8 : 2 * period)) {
         base = now;
         ticks = 0;
     }
     ticks++;
+    {   LONG64 st = InterlockedExchange64(&tick_stretch_us, 0);   /* (rollback's time sync: this refresh and the next ones later) */
+        if (st > 0) base.QuadPart += st * freq.QuadPart / 1000000; }
     long long due = base.QuadPart + ticks * freq.QuadPart / 60;
     for (;;) {
         QueryPerformanceCounter(&now);
@@ -757,4 +1105,19 @@ void display_speed_tick(void) {
         if (left * 1000 > 2 * freq.QuadPart) Sleep(1);
         else YieldProcessor();
     }
+}
+
+void display_loading_note(const char *note) {
+#ifdef _WIN32
+    la_note(note);
+#else
+    (void)note;
+#endif
+}
+
+/* (both renderers, just before each present: the loading animation stops at the first) */
+void display_before_present(void) {
+#ifdef _WIN32
+    if (!g_la_first) la_stop();
+#endif
 }

@@ -80,6 +80,7 @@
 #pragma comment(lib, "iphlpapi.lib")   /* (GetBestRoute: the gateway, for PCP and NAT-PMP) */
 #else
 #include <sys/select.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -97,6 +98,7 @@ typedef int SOCKET;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "config_folder.h"
 #include "host.h"
@@ -184,7 +186,7 @@ static void big_sends(SOCKET s) {
 static int configured = -1, hosting, logging;
 static char relay_text[256], room[NAME_LEN + 1] = "smash", name[NAME_LEN + 1] = "Player";
 static u16 port = NET_DEFAULT_PORT;
-static int direct_ok = 1, test_nat;   /* SSBU_NET_DIRECT; SSBU_NET_TEST_NAT (tests) */
+static int direct_ok = 0, test_nat;   /* SSBU_NET_DIRECT=1 (never with the official lobby: v0.5.0; on in a private room: configure); SSBU_NET_TEST_NAT (tests) */
 static int learn_ok = 1;              /* SSBU_NET_TEST_LEARN=0 (tests): as before, no address learnt from a hello */
 static volatile LONG sim_upnp;        /* SSBU_NET_TEST_UPNP=1 (tests), or a port mapping made: the simulated router forwards the game's port */
 static int proto_wanted = NET_PROTOCOL;   /* SSBU_NET_PROTOCOL: the version asked for first (proto: spoken now) */
@@ -212,10 +214,66 @@ static u64 process_age_ms(void) { return rt_now_ns() / 1000000; }
  * the files the settings menu and the launcher write, where no SSBU_NET_* variable says them.
  * online_server.txt: "host:port [lobby code]" or "off"; online_name.txt: the name (one is picked
  * and kept there when it is missing); online_direct.txt: "off" for no direct connections. */
+/* (before the server regions, net_region.c: one lobby for every player)
+ * online_server.txt "auto" (the default): the one public lobby, in Europe, which every player shares: matchmaking,
+ * the game server and every GSP result (owner 2026-11-16). The North American
+ * lobby is gone: "na", "eu" and its address (with or without a lobby code, which is kept) mean this one; any other
+ * server a player named is kept as it is. */
+/* (v0.5.0) "auto" is the official lobby: relay only (it never introduces games to each other, so no player's
+ * internet address reaches another game), a signed-in player's lobby ticket in every JOIN, and no direct paths
+ * with it. Its address: net_region.c's (the server region, or an override). The older public lobbies' names mean it too. */
+/* (OpenSmash 0.5.0) one official lobby a region (net_region.c): the one config/server_region.txt names, or with "auto"
+ * the one that answers soonest; an override (the variable, the file) is that server and nothing else. Any region's
+ * lobby in online_server.txt means "the official lobby": which one is the region setting's to say.
+ * (OpenSmash 0.5.0) Epic Online Services are gone: "eos" (online_server.txt, SSBU_NET_RELAY, an older game's Discord
+ * join secret) means the official lobby too. */
+static const char *public_lobby(void) { return net_region_lobby(); }
+#define PUBLIC_LOBBY public_lobby()
+static int means_public_lobby(const char *host) {
+    char other[256];   /* (an override's server; read, not decided: nothing is measured for a server of the player's own) */
+    return !_stricmp(host, "auto") || !_stricmp(host, "na") || !_stricmp(host, "eu") || !_stricmp(host, "eos") || !_strnicmp(host, "smash.recomps.wtf:", 18) ||
+           !_stricmp(host, "smash.recomps.wtf") || !_strnicmp(host, "opensmash-lobby.duckdns.org", 27) ||   /* (the older public lobbies, replaced by the official one) */
+           net_region_of_lobby(host) >= 0 || (net_region_override(other, sizeof other) && !_stricmp(host, other));
+}
+const char *net_official_lobby(void) { return public_lobby(); }
+int net_means_official_lobby(const char *host) { return host && means_public_lobby(host); }
+static int official_relay(void) {
+    char other[256];   /* (a relay that is no official lobby's: said without deciding the region, which may measure) */
+    if (!relay_text[0] || (net_region_of_lobby(relay_text) < 0 && !(net_region_override(other, sizeof other) && !_stricmp(relay_text, other)))) return 0;
+    return !_stricmp(relay_text, public_lobby());
+}
+
+/* (v0.5.0) the signed-in player's lobby ticket for the official lobby ("<account id>|<name>|<expiry>.<signature>",
+ * made by the accounts database through the launcher): SSBU_ONLINE_TICKET, or the file SSBU_ONLINE_TICKET_FILE names
+ * (the launcher writes a new one before the old one expires: read again at most every 5 s). Its name is the online name. */
+static char ticket[320];
+static u64 ticket_read_at;
+static u64 now_ms(void);
+static void ticket_refresh(void) {
+    const char *t = getenv("SSBU_ONLINE_TICKET"), *f = getenv("SSBU_ONLINE_TICKET_FILE");
+    if (t && *t) snprintf(ticket, sizeof ticket, "%s", t);
+    else if (f && *f && (!ticket_read_at || now_ms() - ticket_read_at >= 5000)) {
+        ticket_read_at = now_ms();
+        FILE *fp = fopen(f, "rb");
+        if (fp) {
+            size_t n = fread(ticket, 1, sizeof ticket - 1, fp);
+            fclose(fp);
+            ticket[n] = 0;
+            while (n && (ticket[n - 1] == '\n' || ticket[n - 1] == '\r' || ticket[n - 1] == ' ')) ticket[--n] = 0;
+        }
+    }
+    const char *a = strchr(ticket, '|'), *b = a ? strchr(a + 1, '|') : NULL;
+    if (a && b && b - a - 1 > 0 && b - a - 1 <= NAME_LEN) {
+        memset(name, 0, sizeof name);
+        memcpy(name, a + 1, (size_t)(b - a - 1));
+    }
+}
+
 static void configure_from_files(void) {
     char line[256], host[256] = "", code[NAME_LEN + 1] = "";
     if (settings_line_read(config_path(CONFIG_ONLINE_SERVER), line, sizeof line)) sscanf(line, "%255s %32s", host, code);
     if (!host[0] || !_stricmp(host, "off")) return;
+    if (means_public_lobby(host)) snprintf(host, sizeof host, "%s", PUBLIC_LOBBY);
     snprintf(relay_text, sizeof relay_text, "%s", host);
     if (code[0] && !getenv("SSBU_NET_ROOM")) { snprintf(room, sizeof room, "%s", code); room_named = 1; }
     if (!getenv("SSBU_NET_NAME")) {
@@ -226,7 +284,42 @@ static void configure_from_files(void) {
         }
         snprintf(name, sizeof name, "%s", line);
     }
-    if (!getenv("SSBU_NET_DIRECT") && settings_line_read(config_path(CONFIG_ONLINE_DIRECT), line, sizeof line) && !_strnicmp(line, "off", 3)) direct_ok = 0;
+    /* (v0.5.0: online_direct.txt does not turn direct paths on with a lobby server: they show the player's
+     * address, so they are off there unless SSBU_NET_DIRECT=1 asks for them with another lobby. It is read for private
+     * rooms, where they are on by default: net_start's "a private room") */
+}
+
+/* A friend's "Join" in Discord for another lobby (net_discord.c): config/discord_join.txt, one line "<r|a> <lobby>
+ * <lobby code, - none> <room host's address or arena ID> <unix time>". Taken at the next start, within DISCORD_JOIN_FOR
+ * seconds: that lobby and lobby code for this start only (the settings stay as they are), and a room's host listed
+ * first in Local Wireless's Rooms List: the official lobby for this start, whatever online_server.txt says (an older
+ * game on Epic Online Services wrote "eos" as the lobby: the official lobby too, means_public_lobby). */
+#define DISCORD_JOIN_FOR (15 * 60)
+static void discord_join_at_start(void) {
+    const char *path = "config/discord_join.txt";
+    char text[512];
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    remove(path);   /* (once: a later start plays as the settings say) */
+    text[n] = 0;
+    char kind[4], relay[80], code[NAME_LEN + 1], target[48];
+    long long at = 0;
+    if (sscanf(text, "%3s %79s %32s %47s %lld", kind, relay, code, target, &at) != 5 || (strcmp(kind, "r") && strcmp(kind, "a"))) return;
+    long long now = (long long)time(NULL);
+    if (now < at || now - at > DISCORD_JOIN_FOR) return;
+    /* (v0.5.0) only the official lobby: a Join secret is made by another player's game, and one made up could send
+     * this game, with its lobby ticket, to any server */
+    if (!means_public_lobby(relay)) { fprintf(stderr, "[net] a Discord join for another lobby was ignored (only the official one)\n"); return; }
+    /* (the friend's region: rooms and arenas are a lobby's own, so this start plays on theirs; the saved choice stays.
+     * With an override there are no regions, and "eos" names none: net_region_use changes nothing) */
+    net_region_use(net_region_of_lobby(relay));
+    snprintf(relay_text, sizeof relay_text, "%s", PUBLIC_LOBBY);
+    if (strcmp(code, "-")) { snprintf(room, sizeof room, "%s", code); room_named = 1; }
+    struct in_addr a;
+    if (kind[0] == 'r' && inet_pton(AF_INET, target, &a) == 1) net_rooms_pick(ntohl(a.s_addr));
+    fprintf(stderr, "[net] joining from Discord: lobby %s, %s %s\n", relay_text, kind[0] == 'r' ? "the room of" : "Battle Arena", target);
 }
 
 int net_rollback_default(void) {
@@ -235,9 +328,14 @@ int net_rollback_default(void) {
     char line[256], host[256] = "";
     const char *h = getenv("SSBU_NET_HOST"), *r = getenv("SSBU_NET_RELAY");
     v = 0;
-    /* (off unless asked for: online_rollback.txt "on", the settings menu's Online > Rollback netcode. The game's
-     * own netcode is the default until rollback passes two-PC tests; alpha.3's players found it unplayable) */
-    if (!(settings_line_read(config_path(CONFIG_ONLINE_ROLLBACK), line, sizeof line) && !_strnicmp(line, "on", 2))) return v;
+    /* This can run before backend registration (the rollback constructor). */
+    const char *backend = getenv("SSBU_NET_BACKEND");
+    if (backend && !_stricmp(backend, "yuzu")) return v;
+    /* (alpha.3's players found rollback unplayable and #201 made the game's own netcode the default) */
+    /* (on again by default since 2026-11-11: catch-ups fit in a frame - over 16.7 ms in under 1 % at 40 ms one way, about
+     * 3-4 % at 120-150 ms, input delay from the measured trip up to 9 frames, 0 desyncs in pair runs (#254-#277); online_rollback.txt
+     * "off" or the settings menu gives the game's own netcode) */
+    if (settings_line_read(config_path(CONFIG_ONLINE_ROLLBACK), line, sizeof line) && !_strnicmp(line, "off", 3)) return v;
     /* (a private room started by Host/Join SSBU Netplay.bat: SSBU_NET_HOST or SSBU_NET_RELAY, no --online) */
     if (h && *h && strcmp(h, "0")) return v = 1;
     if (r && *r) return v = _stricmp(r, "off") != 0;
@@ -256,15 +354,25 @@ static int protocol_from_file(int otherwise) {
     return v == NET_PROTOCOL || v == NET_PROTOCOL_V3 ? v : otherwise;
 }
 
-static void configure(void) {
-    if (configured >= 0) return;
+const NetBackend *net_backend_candidate, *net_backend;
+NetLdnSink net_backend_ldn_sink;
+
+/* Once, whichever thread asks first; the others wait for it (InitOnce): no thread sees "configured" before the
+ * settings are all read (#460). */
+static BOOL CALLBACK configure_once(PINIT_ONCE once, void *param, void **ctx) {
+    (void)once; (void)param; (void)ctx;
+    if (net_backend_candidate && net_backend_candidate->selected()) {
+        net_backend=net_backend_candidate; configured=1;
+        const char *log=getenv("SSBU_NET_LOG"); if(log) logging=atoi(log);
+        return TRUE;
+    }
     const char *h = getenv("SSBU_NET_HOST"), *r = getenv("SSBU_NET_RELAY"), *v;
     hosting = h && *h && strcmp(h, "0");
     if ((v = getenv("SSBU_NET_PORT")) && atoi(v) > 0 && atoi(v) < 65536) port = (u16)atoi(v);
     if ((v = getenv("SSBU_NET_ROOM")) && *v) { snprintf(room, sizeof room, "%s", v); room_named = 1; }
     if ((v = getenv("SSBU_NET_NAME")) && *v) snprintf(name, sizeof name, "%s", v);
     if ((v = getenv("SSBU_NET_LOG"))) logging = atoi(v) > 0 ? atoi(v) : 1;
-    if ((v = getenv("SSBU_NET_DIRECT")) && !strcmp(v, "0")) direct_ok = 0;
+    if ((v = getenv("SSBU_NET_DIRECT"))) direct_ok = !strcmp(v, "1");
     /* (tests) SSBU_NET_TEST_NAT=1..4: a router of one kind between this game and the others (sim_out
      * below); SSBU_NET_TEST_BLOCK=<seconds after the game started>: drop every direct packet
      * from then on, as if a firewall closed the path (0: from the start) */
@@ -281,22 +389,54 @@ static void configure(void) {
     if ((v = getenv("SSBU_NET_LAN_PORT")) && atoi(v) > 0 && atoi(v) < 65536) lan_port = (u16)atoi(v);
     if ((v = getenv("SSBU_NET_LAN_TEST"))) lan_test = atoi(v) > 0;
     if (hosting) snprintf(relay_text, sizeof relay_text, "127.0.0.1:%u", port);
-    else if (r && *r) { if (_stricmp(r, "off")) snprintf(relay_text, sizeof relay_text, "%s", r); }
+    else if (r && *r) {
+        /* (the macOS and Linux launchers pass online_server.txt's first word as SSBU_NET_RELAY: "auto", "na" and "eu"
+         * are the public lobby there too - issue #259, they were taken as host names and nothing was joined) */
+        if (means_public_lobby(r)) snprintf(relay_text, sizeof relay_text, "%s", PUBLIC_LOBBY);
+        else if (_stricmp(r, "off")) snprintf(relay_text, sizeof relay_text, "%s", r);
+    }
     else if (settings_online()) configure_from_files();
+    if (!hosting && relay_text[0] && _stricmp(relay_text, "lan")) discord_join_at_start();
     lan_mode = !hosting && !_stricmp(relay_text, "lan");
+    /* (a private room: the host's own game is the relay, on the players' own network or at an address the host gave out
+     * by hand, and This network (LAN) finds it by the host's beacons, which are only sent with direct connections on.
+     * So there direct paths are on as before unless SSBU_NET_DIRECT=0; with a lobby server they are asked for
+     * (SSBU_NET_DIRECT=1), and with the official lobby never taken) */
+    /* (the Direct connections setting, online_direct.txt, is this case's switch: "off" there and a private room goes
+     * through its host's game alone and is not announced, as before 0.5.0 - the menu's row and its "Not announced: Direct
+     * connections are off" say exactly that. It changes nothing with a lobby server.) */
+    if (!getenv("SSBU_NET_DIRECT") && (hosting || lan_mode)) {
+        char off[16];
+        direct_ok = !(settings_line_read(config_path(CONFIG_ONLINE_DIRECT), off, sizeof off) && !_strnicmp(off, "off", 3));
+    }
     configured = hosting || relay_text[0];
     proto_wanted = NET_PROTOCOL_DEFAULT;   /* SSBU_NET_PROTOCOL=2|3, else online_protocol.txt's; hosting: its own relay's, 2 */
     if ((v = getenv("SSBU_NET_PROTOCOL")) && (atoi(v) == NET_PROTOCOL || atoi(v) == NET_PROTOCOL_V3)) proto_wanted = atoi(v);
     else if (configured && !hosting) proto_wanted = protocol_from_file(proto_wanted);
     if (hosting || lan_mode) proto_wanted = NET_PROTOCOL;   /* (a private room's relay: version 2) */
     proto = proto_wanted;
+    if (official_relay()) {   /* (v0.5.0: relay only, and the account's name) */
+        if (direct_ok) fprintf(stderr, "[net] direct paths stay off with the official lobby\n");
+        direct_ok = 0;
+        ticket_refresh();
+        if (!ticket[0]) fprintf(stderr, "[net] no lobby ticket: sign in in the launcher to play online\n");
+    }
+    return TRUE;
 }
+static void configure(void) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, configure_once, NULL, NULL);
+}
+/* configure: every caller that reads net_backend or starts the network comes through here, so none sees "configured"
+ * before every setting is read (#460) */
+static void configure_backend(void) { configure(); }
 
 static void start(void);
 int net_configured(void) { start(); return configured; }
 int net_log(void) { configure(); return logging; }
-const char *net_player_name(void) { configure(); return name; }
+const char *net_player_name(void) { configure_backend(); return net_backend ? net_backend->name() : name; }
 const char *net_relay_address(void) { configure(); return !hosting && !lan_mode && relay_text[0] ? relay_text : NULL; }
+const char *net_lobby_code(void) { configure(); return room; }
 
 /* ---- the relay (host mode) ------------------------------------------------------------ */
 typedef struct Member { struct sockaddr_in at; u64 nonce, seen; u32 ip; char name[NAME_LEN + 1]; } Member;
@@ -739,10 +879,10 @@ static u32 member_ips[ROOM_MEMBERS];      /* (a private room's: its MEMBERS, thi
 static int member_count;
 static SRWLOCK members_lock = SRWLOCK_INIT;
 
-u32 net_local_ip(void) { start(); return joined ? my_ip : 0; }
-int net_protocol_wanted(void) { configure(); return proto_wanted; }
+u32 net_local_ip(void) { start(); return net_backend ? net_backend->ip() : joined ? my_ip : 0; }
+int net_protocol_wanted(void) { configure_backend(); return net_backend ? 0 : proto_wanted; }
 int net_protocol_spoken(void) { start(); return joined ? (int)proto : 0; }
-int net_unreachable(void) { start(); return configured && !joined && now_ms() - unjoined_since > UNREACHABLE_MS; }
+int net_unreachable(void) { start(); return net_backend ? net_backend->unreachable() : configured && !joined && now_ms() - unjoined_since > UNREACHABLE_MS; }
 int net_lobby(void) { start(); return joined && lobby; }
 
 /* ---- rollback messages (net.h's NET_RB_PORT; SSBU_RB_NET=relay, hle_rb_relay.c) --------------
@@ -879,6 +1019,9 @@ static const char *addr_text(const struct sockaddr_in *a, char *buf) {   /* (buf
 static u64 random64(void) { unsigned int a, b; rand_s(&a); rand_s(&b); return (u64)a << 32 | b; }
 
 static int usable(const Peer *q, u64 t) { return q->state == P_DIRECT && t - q->last_ack < USABLE_MS && t < test_block_at; }
+/* (before OpenSmash 0.5.0) the port of Epic Online Services' ids and hellos between two players of a lobby: an older
+ * game with SSBU_EOS=1 may still send its id there, through the lobby or straight. Dropped, never the game's. */
+#define OLD_EOS_PORT 7702
 
 static const char *peer_state(const Peer *q, u64 t, char *buf) {   /* (buf: 48 bytes) */
     if (usable(q, t)) { snprintf(buf, 48, "direct %ld ms", (long)q->rtt); return buf; }
@@ -1146,6 +1289,7 @@ static void direct_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             InterlockedIncrement(ok ? &q->in_direct : &q->dropped);
         }
         ReleaseSRWLockShared(&peers_lock);
+        if (ok && dport == OLD_EOS_PORT) return;
         if (ok && rb_take(src, dport, b + 12, (u32)(n - DIRECT_HEAD - 12), &rb_in_direct)) return;   /* (rollback's: the pair's secret is the proof) */
         if (ok && ldn_in_network(src)) vsock_deliver(src, sport, dst, dport, b + 12, (u32)(n - DIRECT_HEAD - 12));
         else if (ok) InterlockedIncrement(&direct_not_in_room);
@@ -1211,6 +1355,7 @@ static void local_address(void) {   /* this player's own address and port, for p
 /* To one player (straight there while a direct path works, else through the lobby), or to the
  * room: straight to each player reached directly, through the lobby to the rest. */
 void net_send(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {
+    if (net_backend) { net_backend->send(src_ip,src_port,dst_ip,dst_port,data,len); return; }
     if (!joined || client_sock == INVALID_SOCKET || len > 65000) return;
     enum { ROOM = 4 + 1 + 4 * PEERS_MAX };   /* (before the DATA body: room for the longest header, BCAST's) */
     u8 stack[1600], *buf = ROOM + 12 + len <= sizeof stack ? stack : malloc(ROOM + 12 + len);
@@ -1273,6 +1418,11 @@ static int is_room_peer(u32 ip) {   /* (the lobby: a player of this player's Loc
 static void rb_lobby_send(u32 dst, const void *data, u32 len);
 static int lobby_has_rb(void);
 void net_rb_send(u32 dst, const void *data, u32 len) {
+    if (net_backend && len) {   /* (another network, net_backend.h: to that member, or every one) */
+        net_backend->send(net_local_ip(), NET_RB_PORT, dst ? dst : 0xFFFFFFFFu, NET_RB_PORT, data, len);
+        InterlockedIncrement64(&rb_out_data);
+        return;
+    }
     if (!joined || client_sock == INVALID_SOCKET || !len) return;
     u32 to = dst ? dst : NET_BROADCAST;
     if (!lobby) {   /* (a private room's relay: DATA to its members) */
@@ -1845,9 +1995,30 @@ static void mod_set_make(void) {
     free(m);
 }
 
-static void send_join(void) {
-    u8 p[JOIN_V3_MAX + 2] = {0};
+/* (the in-game NEX server's gatherings, hle_online.c) who may meet whom, as one short key: the game build, the lobby
+ * code, the simulation version and the mods (their hashes, in any order: the lobby's mods_key) - "p1-" and 16 hex
+ * digits of their FNV-1a 64 hash */
+void net_part_key(char *out, size_t n) {
+    configure();
     mod_set_make();
+    u32 h[MODS_MAX];
+    int k = 0, o = 1;
+    for (int i = 0; i < mod_set[0] && k < MODS_MAX; i++) { h[k++] = get32(mod_set + o); o += 5 + mod_set[o + 4]; }
+    qsort(h, (size_t)k, sizeof *h, u32_cmp);
+    u64 x = 0xcbf29ce484222325ull;
+    char text[256];
+    const char *build = rt_module_main.build_id ? rt_module_main.build_id : "";
+    snprintf(text, sizeof text, "%s|%s|%u|", build, room, (unsigned)SIM_VERSION);
+    for (char *p = text; *p; p++) { x ^= (u8)(*p >= 'a' && *p <= 'z' ? *p - 32 : *p); x *= 0x100000001b3ull; }
+    for (int i = 0; i < k; i++) for (int b = 0; b < 4; b++) { x ^= (u8)(h[i] >> (8 * b)); x *= 0x100000001b3ull; }
+    snprintf(out, n, "p1-%016llx", (unsigned long long)x);
+}
+
+static void send_join(void) {
+    u8 p[JOIN_V3_MAX + 2 + 4 + sizeof ticket + 4] = {0};
+    mod_set_make();
+    int official = official_relay();
+    if (official) ticket_refresh();   /* (a renewed ticket, and its name) */
     header(p, T_JOIN);
     put64(p + 4, nonce);
     memcpy(p + 12, room, strlen(room));
@@ -1867,6 +2038,16 @@ static void send_join(void) {
         memcpy(p + JOIN_SIZE + 6, mod_set, (size_t)mod_set_len);
         len += 6 + mod_set_len;
     }
+    /* (v0.5.0) after the mod set: "TK" u16 length + the lobby ticket (the official lobby only: a ticket is never
+     * shown to another server), then "CV" u16 the online level (tools/ssbu_relay.py join_blocks; lobbies before it ignore them) */
+    int tl = official ? (int)strlen(ticket) : 0;
+    if (tl) {
+        p[len] = 'T'; p[len + 1] = 'K'; p[len + 2] = (u8)(tl >> 8); p[len + 3] = (u8)tl;
+        memcpy(p + len + 4, ticket, (size_t)tl);
+        len += 4 + tl;
+    }
+    p[len] = 'C'; p[len + 1] = 'V'; p[len + 2] = (u8)(NET_CLIENT_LEVEL >> 8); p[len + 3] = (u8)NET_CLIENT_LEVEL;
+    len += 4;
     send_udp(client_sock, p, len, &relay_at);
 }
 
@@ -2568,6 +2749,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         switch (buf[3]) {
         case T_DATA:
             if (n >= 16 && joined) {
+                if (get16(buf + 14) == OLD_EOS_PORT) break;
                 if (get16(buf + 12) != NET_LDN_PORT) count_relayed_in(get32(buf + 4));
                 if (!rb_take(get32(buf + 4), get16(buf + 14), buf + 16, (u32)(n - 16), &rb_in_relayed))
                     vsock_deliver(get32(buf + 4), get16(buf + 12), get32(buf + 8), get16(buf + 14), buf + 16, (u32)(n - 16));
@@ -2679,7 +2861,8 @@ static void start(void) {
     BOOL pending;
     InitOnceBeginInitialize(&once, 0, &pending, NULL);
     if (!pending) return;
-    configure();
+    configure_backend();
+    if (net_backend) { net_backend->start(); InitOnceComplete(&once,0,NULL); return; }
     if (configured) {
 #ifdef _WIN32
         WSADATA wsa;
@@ -2752,6 +2935,7 @@ int net_peer_quality(NetPeerQ *out, int max) {
 
 void net_status(char *out, size_t n) {
     start();
+    if (net_backend) { net_backend->status(out,n); return; }
     if (!configured) { if (n) out[0] = 0; return; }
     if (reject_text[0] && !joined) { snprintf(out, n, "Netplay: %s%s%s", reject_text, reject_detail[0] ? "\n" : "", reject_detail); return; }
     if (lan_mode && !joined && lan_state != NET_LAN_FOUND) { snprintf(out, n, "Netplay: looking for a room on this network..."); return; }

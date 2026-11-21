@@ -181,12 +181,13 @@ int main(int argc, char **argv) {
         uint8_t old[16] = {RBN_MSG_HELLO, 0, 1, 0};
         if (!rbn_hello_parse(old, sizeof old, &g) || g.version != 1) { fprintf(stderr, "FAIL: a version 1 HELLO not told apart\n"); return 1; }
     }
-    {   /* the delay from the round trip: 1 on a home network, one more each 30 ms rounded, at most 5 */
-        static const struct { double rtt; int d; } k[] = {{0, 1}, {3, 1}, {14.9, 1}, {15, 2}, {44.9, 2}, {45, 3}, {48, 3}, {74.9, 3}, {75, 4}, {105, 5}, {900, 5}, {-1, 1}};
+    {   /* the delay from the round trip: 1 on a home network, one more each 30 ms rounded, at most 8 */
+        static const struct { double rtt; int d; } k[] = {{0, 1}, {3, 1}, {14.9, 1}, {15, 2}, {44.9, 2}, {45, 3}, {48, 3}, {74.9, 3}, {75, 4}, {105, 5}, {165, 7}, {900, 8}, {-1, 1}};
         for (unsigned i = 0; i < sizeof k / sizeof *k; i++)
             if (rbn_delay_for_rtt(k[i].rtt) != k[i].d) { fprintf(stderr, "FAIL: delay for %.1f ms is %d, not %d\n", k[i].rtt, rbn_delay_for_rtt(k[i].rtt), k[i].d); return 1; }
-        /* (SSBU_RB_NET=online's: under 15 ms 1; else the one-way trip in frames, less one, from 2 to 4) */
-        static const struct { double rtt; int d; } o[] = {{0, 1}, {14.9, 1}, {15, 2}, {30, 2}, {40, 2}, {50, 2}, {83, 2}, {84, 2}, {100, 2}, {116, 2}, {117, 3}, {150, 4}, {300, 4}, {-1, 1}};
+        /* (SSBU_RB_NET=online's: under 15 ms 1; else the one-way trip in frames, less one up to 100 ms one way, from 2 to 9) */
+        static const struct { double rtt; int d; } o[] = {{0, 1}, {14.9, 1}, {15, 2}, {30, 2}, {40, 2}, {50, 2}, {83, 2}, {84, 2}, {100, 2}, {116, 2}, {117, 3}, {150, 4},
+                                                          {199, 5}, {200, 6}, {240, 7}, {300, 9}, {900, 9}, {-1, 1}};
         for (unsigned i = 0; i < sizeof o / sizeof *o; i++)
             if (rbn_online_delay_for_rtt(o[i].rtt) != o[i].d) { fprintf(stderr, "FAIL: online delay for %.1f ms is %d, not %d\n", o[i].rtt, rbn_online_delay_for_rtt(o[i].rtt), o[i].d); return 1; }
     }
@@ -250,6 +251,67 @@ int main(int argc, char **argv) {
         if (rbn_parse(b, n, &g)) { fprintf(stderr, "FAIL: runs past the count accepted%c", 10); return 1; }
         b[RBN_HEAD] = 0;
         if (rbn_parse(b, n, &g)) { fprintf(stderr, "FAIL: a run of 0 frames accepted%c", 10); return 1; }
+        /* (version 14) the behind bit rides in the runs byte: it comes back, and the pads with it */
+        for (int bh = 0; bh < 2; bh++) {
+            m.behind = bh;
+            n = rbn_build(b, sizeof b, &m);
+            if (!n || !rbn_parse(b, n, &g) || g.behind != bh || g.count != m.count || memcmp(g.pads, m.pads, sizeof m.pads)) {
+                fprintf(stderr, "FAIL: PADS with behind %d round trip%c", bh, 10); return 1;
+            }
+        }
+        m.behind = 0;
+    }
+    {   /* pace: late past RBN_PACE_LATE_MS; behind once the mean of a full enough span is over RBN_PACE_BEHIND_MS; the verdict */
+        RbnPace p; rbn_pace_reset(&p);   /* (behind: the mean of a full enough span over RBN_PACE_BEHIND_MS) */
+        for (int k = 0; k < RBN_PACE_SPAN / 2 - 1; k++) rbn_pace_frame(&p, 40);
+        if (rbn_pace_behind(&p)) { fprintf(stderr, "FAIL: pace behind before half a span was counted%c", 10); return 1; }
+        rbn_pace_frame(&p, 40);
+        if (!rbn_pace_behind(&p)) { fprintf(stderr, "FAIL: pace not behind with every frame late%c", 10); return 1; }
+        for (int k = 0; k < RBN_PACE_SPAN; k++) rbn_pace_frame(&p, k % 2 ? 19 : 14.5);   /* (half late, mean 16.75: a healthy PC at the frame period) */
+        if (rbn_pace_behind(&p) || p.nlate != RBN_PACE_SPAN / 2) { fprintf(stderr, "FAIL: pace behind at half late, mean on the period (%d)%c", p.nlate, 10); return 1; }
+        for (int k = 0; k < RBN_PACE_SPAN; k++) rbn_pace_frame(&p, k % 2 ? 22 : 16.7);   /* (mean 19.35: slow) */
+        if (!rbn_pace_behind(&p)) { fprintf(stderr, "FAIL: pace not behind at a mean of 19 ms%c", 10); return 1; }
+        for (int k = 0; k < RBN_PACE_SPAN; k++) rbn_pace_frame(&p, k == 7 ? 900 : 15);   /* (one stall, clamped: the mean stays under) */
+        if (rbn_pace_behind(&p)) { fprintf(stderr, "FAIL: pace behind after one stall%c", 10); return 1; }
+        for (int k = 0; k < RBN_PACE_SPAN; k++) rbn_pace_frame(&p, RBN_PACE_FRAME_MS + 1.0);   /* (a frame's jitter is on time) */
+        if (rbn_pace_behind(&p) || p.nlate) { fprintf(stderr, "FAIL: pace late within the margin%c", 10); return 1; }
+        for (int k = 0; k < RBN_PACE_SPAN; k++) rbn_pace_frame(&p, 24.3);   /* (the one-PC slow window) */
+        if (!rbn_pace_behind(&p)) { fprintf(stderr, "FAIL: pace not behind at 24 ms%c", 10); return 1; }
+        if (rbn_pace_verdict(0.9, 0, 0.6, 0) != RBN_VERDICT_OURS || rbn_pace_verdict(0, 0.9, 0.6, 0) != RBN_VERDICT_PEER ||
+            rbn_pace_verdict(0.5, 0.5, 0.6, 0) != RBN_VERDICT_BOTH || rbn_pace_verdict(0.1, 0.1, 0.5, 0.1) != RBN_VERDICT_LINK ||
+            rbn_pace_verdict(0.1, 0.1, 0.5, 0.4) != RBN_VERDICT_CATCH || rbn_pace_verdict(0.9, 0, 0.5, 0.4) != RBN_VERDICT_OURS ||
+            rbn_pace_verdict(0.1, 0.1, 0.99, 0.4) != RBN_VERDICT_FULL ||
+            rbn_pace_verdict(0.9, 0, 0.99, 0) != RBN_VERDICT_FULL || rbn_pace_verdict(0, 0.9, 0.96, 0) != RBN_VERDICT_FULL) { fprintf(stderr, "FAIL: pace verdicts%c", 10); return 1; }
+        printf("pace: late, behind and verdicts as expected\n");
+    }
+    {   /* the time sync's fractional slowing (rbn_sync_extra_ms): a game 2 frames ahead gives back half its lead over the next
+         * RBN_TS_EVERY frames, a game behind does nothing, one within 2 ms does nothing, and the samples' outliers don't count */
+        static const struct { int32_t diff, outlier; double want; } cases[] = {
+            {4, 0, 2 * 1000.0 / 60 / 2 / RBN_TS_EVERY}, {-4, 0, 0}, {0, 0, 0}, {4, 60, 2 * 1000.0 / 60 / 2 / RBN_TS_EVERY}, {40, 0, RBN_TS_MAX_MS}};
+        for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+            rbn_reset(2, 0, 2); rbn_sync_reset();
+            for (int i = 0; i < 30; i++) rbn_sync_sample(1, cases[k].diff + (i == 7 ? cases[k].outlier : 0), 0);
+            double total = 0, first = rbn_sync_extra_ms(RBN_TS_EVERY, 1000.0 / 60);
+            total += first;
+            for (uint32_t f = RBN_TS_EVERY + 1; f < 2 * RBN_TS_EVERY; f++) total += rbn_sync_extra_ms(f, 1000.0 / 60);
+            if (first < cases[k].want - 1e-6 || first > cases[k].want + 1e-6 || (cases[k].want > 0 && total < first * (RBN_TS_EVERY - 1))) {
+                fprintf(stderr, "FAIL: time sync case %zu: %.4f ms a frame (want %.4f), %.2f ms in all%c", k, first, cases[k].want, total, 10); return 1;
+            }
+        }
+        printf("time sync: a game ahead slowed by fractions of a frame, one behind or level not at all\n");
+        rbn_reset(2, 0, 2); rbn_sync_reset();
+    }
+    {   /* the stick hysteresis (rbn_local): a stick wavering by less than RBN_HYST sends the same value; the middle at once */
+        rbn_reset(2, 0, 0);
+        int16_t in[] = {10000, 10200, 9800, 10500, 11000, 300, -20000, -19900, 32767};
+        int16_t want[] = {10000, 10000, 10000, 10000, 11000, 0, -20000, -20000, 32767};
+        for (int i = 0; i < (int)(sizeof in / sizeof in[0]); i++) {
+            RbnPad p = {0}; p.lx = in[i];
+            RbnPad got = rbn_local((uint32_t)i + 1, p);
+            if (got.lx != want[i]) { fprintf(stderr, "FAIL: stick hysteresis at %d: %d, want %d%c", i, got.lx, want[i], 10); return 1; }
+        }
+        printf("stick hysteresis: small wavers kept at the value sent\n");
+        rbn_reset(2, 0, 2);
     }
     sabotage = argc > 2 && !strcmp(argv[2], "norollback");
     slow = argc > 2 && !strcmp(argv[2], "slow");

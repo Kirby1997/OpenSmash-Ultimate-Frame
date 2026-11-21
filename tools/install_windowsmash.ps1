@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Sets WindowSmash up on this PC in one go: what "Install WindowSmash.bat" runs.
+Sets WindowSmash up on this PC in one go: what "OpenSmash.exe" runs.
 
 .DESCRIPTION
 Steps, each skipped when it is already done, so running it again carries on where it stopped:
@@ -80,6 +80,15 @@ Do not look for a newer WindowSmash (the updated installer is started with it).
 .PARAMETER UpdateOnly
 Only bring this folder to the newest commit, then stop. The launcher's Update button uses this so
 setup steps (compiler, game files, build) are not run again.
+.PARAMETER PythonOnly
+Only step 3: WindowSmash's own Python (deps\venv) and its packages, then stop. The launcher uses this
+for an install from before deps\venv, one whose venv no longer runs, and after an update.
+.PARAMETER BuildAfterUpdate
+Check build prerequisites and incrementally rebuild the game from the folders saved by the last build.
+Does not update source files, open the setup wizard, or rebuild the launcher.
+.PARAMETER LauncherOnly
+Only put the latest release's OpenSmash.exe here (checked against its published SHA-256), then stop. Used when
+rebuilding the launcher with the .NET SDK failed. Exit 0 when OpenSmash.exe is the release's afterwards.
 .PARAMETER BuildTools
 For the compiler, install the Visual Studio Build Tools rather than download it into deps\.
 .PARAMETER Rebuild
@@ -105,6 +114,9 @@ param(
     [int]$Jobs,
     [switch]$NoUpdate,
     [switch]$UpdateOnly,
+    [switch]$PythonOnly,
+    [switch]$BuildAfterUpdate,
+    [switch]$LauncherOnly,
     [switch]$BuildTools,
     [switch]$Rebuild,
     [switch]$AcceptLicense
@@ -134,6 +146,16 @@ $VsBuildToolsId = 'Microsoft.VisualStudio.BuildTools'   # Visual Studio 2026's; 
 $VsBuildToolsUrl = 'https://visualstudio.microsoft.com/visual-cpp-build-tools/'
 $VsInstallerDir = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
 $NeedDiskGb = 60
+# (SSBU_DATA_IN_PLACE=1, tools\build_game.py: the game's data is read from the game's own file, so the 14.5 GB
+# decrypted copy is never written)
+# (the launcher's "Save disk space", config\save_disk.txt = on: the build as with SSBU_DATA_IN_PLACE=1 and
+# SSBU_TRIM=c,nsp,map, where neither is set by hand - tools\build_game.py save_disk_apply reads the same file)
+$SaveDiskFile = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'config') 'save_disk.txt'
+if ((Test-Path -LiteralPath $SaveDiskFile) -and ([string](Get-Content -LiteralPath $SaveDiskFile -TotalCount 1 -ErrorAction SilentlyContinue)).Trim() -match '^(?i)on') {
+    if ($null -eq $env:SSBU_DATA_IN_PLACE) { $env:SSBU_DATA_IN_PLACE = '1' }
+    if ($null -eq $env:SSBU_TRIM) { $env:SSBU_TRIM = 'c,nsp,map' }
+}
+if ([string]$env:SSBU_DATA_IN_PLACE -eq '1') { $NeedDiskGb = 45 }
 $MinRamGb = 4        # (below 8 GB the build runs one compile at a time and the game is told to use less memory)
 $LowRamGb = 8
 $FirewallRuleName = 'WindowSmash (ssbu.exe)'
@@ -143,10 +165,73 @@ $UserAgent = 'WindowSmash-installer'
 # compression.zstd raises an error instead of answering no (there is no compression package).
 # (No double quotes in it: Windows PowerShell hands them to programs unescaped.)
 $ZstdCheck = 'import sys, importlib.util as u; sys.exit(0 if u.find_spec(''zstandard'') or (sys.version_info >= (3, 14) and u.find_spec(''compression.zstd'')) else 1)'
+# tomllib is Python 3.11's; on 3.10 the tomli package (paramconfig.py reads mods' config_param.toml with it)
+$TomlCheck = 'import sys, importlib.util as u; sys.exit(0 if sys.version_info >= (3, 11) or u.find_spec(''tomli'') else 1)'
 # where updates come from: this repository's branch
 $RepoOwner = 'OpenSmash-Ultimate'
 $RepoName = 'OpenSmash-Ultimate'
 $UpdateBranch = 'main'
+# Update channel (issue #329): by default a copy follows the newest versioned release (releases/latest); following main
+# commit by commit is opt-in, for testers: OPENSMASH_UPDATE_CHANNEL=main or the word main in tools\update_channel.txt.
+# With no release published yet, main is followed as before.
+function Get-UpdateRef {
+    $ch = [string]$env:OPENSMASH_UPDATE_CHANNEL
+    if (-not $ch) { $f = Join-Path $Root 'tools\update_channel.txt'; if (Test-Path -LiteralPath $f) { $ch = (Get-Content -LiteralPath $f -Raw).Trim() } }
+    if ($ch -eq 'main') { return $UpdateBranch }
+    if ($Script:UpdateRef) { return $Script:UpdateRef }   # (asked once a run: the launcher's refresh asks again)
+    # Main only when there is no release (the API's 404). GitHub not answering (no network, the API's hourly limit) is
+    # not main: github.com's releases/latest page is asked instead, and with no answer at all $null, "not known", so a
+    # copy of the release is neither updated to main nor compared with it (Discord "Can't update", 2026-11-18).
+    $rel = Invoke-Api "$RepoApi/releases/latest"
+    if ($rel.Ok -and $rel.Data.tag_name) { $Script:UpdateRef = [string]$rel.Data.tag_name; return $Script:UpdateRef }
+    if (-not $rel.Ok -and $rel.NotFound) { $Script:UpdateRef = $UpdateBranch; return $Script:UpdateRef }
+    $page = Get-LatestReleaseFromPage
+    if ($page.Tag) { $Script:UpdateRef = $page.Tag; return $Script:UpdateRef }
+    if ($page.NoRelease) { $Script:UpdateRef = $UpdateBranch; return $Script:UpdateRef }
+    $Script:UpdateRefProblem = if ($rel.Ok) { 'its answer names no release' } else { [string]$rel.Error }
+    return $null
+}
+$Script:UpdateRef = $null
+$Script:UpdateRefProblem = ''
+
+function Read-ReleaseTagFromUrl {
+    <# The tag a github.com/<owner>/<repo>/releases/tag/<tag> address names, or $null. #>
+    param([string]$Url)
+    if (-not $Url) { return $null }
+    $m = [regex]::Match($Url, '/releases/tag/([^/?#]+)')
+    if ($m.Success) { $t = [uri]::UnescapeDataString($m.Groups[1].Value).Trim(); if ($t) { return $t } }
+    return $null
+}
+
+function Get-LatestReleaseFromPage {
+    <# github.com's own releases/latest page (outside the API's hourly limit): it redirects to the latest release's tag,
+       or to the release list when there is none. @{Tag; NoRelease}; both empty when it did not answer. #>
+    $client = $null
+    try {
+        Add-Type -AssemblyName System.Net.Http
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds(30)
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', $UserAgent)
+        $req = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Head), "https://github.com/$RepoOwner/$RepoName/releases/latest"
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) { return @{ Tag = $null; NoRelease = $false } }
+        $final = [string]$resp.RequestMessage.RequestUri.AbsoluteUri
+        $tag = Read-ReleaseTagFromUrl $final
+        if ($tag) { return @{ Tag = $tag; NoRelease = $false } }
+        return @{ Tag = $null; NoRelease = ($final -match "/$RepoOwner/$RepoName/releases/?$") }
+    } catch {
+        return @{ Tag = $null; NoRelease = $false }
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+}
+# Commits only the old WindowSmash repository has (its last two: the README saying it moved, 2026-11-03), each with the
+# last commit both repositories share. A WindowSmash copy updated to one of them is that shared commit plus a README, so
+# it updates from there; without this GitHub does not know the commit here and the copy never updates (#418).
+$ForeignCommits = @{
+    '598d05240fc146f7184b3450653e2eec2ee97312' = '8025b483b0443adb5668395eca31f9250e8c8efb'
+    '3d5ba9095bf4a2c0d146df31adec0d59b8337bbb' = '8025b483b0443adb5668395eca31f9250e8c8efb'
+}
 $RepoApi = "https://api.github.com/repos/$RepoOwner/$RepoName"
 $SourceVersionFile = 'tools\source_version.txt'   # "<commit> <date>": GitHub's ZIP download fills it in
 
@@ -157,6 +242,22 @@ function Read-SourceVersion {
     param([string]$Text)
     if (-not $Text) { return $null }
     $m = [regex]::Match($Text, '(?<![0-9a-fA-F])([0-9a-fA-F]{40})(?![0-9a-fA-F])')
+    if ($m.Success) { return $m.Groups[1].Value.ToLower() }
+    return $null
+}
+
+function Resolve-ForeignCommit {
+    <# The commit to update from: a WindowSmash-only commit ($ForeignCommits) as the shared one it stands for, else itself. #>
+    param([string]$Commit)
+    if ($Commit -and $ForeignCommits.ContainsKey($Commit.ToLower())) { return $ForeignCommits[$Commit.ToLower()] }
+    return $Commit
+}
+
+function Read-PublishedSha256 {
+    <# The SHA-256 a release's "<hash>  OpenSmash.exe" file names, in lower case, or $null. #>
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $m = [regex]::Match($Text, '^\s*([0-9a-fA-F]{64})(?![0-9a-fA-F])')
     if ($m.Success) { return $m.Groups[1].Value.ToLower() }
     return $null
 }
@@ -189,7 +290,7 @@ function Get-RemovedPaths {
 }
 
 function Get-LobbyLine {
-    <# The line of an online_server.txt that Play SSBU.bat reads (the first that is not empty or a
+    <# The line of an online_server.txt that OpenSmash.exe reads (the first that is not empty or a
        comment): @{Address; Code; Index}, or $null. #>
     param([string[]]$Lines)
     for ($i = 0; $i -lt $Lines.Count; $i++) {
@@ -503,6 +604,14 @@ function Invoke-Download {
     Write-Info ("  {0:N1} MB" -f ((Get-Item -LiteralPath $Dest).Length / 1MB))
 }
 
+function Expand-Zip {
+    <# Expand-Archive, unpacking into a folder that is not there yet, about ten times faster: Windows
+       PowerShell 5.1's took 12.6 s for WindowSmash's ZIP (1,541 files), this 1.1 s. #>
+    param([string]$Zip, [string]$Dest)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Dest)
+}
+
 function Get-Json {
     param([string]$Url)
     return Invoke-RestMethod -Uri $Url -UseBasicParsing -Headers @{ 'User-Agent' = $UserAgent; 'Accept' = 'application/vnd.github+json' }
@@ -510,13 +619,25 @@ function Get-Json {
 
 function Get-Text {
     param([string]$Url)
-    return (Invoke-WebRequest -Uri $Url -UseBasicParsing -Headers @{ 'User-Agent' = $UserAgent }).Content
+    $c = (Invoke-WebRequest -Uri $Url -UseBasicParsing -Headers @{ 'User-Agent' = $UserAgent }).Content
+    # (Windows PowerShell hands a file GitHub serves as application/octet-stream, such as a release's .sha256, as bytes)
+    if ($c -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($c) }
+    return [string]$c
+}
+
+function Get-Sha256 {
+    <# A file's SHA-256 in lower case. .NET's, not Get-FileHash: Windows PowerShell started from PowerShell 7 (a pwsh
+       terminal, GitHub's runners) inherits a module path where Get-FileHash is not found. #>
+    param([string]$File)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($File)
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLower() }
+    finally { $stream.Dispose(); $sha.Dispose() }
 }
 
 function Test-FileSha256 {
     param([string]$File, [string]$Expected)
-    $actual = (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash.ToLower()
-    return ($actual -eq $Expected.ToLower())
+    return ((Get-Sha256 $File) -eq $Expected.ToLower())
 }
 
 function Invoke-Python {
@@ -645,7 +766,7 @@ function Update-FromZip {
     $zip = Join-Path $work "WindowSmash-$New.zip"
     Invoke-Download "https://codeload.github.com/$RepoOwner/$RepoName/zip/$New" $zip "WindowSmash $($New.Substring(0, 7))"
     $extract = Join-Path $work 'extract'
-    Expand-Archive -LiteralPath $zip -DestinationPath $extract
+    Expand-Zip $zip $extract
     $top = @(Get-ChildItem -LiteralPath $extract -Directory)
     if ($top.Count -ne 1 -or -not (Test-Path -LiteralPath (Join-Path $top[0].FullName 'tools\recomp.py'))) {
         throw 'The downloaded WindowSmash does not look complete; nothing was changed. Run this again.'
@@ -678,7 +799,7 @@ function Update-FromZip {
                 if ($merged -ne $mine) { [IO.File]::WriteAllText($to, $merged); $changed++ }
                 continue
             }
-            if ((Test-Path -LiteralPath $to -PathType Leaf) -and (Get-FileHash -LiteralPath $to).Hash -eq (Get-FileHash -LiteralPath $from).Hash) { continue }
+            if ((Test-Path -LiteralPath $to -PathType Leaf) -and (Get-Sha256 $to) -eq (Get-Sha256 $from)) { continue }
             $dir = Split-Path -Parent $to
             if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
             Copy-Item -LiteralPath $from -Destination $to -Force
@@ -697,6 +818,7 @@ function Update-FromZip {
     [IO.File]::WriteAllText((Join-Path $Root $SourceVersionFile), "$New $NewDate`n")
     Remove-Item -LiteralPath $work -Recurse -Force
     Write-Info "updated: $changed file(s) replaced, $gone removed; your game files, settings, save and builds are as they were"
+    Write-Host "__OPENSMASH_SOURCE__ $New"   # (the launcher's proof that the update finished, without asking GitHub again)
     return $true
 }
 
@@ -711,12 +833,31 @@ function Step-Update {
         Write-Warn "To get the newest, download the ZIP again from https://github.com/$RepoOwner/$RepoName"
         return $false
     }
+    $mapped = Resolve-ForeignCommit $local
+    if ($mapped -ne $local) { Write-Info "this copy ($($local.Substring(0, 7))) is the old WindowSmash repository's; it updates as $($mapped.Substring(0, 7)), the commit both share" }
+    $local = $mapped
     $short = $local.Substring(0, 7)
-    $head = Invoke-Api "$RepoApi/commits/$UpdateBranch"
+    # (v0.5.0) the launcher follows a release channel: OPENSMASH_UPDATE_COMMIT names the release's commit, which
+    # this folder is brought to whether it is ahead or behind (a channel switch can go back), never the branch's tip
+    $release = [string]$env:OPENSMASH_UPDATE_COMMIT
+    if ($release -match '^[0-9a-fA-F]{40}$') {
+        $release = $release.ToLowerInvariant()
+        if ($release -eq $local) { Write-Info "at the release already ($short)"; return $false }
+        $rel = Invoke-Api "$RepoApi/commits/$release"
+        $relDate = (Get-Date).ToString('yyyy-MM-dd')
+        if ($rel.Ok) { $relDate = ([string]$rel.Data.commit.committer.date).Substring(0, 10) }
+        Write-Info "the release's sources: $short to $($release.Substring(0, 7)) ($relDate)"
+        if ($DryRun) { Write-Would "download them and replace this folder's files (your game files, settings, save and builds stay)"; return $false }
+        return (Update-FromZip $local $release $relDate)
+    }
+    $ref = Get-UpdateRef
+    if (-not $ref) { Write-Warn "could not ask GitHub which release is the latest ($($Script:UpdateRefProblem)); going on with this one"; return $false }
+    $head = Invoke-Api "$RepoApi/commits/$ref"
     if (-not $head.Ok) { Write-Warn "could not ask GitHub for a newer version ($($head.Error)); going on with this one"; return $false }
     $headSha = [string]$head.Data.sha
     $headDate = ([string]$head.Data.commit.committer.date).Substring(0, 10)
-    if ($headSha -eq $local) { Write-Info "up to date ($short, $headDate)"; return $false }
+    # (for the launcher: the commit this copy now is, as checked here; it then needs no second question to GitHub)
+    if ($headSha -eq $local) { Write-Info "up to date ($short, $headDate)"; Write-Host "__OPENSMASH_SOURCE__ $headSha"; return $false }
     $cmp = Invoke-Api "$RepoApi/compare/$($local)...$($headSha)"
     if (-not $cmp.Ok) {
         if ($cmp.NotFound) { Write-Info "this copy ($short) is not on GitHub (made on this PC, or from a branch since deleted): not updating" }
@@ -724,9 +865,9 @@ function Step-Update {
         return $false
     }
     switch (Get-UpdateDecision $cmp.Data.status) {
-        'current' { Write-Info "up to date ($short)"; return $false }
-        'newer' { Write-Info "this copy ($short) is newer than GitHub's $($UpdateBranch): not updating"; return $false }
-        'diverged' { Write-Info "this copy ($short) comes from another branch than $($UpdateBranch): not updating"; return $false }
+        'current' { Write-Info "up to date ($short)"; Write-Host "__OPENSMASH_SOURCE__ $headSha"; return $false }
+        'newer' { Write-Info "this copy ($short) is newer than GitHub's $(Get-UpdateRef): not updating"; return $false }
+        'diverged' { Write-Info "this copy ($short) comes from another branch than $(Get-UpdateRef): not updating"; return $false }
         'update' { }
         default { Write-Warn "GitHub's answer ($($cmp.Data.status)) was not understood: not updating"; return $false }
     }
@@ -817,29 +958,85 @@ function Step-CheckPc {
 }
 
 # ---- step 3: Python -----------------------------------------------------------------------------------
-function Find-Python {
-    <# The first Python 3.10+ that runs: deps\python, python on the PATH, the py launcher. #>
+function Test-VenvBase {
+    <# Whether deps\venv may be made from this Python (its version text and python.exe): 3.10 up to $PythonMinor,
+       the newest the tools are tested on (and the one deps\python gets), and not the Microsoft Store's, whose
+       files Windows redirects. #>
+    param([string]$Version, [string]$Exe)
+    if (-not (Test-PythonVersionText $Version)) { return $false }
+    $m = [regex]::Match($Version, '(\d+)\.(\d+)')
+    if ([version]("{0}.{1}" -f $m.Groups[1].Value, $m.Groups[2].Value) -gt [version]$PythonMinor) { return $false }
+    return ($Exe -and $Exe -notmatch '\\WindowsApps\\')
+}
+
+function Find-OwnPython {
+    <# WindowSmash's own Python, if it runs: deps\venv, else deps\python (a PC that had no Python). #>
+    $venvPy = Join-Path $Root 'deps\venv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venvPy) {
+        $v = Test-PythonCommand @($venvPy)
+        if ($v) { return @{ Command = @($venvPy); Version = $v } }
+        if ($DryRun) { Write-Would 'remove deps\venv, which does not run any more, and make it again'; return $null }
+        Write-Warn 'deps\venv does not run any more (the Python it was made from was removed?): making it again'
+        Remove-Item -LiteralPath (Join-Path $Root 'deps\venv') -Recurse -Force
+    }
     $own = Join-Path $Root 'deps\python\python.exe'
-    $candidates = @(, @($own)) + @(, @('python')) + @(, @('py', '-3'))
+    if (Test-Path -LiteralPath $own) {
+        $v = Test-PythonCommand @($own)
+        if ($v) { return @{ Command = @($own); Version = $v } }
+    }
+    return $null
+}
+
+function Find-VenvBase {
+    <# The Python deps\venv is made from: the newest of 3.10 to $PythonMinor the py launcher has, else python on
+       the PATH when it is one of those. #>
+    $top = [int]($PythonMinor.Split('.')[1])
+    $candidates = @(for ($m = $top; $m -ge 10; $m--) { , @('py', "-3.$m") }) + @(, @('python'))
     foreach ($c in $candidates) {
-        if ($c[0] -eq $own -and -not (Test-Path -LiteralPath $own)) { continue }
         $v = Test-PythonCommand $c
-        if ($v) { return @{ Command = $c; Version = $v } }
+        if (-not $v) { continue }
+        $pre = @()
+        if ($c.Count -gt 1) { $pre = @($c[1..($c.Count - 1)]) }
+        $old = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $exe = ((& $c[0] @pre '-c' 'import sys; print(sys.executable)' 2>$null) | Out-String).Trim()
+        $ErrorActionPreference = $old
+        if (Test-VenvBase $v $exe) { return @{ Command = $c; Version = $v; Exe = $exe } }
     }
     return $null
 }
 
 function Test-PythonPackages {
-    <# Whether the chosen Python has what the tools import (pycryptodomex, and a zstd). #>
+    <# Whether the chosen Python has what the tools import (pycryptodomex, a zstd, and a TOML reader). #>
     $r = Get-PythonOutput @('-c', 'import Cryptodome')
     if ($r.Code -ne 0) { return $false }
     $r = Get-PythonOutput @('-c', $ZstdCheck)
+    if ($r.Code -ne 0) { return $false }
+    $r = Get-PythonOutput @('-c', $TomlCheck)
     return ($r.Code -eq 0)
 }
 
 function Step-Python {
     Write-Step '[3/10] Python'
-    $found = Find-Python
+    # The tools' packages go into a Python of WindowSmash's own (deps\venv, as on Linux and macOS), not into one
+    # installed on the PC: pip there can need administrator rights, and the launcher could later pick another.
+    $found = Find-OwnPython
+    if (-not $found) {
+        $base = Find-VenvBase
+        if ($base -and $DryRun) { Write-Would "make deps\venv from Python $($base.Version) ($($base.Exe)) and install requirements.txt there"; return }
+        if ($base) {
+            Write-Info "Python $($base.Version) ($($base.Exe)): making deps\venv from it; the packages go there, not into that Python"
+            $venv = Join-Path $Root 'deps\venv'
+            $old = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & $base.Exe -m venv $venv | Out-Host
+            $ErrorActionPreference = $old
+            $venvPy = Join-Path $venv 'Scripts\python.exe'
+            $v = Test-PythonCommand @($venvPy)
+            if (-not $v) { throw "deps\venv could not be made from Python $($base.Version) (see above)." }
+            $found = @{ Command = @($venvPy); Version = $v }
+        }
+    }
     if ($found) {
         $Script:Python = $found.Command
         Write-Info "Python $($found.Version): $($found.Command -join ' ')"
@@ -856,7 +1053,7 @@ function Step-Python {
         $zip = Join-Path $Root "deps\python-$($pick.Version)-embed-amd64.zip"
         if (-not (Test-Path -LiteralPath $zip)) { Invoke-Download $pick.Url $zip "Python $($pick.Version)" }
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
-        Expand-Archive -LiteralPath $zip -DestinationPath $target
+        Expand-Zip $zip $target
         Remove-Item -LiteralPath $zip -Force
         # the embeddable Python ignores site-packages until its ._pth file says "import site"
         foreach ($pth in Get-ChildItem -LiteralPath $target -Filter 'python3*._pth') {
@@ -891,6 +1088,10 @@ function Step-Python {
         Write-Info 'installing the packages (requirements.txt)'
         if ((Invoke-Python @('-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))) -ne 0) { throw 'pip could not install the packages (see above).' }
         if (-not (Test-PythonPackages)) { throw 'The packages are still missing after pip install.' }
+    }
+    # deps\venv is the tools' Python only from here on, with its packages in (the launcher and find_python.bat look for this file)
+    if (-not $DryRun -and $Script:Python.Count -eq 1 -and $Script:Python[0] -eq (Join-Path $Root 'deps\venv\Scripts\python.exe')) {
+        [IO.File]::WriteAllText((Join-Path $Root 'deps\venv\.opensmash-ready'), 'packages installed')
     }
     # (#173) The Python chosen, as a full path, for the launcher and the game's Mods menu (build\python_path.txt):
     # where only "py -3" finds it, plain "python" is Windows' Store shortcut and every tools\os_mods.py call failed.
@@ -1078,7 +1279,7 @@ function Step-Sdl3 {
     }
     $extract = Join-Path $Root 'deps\SDL3-extract'
     if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
-    Expand-Archive -LiteralPath $zip -DestinationPath $extract
+    Expand-Zip $zip $extract
     $inner = Get-ChildItem -LiteralPath $extract -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'include\SDL3\SDL_gamepad.h') } | Select-Object -First 1
     if (-not $inner) { throw "$($asset.Name) does not hold include\SDL3 as expected." }
     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
@@ -1126,6 +1327,15 @@ function Get-DetectedFolders {
     if ($saved.ContainsKey('firmware')) { $firmware = $saved['firmware'] } else { $firmware = Resolve-FirstExisting $c.Firmware $hasNca }
     if ($saved.ContainsKey('game')) { $game = $saved['game'] } else { $game = Resolve-FirstExisting $c.Game $exists }
     return @{ Game = $game; Keys = $keys; Firmware = $firmware }
+}
+
+function Get-UpdateBuildAnswers {
+    <# The last build's folders, for the build after an update. One that is not there any more is left out: a game
+       already set up needs none of them, and build_game.py names the folder itself when a step still needs it.
+       (It used to stop the update with "Open Setup", which the launcher has no way to open: issue #340.) #>
+    $folders = Get-DetectedFolders
+    $there = { param($p) if ($p -and (Test-Path -LiteralPath $p -PathType Container)) { $p } else { $null } }
+    return @{ Game = (& $there $folders.Game); Keys = (& $there $folders.Keys); Firmware = (& $there $folders.Firmware) }
 }
 
 function Test-KeysFolder {
@@ -1427,23 +1637,38 @@ function Test-FirewallRule {
 function Step-Extras {
     param([hashtable]$Answers)
     Write-Step '[8/10] Shortcut and firewall'
-    $lnk = Join-Path (Get-DesktopFolder) 'OpenSmash.lnk'
+    # OpenSmash-Launcher (the launcher) and OpenSmash-Ultimate (--play: the game without the launcher), both with
+    # OpenSmash's icon; an older OpenSmash / Play SSBU shortcut on the desktop to this folder's exe is replaced.
+    $desk = Get-DesktopFolder
     $launcher = Join-Path $Root 'OpenSmash.exe'
+    $shortcuts = @(
+        @{ Name = 'OpenSmash-Launcher.lnk'; Args = ''; What = 'OpenSmash launcher: play, settings and mods' },
+        @{ Name = 'OpenSmash-Ultimate.lnk'; Args = '--play'; What = 'Super Smash Bros. Ultimate (OpenSmash), without the launcher' }
+    )
     if (-not $Answers.Shortcut) {
         Write-Info 'shortcut: not wanted'
-    } elseif (Test-Path -LiteralPath $lnk) {
-        Write-Info "shortcut: already on the desktop"
     } elseif ($DryRun) {
-        Write-Would "put $lnk on the desktop, pointing at OpenSmash.exe"
+        Write-Would "put OpenSmash-Launcher and OpenSmash-Ultimate on the desktop, pointing at OpenSmash.exe"
     } else {
         $ws = New-Object -ComObject WScript.Shell
-        $s = $ws.CreateShortcut($lnk)
-        $s.TargetPath = $launcher
-        $s.WorkingDirectory = $Root
-        $s.IconLocation = $launcher + ',0'
-        $s.Description = 'OpenSmash'
-        $s.Save()
-        Write-Info "shortcut: $lnk"
+        foreach ($old in @('OpenSmash.lnk', 'Play SSBU.lnk')) {
+            $p = Join-Path $desk $old
+            try {
+                if ((Test-Path -LiteralPath $p) -and ($ws.CreateShortcut($p).TargetPath -ieq $launcher)) { Remove-Item -LiteralPath $p -Force }
+            } catch { }
+        }
+        foreach ($sc in $shortcuts) {
+            $lnk = Join-Path $desk $sc.Name
+            if (Test-Path -LiteralPath $lnk) { Write-Info "shortcut: already on the desktop ($($sc.Name))"; continue }
+            $s = $ws.CreateShortcut($lnk)
+            $s.TargetPath = $launcher
+            $s.Arguments = $sc.Args
+            $s.WorkingDirectory = $Root
+            $s.IconLocation = $launcher + ',0'
+            $s.Description = $sc.What
+            $s.Save()
+            Write-Info "shortcut: $lnk"
+        }
     }
     $exe = Join-Path $Root 'build\ssbu.exe'
     if (-not $Answers.Firewall) {
@@ -1468,26 +1693,63 @@ function Step-Extras {
 function Step-Build {
     param([hashtable]$Answers)
     Write-Step '[9/10] Build the game'
-    $build = @((Join-Path $Root 'tools\build_game.py'), '--game', $Answers.Game, '--keys', $Answers.Keys)
+    $build = @((Join-Path $Root 'tools\build_game.py'))
+    if ($Answers.Game) { $build += @('--game', $Answers.Game) }   # (none: the update's build, whose saved folder is gone)
+    if ($Answers.Keys) { $build += @('--keys', $Answers.Keys) }
     if ($Answers.Firmware) { $build += @('--firmware', $Answers.Firmware) } else { $build += '--no-firmware' }   # (none: the open fonts)
     if ($Jobs) { $build += @('--jobs', "$Jobs") }
     if ($SkipBuild) { $build += '--prepare-only' }
+    # the standard Skyline plugins are fetched and listed BEFORE the game is built (build_game.py plugins_first), so main's
+    # C is written once with their hooks in it: about 1 minute of plugin build after the game instead of 16.
+    # SSBU_PLUGINS_FIRST=0: after the build, as before.
+    $build += '--std-plugins'
+    $buildStart = Get-Date
+    # (v0.5.0) an install of a release (the launcher names its tag in OPENSMASH_RELEASE_TAG): the game as a library
+    # of its own (ssbu_game.dll) and the release's prebuilt runtime in place of the one built here (tools/runtime_fetch.py),
+    # so a runtime fix of a later release needs no compile of the game
+    $releaseTag = [string]$env:OPENSMASH_RELEASE_TAG
+    $gameDll = $releaseTag -match '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$'
+    if ($gameDll) { $build += '--game-dll' }
+    if ($BuildAfterUpdate) { $build += '--no-input' }   # (the launcher's: nobody to answer a folder question there)
     if ($DryRun) { Write-Would ('run: ' + ($Script:Python -join ' ') + ' ' + ($build -join ' ')); return $false }
     # (an update of the mod manager or other tools only: the game is as it was, no build - its own check)
     if (-not $Rebuild -and -not $SkipBuild -and (Test-Path (Join-Path $Root 'build\ssbu.exe')) -and
         (Invoke-Python @((Join-Path $Root 'tools\skyline.py'), 'uptodate')) -eq 0) {
-        Write-Info 'nothing that goes into the game changed: no build (run OpenSmash.exe again to build it anyway)'
+        Write-Info 'nothing that goes into the game changed: no build'
+        # (DLC put in the game folder since the last build: build_game.py's step 7 reads it, quickly and without a
+        # build, since the game reads its DLC list when it starts. Once a build had found none, nothing ran step 7
+        # again: issue #340. Not being able to read it leaves the game as it was.)
+        if ($Answers.Game) {
+            Write-Info 'the game folder is read again, for DLC added since the last build'
+            if ((Invoke-Python ($build + '--prepare-only')) -ne 0) {
+                Write-Warn 'the game folder could not be read again (see above): DLC added since the last build is not turned on yet; the game is as it was'
+            }
+        }
+        # (the online files beside the program - Discord's; Epic Online Services' too before 0.5.0 - on every update,
+        # built or not: a fetch that failed at the last build was otherwise never tried again, issue #389. Nothing is
+        # downloaded when they are current.)
+        if ((Invoke-Python @((Join-Path $Root 'tools\online_files.py'), (Join-Path $Root 'build'))) -ne 0) {
+            Write-Warn 'the Discord files could not be fetched (see above): no Discord sign-in in the game until they are; Play in the launcher tries again'
+        }
         return $true
     }
     if ($SkipBuild) { Write-Info 'the program, fonts, data, DLC and fighters; not the build itself (-SkipBuild)' }
     else { Write-Info 'the program, fonts, data, DLC and fighters, then the build: 30 minutes to a few hours' }
     if ((Invoke-Python $build) -ne 0) { throw 'The build stopped (the message above says why). Fix that, then run OpenSmash.exe again: it carries on where it stopped.' }
     if ($SkipBuild) { return $false }
+    if ($gameDll -and (Test-Path (Join-Path $Root 'build\ssbu_game.dll'))) {
+        if ((Invoke-Python @((Join-Path $Root 'tools\runtime_fetch.py'), $releaseTag)) -ne 0) {
+            Write-Warn "the prebuilt runtime of $releaseTag could not be put in place (see above): the runtime built here stays"
+        }
+    }
     # the community's Skyline plugins that mods need (ARCropolis, Smashline 2, One Slot Effects, nro_hook),
     # from their own releases (tools\std_plugins.py checks each), then built into the game with the mods' own
     Write-Info 'the standard Skyline plugins: fetched from their releases and built in (tools\std_plugins.py, tools\skyline.py)'
     Write-Warn 'building the plugins into the game can take a while: do not start the game until this window says Done'
-    if ((Invoke-Python @((Join-Path $Root 'tools\std_plugins.py'), 'fetch')) -ne 0) {
+    $stamp = Join-Path $Root 'dump\skyline\plugins_first.txt'
+    $fetched = (Test-Path -LiteralPath $stamp) -and ((Get-Item -LiteralPath $stamp).LastWriteTime -ge $buildStart)
+    if ($fetched) { Write-Info 'the plugins were fetched before the build: only their check in the game is left' }
+    if (-not $fetched -and (Invoke-Python @((Join-Path $Root 'tools\std_plugins.py'), 'fetch')) -ne 0) {
         Write-Warn 'the plugins could not be fetched (see above): mods that need them will not work until this runs again'
     } else {
         $sky = @((Join-Path $Root 'tools\skyline.py'), 'build')
@@ -1497,13 +1759,84 @@ function Step-Build {
     return $true
 }
 
+function Step-StaleShaders {
+    <# After a build, or none needed: prepared shaders under other SPIR-V names than the built game reads (a change
+       of SHADER_CACHE_SPV_VERSION or of glslang, in this update or one before) lose dump\shadercache\complete.txt,
+       so the launcher offers Prepare Shaders again (tools\shader_aot.py forget_stale_marker). #>
+    Invoke-Python @((Join-Path $Root 'tools\shader_aot.py'), '--forget-stale') | Out-Null
+}
+
+function Invoke-UpdateGameBuild {
+    Write-Info 'Checking the game build after the source update'
+    Step-CheckPc
+    Step-Python
+    $compiler = Test-Compiler
+    if (-not $compiler.Ok) {
+        throw ("The game compiler is not ready. Open Setup to repair the compiler, then retry the update.`n" + $compiler.Output)
+    }
+    Step-Sdl3
+    Step-Codecs
+    if (Step-Build (Get-UpdateBuildAnswers)) { Step-StaleShaders }
+    Write-Host 'The game is current.' -ForegroundColor Green
+}
+
 # ---- step 10: shaders --------------------------------------------------------------------------------------------
+function Update-LauncherExe {
+    <# OpenSmash.exe never replaced itself: v0.3.0-alpha.1 and alpha.2 have no updater, alpha.3 and later fetch the
+       source only, and only a PC with the .NET SDK rebuilds one. So, on a copy that follows the versioned releases,
+       an OpenSmash.exe that is not the latest release's is swapped for it here, checked against the SHA-256 published
+       beside it. A running exe can be renamed but not overwritten: the old one becomes OpenSmash.exe.old (deleted on
+       the next run) and the new one is used from the next start. $true when it was swapped; $Script:LauncherIsRelease
+       says whether OpenSmash.exe is the release's afterwards (swapped or already), for -LauncherOnly. #>
+    $Script:LauncherIsRelease = $false
+    $exe = Join-Path $Root 'OpenSmash.exe'
+    $old = "$exe.old"
+    if (Test-Path -LiteralPath $old) {
+        # the one swapped out last time: deleted once it no longer runs; put back if a swap stopped half-way
+        try {
+            if (Test-Path -LiteralPath $exe -PathType Leaf) { Remove-Item -LiteralPath $old -Force }
+            else { Move-Item -LiteralPath $old -Destination $exe }
+        } catch { }
+    }
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $Root '.git')) { return $false }   # (a checkout builds its own: tools\build_launcher.ps1)
+    # A launcher that rebuilds itself after an update (this one, on a PC with the .NET SDK) says so: it is left to that.
+    # Older launchers never rebuild, so without the word the release's is put here, SDK or not.
+    if ($env:OPENSMASH_LAUNCHER_REBUILDS -eq '1') { return $false }
+    $tag = Get-UpdateRef
+    if (-not $tag) { Write-Warn "launcher: GitHub did not say which release is the latest ($($Script:UpdateRefProblem)); this one stays"; return $false }
+    if ($tag -eq $UpdateBranch) { return $false }   # following main, or no release yet: nothing published to compare with
+    $base = "https://github.com/$RepoOwner/$RepoName/releases/download/$([uri]::EscapeDataString($tag))"
+    $tmp = "$exe.download"
+    try {
+        $sum = Read-PublishedSha256 (Get-Text "$base/OpenSmash.exe.sha256")
+        if (-not $sum) { Write-Warn "launcher: $tag publishes no OpenSmash.exe checksum; this one stays"; return $false }
+        if ((Get-Sha256 $exe) -eq $sum) { Write-Info "launcher: OpenSmash.exe is $($tag)'s"; $Script:LauncherIsRelease = $true; return $false }
+        if ($DryRun) { Write-Would "replace OpenSmash.exe with $($tag)'s"; return $false }
+        Invoke-Download "$base/OpenSmash.exe" $tmp "the OpenSmash launcher of $tag"
+        if (-not (Test-FileSha256 $tmp $sum)) { throw 'its SHA-256 differs from the published one' }
+        Move-Item -LiteralPath $exe -Destination $old -Force
+        try { Move-Item -LiteralPath $tmp -Destination $exe -Force }
+        catch { Move-Item -LiteralPath $old -Destination $exe -Force; throw }
+        Write-Info "launcher: OpenSmash.exe is now $($tag)'s. Close OpenSmash and open it again to use it."
+        $Script:LauncherIsRelease = $true
+        return $true
+    } catch {
+        Write-Warn "launcher: OpenSmash.exe could not be updated ($($_.Exception.Message)); the one here stays"
+        if (Test-Path -LiteralPath $tmp) { try { Remove-Item -LiteralPath $tmp -Force } catch { } }
+        return $false
+    }
+}
+
 function Step-Launcher {
     # The OpenSmash launcher (OpenSmash.exe): the one window for playing, settings and mods. Built here when the
     # .NET 8 SDK is on this PC (tools\build_launcher.ps1); otherwise taken from the organisation's latest release,
-    # checked against the SHA-256 published beside it. Without either, Play SSBU.bat keeps its own window.
+    # checked against the SHA-256 published beside it. Without either, OpenSmash.exe keeps its own window.
     $exe = Join-Path $Root 'OpenSmash.exe'
-    if (Test-Path -LiteralPath $exe) { Write-Info 'launcher: OpenSmash.exe is here'; return }
+    if (Test-Path -LiteralPath $exe) {
+        if (-not (Update-LauncherExe)) { Write-Info 'launcher: OpenSmash.exe is here' }
+        return
+    }
     if ($DryRun) { Write-Would 'build or download OpenSmash.exe (the launcher)'; return }
     if (Get-Command dotnet -ErrorAction SilentlyContinue) {
         try { & (Join-Path $Root 'tools\build_launcher.ps1'); if (Test-Path -LiteralPath $exe) { Write-Info 'launcher: OpenSmash.exe built'; return } }
@@ -1515,19 +1848,18 @@ function Step-Launcher {
         if ($sum -notmatch '^[0-9a-f]{64}$') { throw 'no checksum published' }
         $tmp = "$exe.download"
         Invoke-Download "$base/OpenSmash.exe" $tmp 'the OpenSmash launcher'
-        $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
-        if ($got -ne $sum) { Remove-Item -LiteralPath $tmp -Force; throw "its SHA-256 differs from the published one" }
+        if (-not (Test-FileSha256 $tmp $sum)) { Remove-Item -LiteralPath $tmp -Force; throw "its SHA-256 differs from the published one" }
         Move-Item -LiteralPath $tmp -Destination $exe -Force
         Write-Info 'launcher: OpenSmash.exe downloaded and checked'
     } catch {
-        Write-Warn "launcher: not available ($($_.Exception.Message)); Play SSBU.bat opens its own window instead (Build Launcher.bat builds OpenSmash.exe with the .NET 8 SDK)"
+        Write-Warn "launcher: not available ($($_.Exception.Message)); OpenSmash.exe opens its own window instead (tools\build_launcher.ps1 builds OpenSmash.exe with the .NET 8 SDK)"
     }
 }
 
 function Step-Shaders {
     param([hashtable]$Answers, [bool]$Built)
     Write-Step '[10/10] Shaders'
-    if (-not $Answers.Shaders) { Write-Info 'not wanted (launchers\Prepare Shaders.bat does it any time)'; return }
+    if (-not $Answers.Shaders) { Write-Info 'not wanted (`python tools\shader_aot.py` does it any time)'; return }
     if ($DryRun -or -not $Built) { Write-Would 'ask low, medium, or high, then compile the shaders in this window'; return }
     Write-Host ''
     Write-Host 'How hard should this PC work on the shaders? low keeps it usable, high finishes sooner.'
@@ -1540,7 +1872,7 @@ function Step-Shaders {
     Write-Info "shader priority: $choice"
     $py = @((Join-Path $Root 'tools\shader_aot.py'), '--priority', $choice)
     if ((Invoke-Python $py) -ne 0) {
-        Write-Warn 'the shader compile stopped (see above). What finished is kept; launchers\Prepare Shaders.bat runs the rest.'
+        Write-Warn 'the shader compile stopped (see above). What finished is kept; `python tools\shader_aot.py` runs the rest.'
     }
 }
 
@@ -1552,11 +1884,29 @@ function Main {
         Write-Host "  $Root"
         if ($DryRun) { Write-Host '  dry run: saying what each step would do, doing nothing' -ForegroundColor DarkGray }
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        if ($PythonOnly) {
+            Step-Python
+            return 0
+        }
+        if ($BuildAfterUpdate) {
+            Invoke-UpdateGameBuild
+            return 0
+        }
+        if ($LauncherOnly) {
+            # A launcher rebuild that failed (no or a broken .NET SDK, "dotnet publish failed"): the release's OpenSmash.exe
+            # instead, as for a PC without the SDK. 0 when OpenSmash.exe is the release's now (swapped or already was).
+            $env:OPENSMASH_LAUNCHER_REBUILDS = ''
+            [void](Update-LauncherExe)
+            if ($Script:LauncherIsRelease) { return 0 }
+            return 1
+        }
         $updated = Step-Update
         if ($UpdateOnly) {
             # the launcher only asked for the files: do not run the rest of setup.
+            $swapped = Update-LauncherExe
             if ($updated) { Write-Host 'Updated.' -ForegroundColor Green }
-            else { Write-Host 'Nothing to update.' }
+            elseif (-not $swapped) { Write-Host 'Nothing to update.' }
+            if ($swapped) { Write-Host 'The launcher was updated too: close OpenSmash and open it again.' -ForegroundColor Green }
             return 0
         }
         if ($updated) {
@@ -1577,8 +1927,19 @@ function Main {
         $answers = Step-GameFiles
         Step-Extras $answers
         $built = Step-Build $answers
+        if ($built) { Step-StaleShaders }
+        # the launcher before the shaders (an hour or more on some PCs): the game can be played while they compile,
+        # and the launcher can go on with them later (Prepare Shaders). OPENSMASH_SHADERS_FIRST=1: the old order.
+        $shadersFirst = [string]$env:OPENSMASH_SHADERS_FIRST -eq '1'
+        if (-not $shadersFirst) {
+            Step-Launcher
+            if ($built -and $answers.Shaders -and -not $DryRun) {
+                Write-Host ''
+                Write-Host 'The game is ready: it can be played from now on (OpenSmash.exe). The shaders below only make its first matches smoother; closing this window keeps what is compiled.' -ForegroundColor Green
+            }
+        }
         Step-Shaders $answers $built
-        Step-Launcher
+        if ($shadersFirst) { Step-Launcher }
         Write-Host ''
         if ($built) {
             Write-Host 'Done. Start the game with OpenSmash.exe, or the shortcut on the desktop.' -ForegroundColor Green

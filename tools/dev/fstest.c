@@ -30,6 +30,7 @@
 #define FS_TEST
 #include <stdarg.h>
 #include "../../runtime/hle_fs.c"
+char rt_romfs_warning[320];   /* (host.c's, not linked here) */
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
@@ -37,13 +38,20 @@
 /* ---- what hle_fs.c needs from the rest of the runtime --------------------------------- */
 /* (hle_skyline.c and host.c: no Skyline plugins here, no exported symbols to hook) */
 void skyline_load_plugins(Cpu *c) { (void)c; }
+static int texture_snapshots;
+void mod_refresh_file_opened(const char *path) { (void)path; texture_snapshots++; }
 void native_mods_load(void) {}   /* (hle_native_mods.c: no mods here) */
 void select_screen_install(void) {}   /* (hle_select_screen.c: no game here) */
 int skyline_provides(const char *path) { (void)path; return 0; }
 void skyline_mods_mounted(void) {}
 u64 rt_symbol(const char *name) { (void)name; return 0; }
 int kernel_rb_switch(void) { return 0; }   /* (kernel.c: rollback's savestates, off) */
+int (*kernel_rb_io_enter)(void *kthread, const char *what);   /* (kernel.c: the rollback barrier's hooks, unset here) */
+void (*kernel_rb_io_leave)(int token);
 void rb_guest_writing(void *p, u64 n) { (void)p; (void)n; }   /* (hle_rb_state.c: the state map, off) */
+#ifdef _WIN32
+void rb_map_install(void) {}   /* (hle_rb_map.c: the rollback state map's allocator hooks, off) */
+#endif
 u64 rt_native(GuestFn *fn, const char *name) { (void)fn; (void)name; return 0; }
 u64 rt_hook_function(u64 target, u64 replace) { (void)target; (void)replace; return 0; }
 const char *rt_data_dir;
@@ -56,6 +64,7 @@ void rt_fatal(const char *fmt, ...) {
     exit(3);
 }
 void account_save_id(u64 uid[2]) { (void)uid; }
+int save_language_wanted(const char **code) { if (code) *code = NULL; return -1; }   /* (hle_env.c: no language chosen) */
 
 static int failures, checks;
 static int is(const char *text, const char *want) { return text && !strcmp(text, want); }   /* (NULL: not there) */
@@ -232,6 +241,13 @@ static void setup(const char *dir) {
     snprintf(text, sizeof text, "%s\n0\n", path);
     f = CreateFileA(cfg, GENERIC_WRITE, SHARE_ALL, NULL, CREATE_ALWAYS, 0, NULL);
     if (f != INVALID_HANDLE_VALUE) { write_all(f, text, strlen(text)); CloseHandle(f); }
+    /* and two unconfirmed blocks beside it (tools/update.py's report: notes, then each block and what it holds) */
+    static const char unverified[] = "# 16 KB blocks of the updated RomFS whose bytes are unconfirmed\n# 2 blocks, 1 inside files the game loads\n"
+                                     "613780 0x257650000\n  loaded file data.arc+0x2575f0000 (0x9c40 bytes): path hash40 0x2a0b1c2d3e\n"
+                                     "613781 0x257654000\n  listed no file: padding between files\n";
+    snprintf(path, sizeof path, "%s/romfs.unverified.txt", data);
+    f = CreateFileA(path, GENERIC_WRITE, SHARE_ALL, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) { write_all(f, unverified, sizeof unverified - 1); CloseHandle(f); }
 }
 
 /* ---- in one process --------------------------------------------------------------------- */
@@ -239,6 +255,9 @@ static void checks_all(DWORD live_pid) {
     char path[1024];
     u64 h = 0;
     ready();
+
+    /* romfs.unverified.txt beside romfs.cfg: one line for every crash report (host.c), its blocks counted */
+    CHECK(strstr(rt_romfs_warning, "game data: 2 blocks of 16 KB unconfirmed") == rt_romfs_warning, "the unconfirmed blocks' line: %s", rt_romfs_warning);
 
     /* the RomFS and the cache: no journal */
     CHECK(call(hle__ZN2nn2fs8MountRomEPKcPvm, G("rom"), 0, 0, 0, 0) == 0, "MountRom");
@@ -250,13 +269,28 @@ static void checks_all(DWORD live_pid) {
         rb_fs = 1;
         CHECK(t_open("rom:/hello.txt", OPEN_READ, &h1) == 0, "a RomFS file opened");
         u64 mark = fs_rb_mark();
-        CHECK(!fs_rb_closed_since(mark), "rollback: nothing closed since the mark");
+        CHECK(!fs_rb_closed_since(mark, NULL), "rollback: nothing closed since the mark");
         CHECK(t_open("rom:/hello.txt", OPEN_READ, &h2) == 0, "a RomFS file opened again");
         t_close(h2);
-        CHECK(!fs_rb_closed_since(mark), "rollback: a handle opened and closed after the mark counted");
+        CHECK(!fs_rb_closed_since(mark, NULL), "rollback: a handle opened and closed after the mark counted");
         t_close(h1);
-        CHECK(fs_rb_closed_since(mark), "rollback: a handle open at the mark and closed since not seen");
-        CHECK(!fs_rb_closed_since(fs_rb_mark()), "rollback: a close before the mark counted");
+        CHECK(fs_rb_closed_since(mark, NULL), "rollback: a handle open at the mark and closed since not seen");
+        CHECK(!fs_rb_closed_since(fs_rb_mark(), NULL), "rollback: a close before the mark counted");
+        /* (SSBU_RB_FS_ROM) a RomFS handle kept in the state (fs_rb_save) and closed since does not refuse its load, and the
+         * load puts it back in its slot; one opened after the state is freed by the load */
+        u64 h3 = 0, h4 = 0;
+        CHECK(t_open("rom:/hello.txt", OPEN_READ, &h3) == 0, "a RomFS file opened for a state");
+        u64 mark3 = fs_rb_mark();
+        void *fs = fs_rb_save();
+        CHECK(fs != NULL, "rollback: the open RomFS handle kept in the state");
+        t_close(h3);
+        CHECK(get_handle(h3) == NULL, "the RomFS handle closed");
+        CHECK(!fs_rb_closed_since(mark3, fs), "rollback: a RomFS handle kept in the state counted as gone");
+        CHECK(t_open("rom:/hello.txt", OPEN_READ, &h4) == 0, "a RomFS file opened after the state");
+        CHECK(fs_rb_load(fs, mark3) >= 1 && get_handle(h3) != NULL, "rollback: the RomFS handle put back by the load");
+        CHECK(h4 == h3 || get_handle(h4) == NULL, "rollback: the RomFS handle opened after the state freed by the load");
+        t_close(h3);
+        free(fs);
         rb_fs = -1;
     }
     CHECK(call(hle__ZN2nn2fs17MountCacheStorageEPKc, G("cache"), 0, 0, 0, 0) == 0, "MountCacheStorage");
@@ -264,6 +298,15 @@ static void checks_all(DWORD live_pid) {
     snprintf(path, sizeof path, "%s/cache/c.bin", folder);
     CHECK(h_get(path) && is(h_get(path), "cached"), "the cache is written directly: %s", h_get(path) ? h_get(path) : "(none)");
     CHECK(commit("cache") == 0 && commit("nothing") == R_NOT_MOUNTED, "Commit of the cache, and of no mount");
+
+    CHECK(t_write("cache:/loaded.nutexb", 0, "pixels", 1, NULL) == 0, "texture fixture");
+    u64 texture = 0;
+    CHECK(t_open("cache:/loaded.nutexb", OPEN_READ, &texture) == 0 && texture_snapshots == 0, "opening a texture is not loading pixels");
+    char pixels[6]; Handle *texture_handle = get_handle(texture);
+    CHECK(read_at(texture_handle, 0, pixels, 2) == 2 && texture_snapshots == 0, "header probe must not allocate a snapshot");
+    CHECK(read_at(texture_handle, 4, pixels, 2) == 2 && texture_snapshots == 0, "footer probe must not allocate a snapshot");
+    CHECK(read_at(texture_handle, 0, pixels, 6) == 6 && texture_snapshots == 1, "full texture load must allocate its snapshot");
+    t_close(texture);
 
     /* the save: writes are the session's until Commit */
     h_put("a.bin", "AAAA-old"); h_put("b.bin", "BBBB-old"); h_put("d1\\c.bin", "CCCC-old"); h_put("d2\\e.bin", "EEEE-old");

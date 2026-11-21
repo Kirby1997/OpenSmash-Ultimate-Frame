@@ -1,4 +1,7 @@
 """tools/shader_aot.py's scan of data.arc for GPU programs. Made-up containers; no game files."""
+import os
+import importlib.util
+import runpy
 from pathlib import Path
 import sys
 import types
@@ -8,6 +11,21 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import shader_aot  # noqa: E402
+
+
+@unittest.skipUnless(importlib.util.find_spec('zstandard'), 'needs the zstandard fallback package')
+class ZstdFallbackTests(unittest.TestCase):
+    def test_complete_and_every_truncated_frame(self):
+        import zstandard
+        # Force the pre-3.14 path even on CI's Python with compression.zstd.
+        with mock.patch.dict(sys.modules, {'compression': None, 'compression.zstd': None}):
+            decompress = runpy.run_path(str(ROOT / 'tools/shader_aot.py'))['zstd_decompress']
+        original = b'synthetic shader container, with no game data'
+        frame = zstandard.ZstdCompressor().compress(original)
+        self.assertEqual(decompress(frame), original)
+        for end in range(len(frame)):
+            with self.subTest(bytes=end), self.assertRaises(zstandard.ZstdError):
+                decompress(frame[:end])
 
 
 class EmptyFilesTests(unittest.TestCase):
@@ -130,6 +148,49 @@ class ScanTests(unittest.TestCase):
         self.assertEqual([(stage, len(blob), sorted(pairs)) for stage, blob, pairs in programs], [(0, 0xE0, []), (1, 0x1D0, [0])])
 
 
+class WarmShadersTests(unittest.TestCase):
+    """Prepare Shaders' last step on Linux draws the cache through DXVK (build-linux/ssbu). On Windows
+    the game draws it for AMD's driver itself, when it closes."""
+
+    def warm(self, exists=True, rewarm=False, code=0):
+        proc = mock.Mock()
+        proc.stdout = iter(["[warm] drawing\n", "a line the console does not need\n"])
+        proc.wait.return_value = code
+        popen = mock.Mock(return_value=proc)
+        with mock.patch.object(shader_aot, 'LINUX', True), \
+             mock.patch.object(shader_aot.os.path, 'isfile', return_value=exists), \
+             mock.patch.object(shader_aot, '_POPEN_PRIORITY', {}), \
+             mock.patch.object(shader_aot.subprocess, 'Popen', popen), \
+             mock.patch('builtins.print') as printed:
+            ok = shader_aot.warm_shaders('/a/cache', rewarm)
+        return ok, popen, printed
+
+    def printed(self, printed):
+        return ' '.join(str(call.args[0]) for call in printed.call_args_list)
+
+    def test_linux_uses_the_linux_program(self):
+        ok, popen, printed = self.warm()
+        self.assertTrue(ok)
+        self.assertEqual(popen.call_args.args[0],
+                         [os.path.join(str(ROOT), 'build-linux', 'ssbu'), '--warm-shaders', '/a/cache'])
+        self.assertIn('DXVK/Vulkan', self.printed(printed))
+
+    def test_rewarm_is_passed_to_the_pass(self):
+        _ok, popen, _printed = self.warm(rewarm=True)
+        self.assertEqual(popen.call_args.args[0][-1], 'rewarm')
+
+    def test_a_missing_program_is_reported_not_started(self):
+        ok, popen, printed = self.warm(exists=False)
+        self.assertFalse(ok)
+        popen.assert_not_called()
+        self.assertIn('skipped', self.printed(printed))
+
+    def test_a_failed_pass_keeps_the_cache(self):
+        ok, _popen, printed = self.warm(code=1)
+        self.assertFalse(ok)
+        self.assertIn('not warmed', self.printed(printed))
+
+
 class RomfsImageReadErrorTests(unittest.TestCase):
     def test_the_error_names_its_file(self):
         import nca
@@ -150,6 +211,31 @@ class RomfsImageReadErrorTests(unittest.TestCase):
                 image.read(8, 8)
             self.assertEqual((caught.exception.errno, caught.exception.filename), (5, str(src)))
             real.close()
+
+
+class DriverWarmTests(unittest.TestCase):
+    """After Prepare Shaders, the game exe's --warm-shaders pass starts in the background (AMD's driver compiles at a
+    shader's first draw): with the cache, "auto" for the card, at idle priority, in the repository."""
+
+    def test_starts_the_game_exe_with_auto(self):
+        with mock.patch.object(shader_aot, 'LINUX', False), mock.patch.object(shader_aot.os.path, 'exists', lambda p: True), \
+                mock.patch.dict(shader_aot.os.environ, {}, clear=False), mock.patch.object(shader_aot.subprocess, 'Popen') as popen:
+            shader_aot.os.environ.pop('SSBU_SHADER_WARM', None)
+            p = shader_aot.start_driver_warm('C:/tree/dump/shadercache', game='C:/repo/build/ssbu.exe')
+        self.assertIs(p, popen.return_value)
+        args, kw = popen.call_args
+        self.assertEqual(args[0], ['C:/repo/build/ssbu.exe', '--warm-shaders', 'C:/tree/dump/shadercache', 'auto'])
+        self.assertEqual(kw['cwd'], shader_aot.ROOT)
+
+    def test_nothing_without_the_exe_on_linux_or_when_turned_off(self):
+        with mock.patch.object(shader_aot.subprocess, 'Popen') as popen:
+            with mock.patch.object(shader_aot, 'LINUX', True):
+                self.assertIsNone(shader_aot.start_driver_warm('c'))
+            with mock.patch.object(shader_aot, 'LINUX', False), mock.patch.object(shader_aot.os.path, 'exists', lambda p: False):
+                self.assertIsNone(shader_aot.start_driver_warm('c'))
+            with mock.patch.object(shader_aot, 'LINUX', False), mock.patch.dict(shader_aot.os.environ, {'SSBU_SHADER_WARM': '0'}):
+                self.assertIsNone(shader_aot.start_driver_warm('c', game='x'))
+        popen.assert_not_called()
 
 
 if __name__ == '__main__':

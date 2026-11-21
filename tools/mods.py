@@ -311,6 +311,14 @@ def extract(archive, into):
             if os.path.exists(seven):
                 r = subprocess.run([seven, "x", "-y", f"-o{into}", archive], capture_output=True, text=True)
                 break
+    if r.returncode and os.name != "nt":   # (Linux's GNU tar reads neither .7z nor .rar: the unpackers it may have)
+        for cmd in unpack_commands(archive, into):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+            except OSError:
+                continue
+            if not r.returncode:
+                break
     if r.returncode and archive.lower().endswith(".7z"):   # (no 7-Zip: py7zr, which the installer adds)
         try:
             import py7zr
@@ -325,8 +333,33 @@ def extract(archive, into):
                 z.extractall(into)
             return
     if r.returncode:
-        hint = " (install 7-Zip, from 7-zip.org, to open .7z and .rar files)" if os.name == "nt" else ""
+        if os.name == "nt":
+            hint = " (install 7-Zip, from 7-zip.org, to open .7z and .rar files)"
+        elif sys.platform == "darwin":
+            hint = ""
+        else:
+            hint = (" (install 7-Zip or bsdtar from your distribution - the 7zip, p7zip or libarchive-tools package - to "
+                    "open .7z and .rar files)")
         raise Error(f"cannot unpack {os.path.basename(archive)}{hint}: {(r.stderr or r.stdout).strip()[-400:]}")
+
+
+# (unpacker, its arguments) for .7z, .rar and the rest where tar can't: libarchive's bsdtar, 7-Zip (7zz: 7-Zip's own
+# Linux build, 7z / 7za: p7zip's), unrar, The Unarchiver's unar
+UNPACKERS = (("bsdtar", ["-xf", "{archive}", "-C", "{into}"]), ("7zz", ["x", "-y", "-o{into}", "{archive}"]),
+             ("7z", ["x", "-y", "-o{into}", "{archive}"]), ("7za", ["x", "-y", "-o{into}", "{archive}"]),
+             ("unrar", ["x", "-o+", "-y", "{archive}", "{into}/"]), ("unar", ["-f", "-q", "-o", "{into}", "{archive}"]))
+
+
+def unpack_commands(archive, into, which=shutil.which):
+    """The commands that may unpack `archive` into `into`, of the unpackers installed (unrar only for a .rar)."""
+    out = []
+    for name, args in UNPACKERS:
+        if name == "unrar" and not archive.lower().endswith(".rar"):
+            continue
+        exe = which(name)
+        if exe:
+            out.append([exe] + [a.format(archive=archive, into=into) for a in args])
+    return out
 
 
 def safe_name(name):
@@ -352,16 +385,33 @@ def install(tree, archive, name=None, meta=None):
             raise Error(f"{os.path.basename(archive)} has no files laid out as the game's (fighter/, ui/, sound/, stream;/ ...) "
                         "and no Skyline plugin (.nro)")
         base = safe_name(name or os.path.splitext(os.path.basename(archive))[0])
+        on = []   # (the game files of each of this pack's mods turned on)
         for root in roots:
             leaf = os.path.basename(root)
             label = base if len(roots) == 1 else f"{base} - {safe_name(leaf)}"
             final, k = label, 2
+            old = None
             while os.path.exists(os.path.join(tree.mods, final)):
+                # (the same download again - the same file, by its checksum: it replaces the copy there,
+                # turned on or off as it was, not a second copy "(2)" turned on beside it, the two
+                # changing the same files: Knuckles' 914)
+                if (meta or {}).get("md5") and state["mods"].get(final, {}).get("md5") == meta["md5"]:
+                    old = state["mods"][final]
+                    shutil.rmtree(os.path.join(tree.mods, final))
+                    break
                 final, k = f"{label} ({k})", k + 1
             inner = {os.path.normcase(r) for r in nested_roots(root, roots)}
             shutil.copytree(root, os.path.join(tree.mods, final),
                             ignore=lambda d, names: [n for n in names if os.path.normcase(os.path.join(d, n)) in inner])
-            entry = {"enabled": True}
+            # (a pack's choices - a moveset's Battle and Modern styles, one victory pose of several: a
+            # mod most of whose files another of the pack's turned-on mods changes too is the other's
+            # alternative, installed turned off; an add-on shares few. Both on, the later one's files
+            # won, and both movesets' plugins ran on the one fighter)
+            files = {p.lower() for p, _src in mod_files(os.path.join(tree.mods, final))}
+            choice = files and any(len(files & other) >= len(files) / 2 for other in on)
+            entry = {"enabled": old.get("enabled", True) if old else not choice}
+            if entry["enabled"]:
+                on.append(files)
             entry.update(meta or {})
             state = tree.load()
             state["mods"][final] = entry
@@ -2008,6 +2058,7 @@ def apply(tree, log=print):
     lines = vanilla_cfg(tree)
     state = tree.load()
     on = [n for n in state["order"] if state["mods"].get(n, {}).get("enabled")]
+    prcxml_redirects(tree, on, log)
     if os.path.exists(os.path.join(tree.root, "skyline", "plugins", "libarcropolis.nro")):
         # the real ARCropolis is among the standard plugins: it reads the turned-on mods from
         # sd:/ultimate/mods (runtime/hle_fs.c) as the game loads, so the game keeps its own data
@@ -2149,6 +2200,49 @@ def motion_list_text_unreadable(path):
     return any(len(re.findall(rf"^\s*{k}:", text, re.M)) < flags for k in ("unk_800", "unk_1000", "unk_2000"))
 
 
+COLOR_START = prc.hash40("color_start_index")
+UI_CHARA_ID = prc.hash40("ui_chara_id")
+CHARA_DB = ("ui", "param", "database", "ui_chara_db.prcxml")
+
+
+def prcxml_redirects(tree, on, log):
+    """The characters the turned-on mods add with their ui_chara_db.prcxml alone - no plugin, so no
+    CSK Collection call - on another fighter's extra costumes (Popple: Mario's c24-c31, its
+    color_start_index 24), into dump/skyline/prcxml_redirects.txt, a line each: the ui_chara hash40
+    and its first costume. runtime/hle_skyline.c adds them to the characters it redirects, as the
+    CSK Collection does on the console; without it such a character played its fighter's c00."""
+    found = {}
+    for name in on:
+        for root in find_roots(os.path.join(tree.mods, name)) or [os.path.join(tree.mods, name)]:
+            path = os.path.join(root, *CHARA_DB)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    kind, db = prc.read_xml(f.read())
+            except (prc.Error, ET.ParseError, ValueError) as e:
+                log(f"{name}: its {'/'.join(CHARA_DB)} could not be read ({e}): its characters keep costume 0")
+                continue
+            if kind != prc.STRUCT:
+                continue
+            for _key, (list_kind, entries) in db:
+                if list_kind != prc.LIST:
+                    continue
+                for entry_kind, entry in entries:
+                    if entry_kind != prc.STRUCT:
+                        continue
+                    fields = dict(entry)
+                    chara, start = fields.get(UI_CHARA_ID, (None, 0))[1], fields.get(COLOR_START, (None, 0))[1]
+                    if chara and start:
+                        found[chara] = start
+    path = os.path.join(tree.root, "dump", "skyline", "prcxml_redirects.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.writelines(f"{chara:#x} {start}\n" for chara, start in found.items())
+    if found:
+        log(f"{len(found)} character(s) of .prcxml files on their own costumes (prcxml_redirects.txt)")
+
+
 def hide_shadowed_sources(tree, on, log):
     """A mod that ships a file both whole and as ARCropolis' text source next to it - Knuckles'
     fighter/sonic/motion/body/c120/motion_list.bin and motion_list.yml - has ARCropolis build the
@@ -2208,8 +2302,8 @@ def select_screen(tree, on, table, folder, log):
     tiles and its own fighters fill 87, so past 4 new fighters its layout and table are made again for
     91 + their number of tiles, smaller tiles the more there are, into `folder` (the game's layout, or a
     turned-on mod's own copy of it, as the base; kept in dump/mods/select_screen and made again when
-    what it is made from changes). runtime/hle_select_screen.c sets up the tiles the game
-    leaves out. Nothing is made when a mod brings its own arrangement (it is used as it is) or the
+    what it is made from changes). runtime/hle_select_screen.c hides the tiles past 91 the rows
+    do not use. Nothing is made when a mod brings its own arrangement (it is used as it is) or the
     game's screen has room. [(data.arc path, file)] of the files made."""
     import css_layout
     extra, arranged = select_screen_count(tree, on)

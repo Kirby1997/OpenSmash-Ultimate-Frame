@@ -19,7 +19,7 @@ static int failures, checks;
 static void load_text(const char *text) {
     memset(&cfg, 0, sizeof cfg);
     cfg.keyboard_slot = 0; cfg.background = 1; cfg.rumble = 1;
-    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.invert = -1;
+    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.invert = cfg.def.dpad_moves = cfg.def.stick_taunts = -1;
     kb_defaults();
     char path[MAX_PATH], dir[MAX_PATH];
     GetTempPathA(sizeof dir, dir);
@@ -238,6 +238,59 @@ static void test_slots(void) {
     CHECK(devs[6].slot == 6 && devs[7].slot == 7 && devs[8].slot == -1, "eight players, then none: %d %d %d", devs[6].slot, devs[7].slot, devs[8].slot);
 }
 
+static void test_unit_pins(void) {
+    /* two pads that report one GUID (two PowerA GameCube controllers): each is claimed by its own unit */
+    char tag[12], pin[64];
+    Dev a = make_dev("pa", "", "\\\\?\\HID#A", "PowerA GC", "gamecube"), b = make_dev("pa", "", "\\\\?\\HID#B", "PowerA GC", "gamecube");
+    dev_path_tag(b.path, tag);
+    CHECK(strlen(tag) == 8, "a path tag is 8 hex digits: %s", tag);
+    dev_path_tag(a.path, pin);
+    CHECK(strcmp(tag, pin), "two paths, two tags");
+    snprintf(pin, sizeof pin, "path:%s", tag);
+    CHECK(dev_matches(&b, pin) && !dev_matches(&a, pin), "path:<tag> names one pad of two");
+    CHECK(!dev_matches(&b, "path:00000000") && !dev_matches(&b, "serial:x"), "other tokens do not match (no serial)");
+    Dev s1 = make_dev("pa", "SN1", "", "PowerA GC", "gamecube"), s2 = make_dev("pa", "SN2", "", "PowerA GC", "gamecube");
+    CHECK(dev_matches(&s1, "serial:sn1") && !dev_matches(&s2, "serial:SN1"), "serial:<serial> names one pad of two");
+    CHECK(!dev_matches(&a, "path:") && !dev_matches(&a, "serial:"), "empty tokens match nothing");
+    load_text("[players]\n1 = path:ffffffff\n");
+    CHECK(!dev_matches(&a, cfg.pin[0]), "a path nobody has");
+    snprintf(pin, sizeof pin, "[players]\n2 = path:%s\n", tag);
+    load_text(pin);
+    memset(devs, 0, sizeof devs);
+    nknown = 0;
+    CHECK(plug(0, a) == 0, "the unpinned twin: first free player");
+    CHECK(plug(1, b) == 1, "the pinned twin: its player");
+    devs[0].used = devs[1].used = 0;
+    CHECK(plug(0, b) == 1 && plug(1, a) == 0, "plugged in the other order: still each its own");
+    PadInfo info;
+    dev_info(&devs[0], &(Raw){0}, &info);
+    CHECK(!strncmp(info.pin, "path:", 5), "twins: the menu writes the unit: %s", info.pin);
+    devs[0].used = 0;
+    dev_info(&devs[1], &(Raw){0}, &info);
+    CHECK(!strcmp(info.pin, "pa"), "a lone pad: its GUID: %s", info.pin);
+    devs[0] = s1; devs[1] = s2;
+    dev_info(&devs[0], &(Raw){0}, &info);
+    CHECK(!strcmp(info.pin, "serial:SN1"), "twins with serials: the serial: %s", info.pin);
+    devs[0] = make_dev("pa", "0001", "\\\\?\\HID#A", "PowerA GC", "gamecube");
+    devs[1] = make_dev("pa", "0001", "\\\\?\\HID#B", "PowerA GC", "gamecube");
+    dev_info(&devs[0], &(Raw){0}, &info);
+    CHECK(!strncmp(info.pin, "path:", 5), "twins with one serial between them: the path: %s", info.pin);
+    { PadInfo i2; dev_info(&devs[1], &(Raw){0}, &i2);
+      CHECK(strcmp(info.unit, i2.unit) != 0, "twins with one serial: different units: %s / %s", info.unit, i2.unit); }
+    devs[0] = make_dev("pa", "A B;", "\\\\?\\HID#A", "PowerA GC", "gamecube");
+    devs[1] = make_dev("pa", "XY", "\\\\?\\HID#B", "PowerA GC", "gamecube");
+    dev_info(&devs[0], &(Raw){0}, &info);
+    CHECK(!strncmp(info.pin, "path:", 5), "a serial the ini cannot hold: the path: %s", info.pin);
+    /* a GUID pin for player 1 and a unit pin for player 2: the unit pin's pad is player 2 whichever is set up first */
+    dev_path_tag(b.path, tag);
+    snprintf(pin, sizeof pin, "[players]\n1 = pa\n2 = path:%s\n", tag);
+    load_text(pin);
+    memset(devs, 0, sizeof devs);
+    nknown = 0;
+    CHECK(plug(0, b) == 1, "the unit pin beats a GUID pin that also matches");
+    CHECK(plug(1, a) == 0, "and the other twin gets the GUID pin's player");
+}
+
 static void test_rumble(void) {
     load_text("[device default]\nrumble = 50\n");
     Dev d = make_dev("g", "", "", "Pad", "ps5");
@@ -393,6 +446,65 @@ static void test_axes(void) {
     CHECK(dev.trigger_top[0][0] == 255, "four in a row: the top is relearned: %d", dev.trigger_top[0][0]);
 }
 
+/* gc_switch = 1 (the default): the sticks as a Switch console scales them: counts from the centre over 56 (the C-stick 44),
+ * no dead zone, no growing reach; the triggers over 150 counts from rest. */
+static void test_axes_switch(void) {
+    Device dev = {.kind = KIND_ADAPTER, .first = 0};
+    UCHAR r[37] = {0x21};
+    UCHAR *p1 = r + 1;
+    p1[0] = 0;   /* unplugged first, so the next report is a plug-in (the triggers' rest is measured then) */
+    adapter_report(&dev, r, sizeof r);
+    p1[0] = 0x10; p1[3] = p1[4] = p1[5] = p1[6] = 128; p1[7] = p1[8] = 30;
+    for (int i = 0; i < 40; i++) adapter_report(&dev, r, sizeof r);
+    PadUsbAxes ua;
+    CHECK(padusb_axes(0, &ua) && ua.lo[0] == 56 && ua.hi[0] == 56 && ua.lo[2] == 44, "reach 56 / 44: %d %d", ua.hi[0], ua.hi[2]);
+    CHECK(usb_ports[0].lx == 0 && usb_ports[0].ly == 0, "rest: zeroed");
+    CHECK(dev.trigger_rest[0][0] == 30 && usb_ports[0].lt == 0, "trigger rest 30 reads 0: %d %d", dev.trigger_rest[0][0], usb_ports[0].lt);
+    p1[3] = 130;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx > 1100 && usb_ports[0].lx < 1250, "2 counts: no dead zone: %d", usb_ports[0].lx);
+    p1[3] = 128 + 28;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx > 16000 && usb_ports[0].lx < 16800, "28 of 56: half: %d", usb_ports[0].lx);
+    p1[3] = 255;
+    for (int i = 0; i < 6; i++) adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx == 32767, "past the reach: saturated: %d", usb_ports[0].lx);
+    p1[3] = 128 + 28;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx > 16000 && usb_ports[0].lx < 16800, "and the reach did not grow: %d", usb_ports[0].lx);
+    p1[3] = 128; p1[5] = 128 + 22;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].rx > 16000 && usb_ports[0].rx < 16800, "C-stick 22 of 44: half: %d", usb_ports[0].rx);
+    p1[5] = 128;
+    p1[3] = 128 + 56; p1[4] = 128 - 56;   /* the corner: clamped to the circle */
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx > 23000 && usb_ports[0].lx < 23300 && usb_ports[0].ly > 23000 && usb_ports[0].ly < 23300,
+          "corner on the circle, +y up: %d %d", usb_ports[0].lx, usb_ports[0].ly);
+    p1[3] = p1[4] = 128; p1[7] = 30 + 75;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lt > 16000 && usb_ports[0].lt < 16800, "trigger 75 of 150 from rest: %d", usb_ports[0].lt);
+}
+
+/* A blank (all-zero) first report of a port just plugged in must not set the centres or the trigger rests. */
+static void test_blank_first_report(void) {
+    Device dev = {.kind = KIND_ADAPTER, .first = 0};
+    UCHAR r[37] = {0x21};
+    UCHAR *p4 = r + 1 + 27;   /* port 4 */
+    p4[0] = 0x10;             /* connected, every axis 0: the blank report */
+    adapter_report(&dev, r, sizeof r);
+    CHECK(!usb_ports[3].connected, "blank first report: not connected yet");
+    p4[3] = 133; p4[4] = 129; p4[5] = 134; p4[6] = 127; p4[7] = 34; p4[8] = 40;
+    for (int i = 0; i < 40; i++) adapter_report(&dev, r, sizeof r);
+    PadUsbAxes ua;
+    CHECK(usb_ports[3].connected && padusb_axes(3, &ua) && ua.centre[0] == 133 && ua.centre[2] == 134,
+          "centres measured from the real reports: %d %d", ua.centre[0], ua.centre[2]);
+    CHECK(dev.trigger_rest[3][0] == 34 && dev.trigger_rest[3][1] == 40 && usb_ports[3].lt == 0 && usb_ports[3].rt == 0,
+          "trigger rests 34 / 40 read 0: %d %d %d %d", dev.trigger_rest[3][0], dev.trigger_rest[3][1], usb_ports[3].lt, usb_ports[3].rt);
+    p4[3] = p4[4] = p4[5] = p4[6] = 0;   /* an already connected port sending zeros stays connected (only a new connection waits) */
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[3].connected, "a connected port stays connected on an all-zero report");
+}
+
 /* The keyboard ([keyboard]): the defaults are the keys of before, rebinding, several keys, the
  * sticks' directions, Alt+Enter, ssbu-recomp's spellings and bad names. */
 static int held_keys[8], nheld;
@@ -484,16 +596,223 @@ static void test_keyboard(void) {
     CHECK(lx == 32767 && cfg.kb_ssf2 == 0, "movement = full: fully at once");
 }
 
+static void test_dpad_moves(void) {
+    load_text("[device default]\ndpad_moves = on\n[device ps5]\ndpad_moves = off\n");
+    CHECK(cfg.def.dpad_moves == 1 && cfg.dev[0].dpad_moves == 0, "dpad_moves parsed per section");
+    load_text("");
+    CHECK(cfg.def.stick_taunts == -1, "stick_taunts unset by default");
+    CHECK(cfg.def.dpad_moves == -1, "dpad_moves unset by default");
+    Dev d = make_dev("g", "", "", "Xbox", "xboxone");
+    int labels[4] = {N_A, N_B, N_X, N_Y};
+    dev_configure(&d, labels);
+    CHECK(d.dpad_moves == 0, "dpad_moves off by default");
+    Raw raw = {1u << RB_DPAD_RIGHT, {0, 0, 0, 0, 0, 0}};
+    PadState o;
+    dev_state(&d, &raw, &o);
+    CHECK(o.lx == 0 && (o.buttons >> N_RIGHT & 1), "off: the D-pad is only buttons");
+    load_text("[device default]\ndpad_moves = on\n");
+    Dev e = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&e, labels);
+    CHECK(e.dpad_moves == 1, "dpad_moves on");
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx == 32767 && o.ly == 0 && !(o.buttons >> N_RIGHT & 1), "right: full tilt, no D-pad button");
+    raw.buttons = 1u << RB_DPAD_UP | 1u << RB_DPAD_LEFT;
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx == -23170 && o.ly == 23170 && !(o.buttons >> N_UP & 1), "diagonal on the circle");
+    raw.buttons = 1u << RB_DPAD_DOWN;
+    dev_state(&e, &raw, &o);
+    CHECK(o.ly == -32767, "down is negative y");
+    raw.buttons = 1u << RB_DPAD_RIGHT;
+    raw.axis[RA_LEFTX] = -20000;   /* the stick pushed less far the other way: the D-pad wins */
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx == 32767, "larger wins: D-pad over a small stick");
+    raw.buttons = 0;
+    raw.axis[RA_LEFTX] = 30000;
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx > 29000 && o.lx <= 32767, "no D-pad: the stick as it is");
+}
+
+static void test_stick_taunts(void) {
+    int labels[4] = {N_A, N_B, N_X, N_Y};
+    load_text("[device default]\nstick_taunts = on\n[device ps5]\nstick_taunts = off\n");
+    CHECK(cfg.def.stick_taunts == 1 && cfg.dev[0].stick_taunts == 0, "stick_taunts parsed per section");
+    load_text("");
+    Dev d = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&d, labels);
+    Raw raw = {0, {32767, 0, 0, 0, 0, 0}};
+    PadState o;
+    dev_state(&d, &raw, &o);
+    CHECK(d.stick_taunts == 0 && o.lx == 32767 && !(o.buttons >> N_RIGHT & 1), "off by default: the stick is the stick");
+    load_text("[device default]\nstick_taunts = on\n");
+    Dev e = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&e, labels);
+    dev_state(&e, &raw, &o);
+    CHECK(e.stick_taunts == 1 && (o.buttons >> N_RIGHT & 1) && o.lx == 0, "stick right: right taunt, stick still");
+    raw.axis[RA_LEFTX] = 0; raw.axis[RA_LEFTY] = -32767;   /* (the raw y is down-positive: up is negative) */
+    dev_state(&e, &raw, &o);
+    CHECK((o.buttons >> N_UP & 1) && !(o.buttons >> N_DOWN & 1) && o.ly == 0, "stick up: up taunt");
+    raw.axis[RA_LEFTY] = 32767;
+    dev_state(&e, &raw, &o);
+    CHECK((o.buttons >> N_DOWN & 1) && !(o.buttons >> N_UP & 1), "stick down: down taunt");
+    raw.axis[RA_LEFTX] = -32767; raw.axis[RA_LEFTY] = 0;
+    dev_state(&e, &raw, &o);
+    CHECK((o.buttons >> N_LEFT & 1), "stick left: left taunt");
+    raw.axis[RA_LEFTX] = 10000;
+    dev_state(&e, &raw, &o);
+    CHECK(!(o.buttons & (1ull << N_RIGHT | 1ull << N_LEFT | 1ull << N_UP | 1ull << N_DOWN)), "a light push is no taunt");
+    load_text("[device default]\nstick_taunts = on\ndpad_moves = on\n");
+    Dev f = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&f, labels);
+    Raw both = {1u << RB_DPAD_LEFT, {0, -32767, 0, 0, 0, 0}};
+    dev_state(&f, &both, &o);
+    CHECK((o.buttons >> N_UP & 1) && o.lx == -32767 && o.ly == 0, "together: the stick taunts, the D-pad walks");
+}
+
+/* The adapter's pipes found from its descriptors, not assumed (official 0x81/0x02, GC Pocket+ 0x82/0x01). */
+static void test_pipes(void) {
+    UCHAR in, out; USHORT len;
+    { UCHAR id[] = {0x81, 0x02}, ty[] = {3, 3}; USHORT sz[] = {37, 6};
+      padusb_pick_pipes(id, ty, sz, 2, &in, &out, &len);
+      CHECK(in == 0x81 && out == 0x02 && len == 37, "official: in 0x%02x out 0x%02x len %u", in, out, len); }
+    { UCHAR id[] = {0x01, 0x82}, ty[] = {3, 3}; USHORT sz[] = {64, 64};
+      padusb_pick_pipes(id, ty, sz, 2, &in, &out, &len);
+      CHECK(in == 0x82 && out == 0x01 && len == 64, "0x82/0x01 in either order: in 0x%02x out 0x%02x len %u", in, out, len); }
+    { UCHAR id[] = {0x83}, ty[] = {3}; USHORT sz[] = {512};
+      padusb_pick_pipes(id, ty, sz, 1, &in, &out, &len);
+      CHECK(in == 0x83 && out == 0 && len == 37, "input only: in 0x%02x out 0x%02x len %u", in, out, len); }
+    { UCHAR id[] = {0x84, 0x05, 0x81, 0x02}, ty[] = {2, 2, 3, 3}; USHORT sz[] = {64, 64, 37, 5};
+      padusb_pick_pipes(id, ty, sz, 4, &in, &out, &len);
+      CHECK(in == 0x81 && out == 0x02, "interrupt wins over bulk: in 0x%02x out 0x%02x", in, out); }
+    padusb_pick_pipes(NULL, NULL, NULL, 0, &in, &out, &len);
+    CHECK(!in && !out, "no pipes: nothing found");
+}
+
+/* Issue #320: a pad named with a '#' ("XInput Controller #1"), whose section the comment rule cut at the '#'; and the
+ * sections that name a pad layered, type < name < GUID, each changing only what it has. */
+static void test_device_sections(void) {
+    load_text("[players]\n1 = XInput Controller #1\n"
+              "[device default]\ndpad_moves = off\nstick_taunts = off\n"
+              "[device XInput  Controller #1]   ; written by the menu\nstick_taunts = on\ndpad_moves = on\nA = leftshoulder\nB = leftshoulder\n");
+    CHECK(!strcmp(cfg.pin[0], "XInput Controller #1"), "pin with a '#' kept whole: '%s'", cfg.pin[0]);
+    CHECK(cfg.ndev == 1 && !strcmp(cfg.dev[0].match, "XInput Controller #1"), "section name with a '#': '%s'", cfg.ndev ? cfg.dev[0].match : "");
+    Dev d = make_dev("0300fa67c82d00000631000014017801", "", "", "XInput Controller #1", "xboxone");
+    int xbox_labels[4] = {N_A, N_B, N_X, N_Y};
+    dev_configure(&d, xbox_labels);
+    CHECK(!strcmp(d.section, "XInput Controller #1"), "the pad takes its section: '%s'", d.section);
+    CHECK(d.dpad_moves == 1 && d.stick_taunts == 1, "dpad_moves and stick_taunts from the pad's section");
+    CHECK(press(&d, 1u << RB_LEFT_SHOULDER, 0, 0) == (1ull << N_A | 1ull << N_B | 1ull << N_L), "A = leftshoulder, B = leftshoulder");
+    CHECK(press(&d, 1u << RB_EAST, 0, 0) == 0, "the right face button no longer A");
+    CHECK(dev_matches(&d, cfg.pin[0]), "[players] pin matches the pad");
+
+    load_text("[device xboxone]\nA = south\nrumble = 50\n[device XInput Controller #1]\nrumble = 70\nB = north\n"
+              "[device 0300fa67c82d00000631000014017801]\nX = west\ndeadzone = 20\n");
+    dev_configure(&d, xbox_labels);
+    CHECK(!strcmp(d.section, "0300fa67c82d00000631000014017801"), "the most exact section is the GUID's: '%s'", d.section);
+    CHECK(press(&d, 1u << RB_SOUTH, 0, 0) == 1ull << N_A, "type's remap kept under the name's and GUID's");
+    CHECK(press(&d, 1u << RB_NORTH, 0, 0) == 1ull << N_B, "name's remap kept under the GUID's");
+    CHECK(press(&d, 1u << RB_WEST, 0, 0) & 1ull << N_X, "GUID's remap (west presses X too)");
+    CHECK(d.rumble == 70 && d.deadzone == 20, "rumble from the name's, deadzone from the GUID's (%d, %d)", d.rumble, d.deadzone);
+    Dev two = make_dev("0300fa67c82d00000631000014017801", "", "", "XInput Controller #2", "xboxone");
+    dev_configure(&two, xbox_labels);
+    CHECK((press(&two, 1u << RB_WEST, 0, 0) & 1ull << N_X) && two.rumble == 50, "the same model on another port: GUID's and type's");
+}
+
+/* A GameCube adapter in PC mode (GUID vendor 0x0079): the stick's travel taken as 100 counts (C-stick 87), then the console's 56 / 44. */
+static void test_gc_pcmode(void) {
+    load_text("");
+    cfg.gc_switch = 1; cfg.def.outer = -1;   /* (load_text starts from zeros; the file's defaults are 1 and -1) */
+    Dev pc = make_dev("03004271790000004418000000016800", "", "", "Nintendo GameCube Controller", "gamecube");
+    dev_configure(&pc, NULL);
+    CHECK(dev_gc_pcmode(&pc), "the Mayflash GUID is a PC mode adapter");
+    Raw raw = {0, {0, 0, 0, 0, 0, 0}};
+    PadState o;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 0 && o.ly == 0 && o.rx == 0 && o.ry == 0, "rest: no dead zone needed");
+    raw.axis[RA_LEFTX] = 129;   /* (byte 128 at rest, in SDL's terms) */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 0, "half a count is no count: %d", o.lx);
+    raw.axis[RA_LEFTX] = 32767; raw.axis[RA_LEFTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 32767 && o.ly == 0, "full tilt right: %d %d", o.lx, o.ly);
+    raw.axis[RA_LEFTX] = 32767 * 56 / 100;   /* 56 counts of 100: the console's full scale */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx >= 32700 && o.lx <= 32767, "56 of 100 counts is full: %d", o.lx);
+    raw.axis[RA_LEFTX] = 32767 * 28 / 100;   /* 28 counts: half way, on the console's grid */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == 28 * 32767L / 56, "28 counts: %d", o.lx);
+    raw.axis[RA_LEFTX] = 0; raw.axis[RA_RIGHTX] = 32767 * 44 / 87;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.rx >= 32700 && o.rx <= 32767 && o.lx == 0, "the C-stick: 44 of 87 counts is full: %d", o.rx);
+    raw.axis[RA_RIGHTX] = 32767; raw.axis[RA_RIGHTY] = -32767;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.rx * (long)o.rx + o.ry * (long)o.ry <= 32767L * 32767L + 40000, "inside the circle: %d %d", o.rx, o.ry);
+    raw.axis[RA_LEFTX] = -32768; raw.axis[RA_LEFTY] = 0; raw.axis[RA_RIGHTX] = 0; raw.axis[RA_RIGHTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == -32767 && o.ly == 0, "full tilt left (SDL's -32768): %d %d", o.lx, o.ly);
+    raw.axis[RA_LEFTX] = 0; raw.axis[RA_LEFTY] = 32767 * 28 / 100;   /* SDL's y grows downwards: the game's grows upwards */
+    dev_state(&pc, &raw, &o);
+    CHECK(o.ly == -(28 * 32767L / 56) && o.lx == 0, "left stick down: %d", o.ly);
+    raw.axis[RA_LEFTY] = 0; raw.axis[RA_RIGHTY] = -32767 * 22 / 87;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.ry == (long)(22 * 32767L / 44) && o.rx == 0, "C-stick up, 22 counts of 44: %d", o.ry);
+    Dev other = make_dev("03004271790000000600000000016800", "", "", "Generic pad", "gamecube");   /* (0079:0006, not an adapter) */
+    CHECK(!dev_gc_pcmode(&other), "another 0079 pad is not taken for the adapter");
+    PadInfo info;
+    dev_info(&pc, &raw, &info);
+    CHECK(info.pc_mode && info.pc_scaled, "the menu knows: %d %d", info.pc_mode, info.pc_scaled);
+    pc.invert = 1;   /* (leftx) */
+    raw.axis[RA_LEFTX] = 32767 * 28 / 100; raw.axis[RA_RIGHTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx == -(28 * 32767L / 56), "invert applies before the scaling: %d", o.lx);
+    pc.invert = 0;
+    load_text("[device default]\ndeadzone = 10\nouter_zone = 98\n");
+    cfg.gc_switch = 1;
+    dev_configure(&pc, NULL);
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "a zone set in [device default] is the player's choice: %d", o.lx);
+    dev_info(&pc, &raw, &info);
+    CHECK(info.pc_mode && !info.pc_scaled, "and the menu knows it is not scaled");
+    load_text("[device default]\nouter_zone = 90\n");
+    cfg.gc_switch = 1;
+    dev_configure(&pc, NULL);
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "an outer zone alone is a choice too: %d", o.lx);
+    load_text("[general]\ngc_switch = 0\n");
+    cfg.def.outer = -1;
+    dev_configure(&pc, NULL);
+    raw.axis[RA_LEFTX] = 32767 * 28 / 100; raw.axis[RA_RIGHTX] = raw.axis[RA_RIGHTY] = 0;
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "gc_switch = 0: the earlier scaling: %d", o.lx);
+    load_text("[device gamecube]\ndeadzone = 5\n");
+    cfg.gc_switch = 1; cfg.def.outer = -1;
+    dev_configure(&pc, NULL);
+    dev_state(&pc, &raw, &o);
+    CHECK(o.lx != 28 * 32767L / 56, "a dead zone the player set: the earlier way: %d", o.lx);
+    Dev nin = make_dev("030000007e0500003703000000016800", "", "", "Nintendo GameCube Controller", "gamecube");
+    CHECK(!dev_gc_pcmode(&nin), "Nintendo's own adapter is not a PC mode adapter");
+}
+
 int main(void) {
+    _putenv("SSBU_GC_SWITCH=");   /* (the file decides here, not an environment this was started in) */
     test_keyboard();
     test_config();
     test_mapping();
     test_gamecube();
+    test_gc_pcmode();
+    padusb_set_switch(0);   /* the two below test the earlier (calibrating) scaling; test_axes_switch the console's */
     test_usb();
+    test_pipes();
     test_axes();
+    padusb_set_switch(1);
+    test_axes_switch();
+    test_blank_first_report();
     test_sticks();
     test_slots();
+    test_unit_pins();
     test_rumble();
+    test_dpad_moves();
+    test_stick_taunts();
+    test_device_sections();
     printf("%d of %d checks passed\n", checks - failures, checks);
     return failures != 0;
 }

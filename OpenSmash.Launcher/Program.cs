@@ -24,8 +24,22 @@ namespace OpenSmash.Launcher
             if (args.Contains("--play", StringComparer.OrdinalIgnoreCase) && ProjectSetup.FindProject(AppContext.BaseDirectory) is string built
                 && WindowSmash.IsBuilt(built))
             {
-                using var game = WindowSmash.StartGame(built);
+                // (v0.5.0) the signed-in account's lobby ticket, kept fresh while the game runs
+                string? pass = null;
+                OpenSmash.Core.OnlinePass? keeper = null;
+                try
+                {
+                    var account = new OpenSmash.Core.Account(built);
+                    if (account.Service.Configured && account.ResumeAsync().GetAwaiter().GetResult())
+                    {
+                        keeper = new OpenSmash.Core.OnlinePass(account, built);
+                        if (keeper.WriteAsync().GetAwaiter().GetResult()) { pass = keeper.File; keeper.KeepFresh(); }
+                    }
+                }
+                catch { }
+                using var game = WindowSmash.StartGame(built, pass);
                 game?.WaitForExit();
+                keeper?.Dispose();
                 return;
             }
 
@@ -38,17 +52,23 @@ namespace OpenSmash.Launcher
 
             // Ensure single instance
             using var mutex = new Mutex(true, "Global\\OpenSmashLauncher", out bool createdNew);
+            if (!createdNew && args.Contains("--updated", StringComparer.OrdinalIgnoreCase))
+            {   // (v0.5.0: the launcher that replaced itself is still closing: its successor waits for it)
+                try { createdNew = mutex.WaitOne(TimeSpan.FromSeconds(20)); } catch (AbandonedMutexException) { createdNew = true; }
+            }
             if (!createdNew) return;
+            OpenSmash.Core.Updater.CleanUp();   // (the .old exe a self-update left)
 
             // Resolve repo root (where the .exe lives, or the repo above its build output folder)
             string repo = ProjectSetup.ExeRoot(AppContext.BaseDirectory);
+            UiLocale.Initialize(repo);
 
             // Extract embedded resources (PowerShell scripts, icon) to a temp folder
             string workDir = Path.Combine(Path.GetTempPath(), "OpenSmash_" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(workDir);
             ExtractResources(workDir);
 
-            // On its own (the release's OpenSmash Setup.exe, or OpenSmash.exe anywhere): the folder set up before,
+            // On its own (the release's OpenSmash.exe, or OpenSmash.exe anywhere): the folder set up before,
             // or the first-start screen, which downloads the project and makes the shortcuts. Then the launcher
             // copied into that folder takes over, so everything starts from there as from a copy of the repo.
             if (!ProjectSetup.IsProject(repo))
@@ -57,6 +77,7 @@ namespace OpenSmash.Launcher
                 if (found == null)
                 {
                     using var first = new FirstRunForm(workDir, ProjectSetup.DefaultFolder(repo));
+                    UiLocale.Attach(first);
                     Application.Run(first);
                     if (first.Folder == "") return;
                     found = first.Folder;
@@ -76,14 +97,20 @@ namespace OpenSmash.Launcher
                 repo = found;
             }
 
+            UiLocale.Initialize(repo);
+
             // No build yet (or --installer): Install WindowSmash comes first.
             if (!WindowSmash.IsBuilt(repo) || args.Contains("--installer", StringComparer.OrdinalIgnoreCase))
             {
+                LauncherForm.NameReleaseForInstaller(repo);   // (v0.5.0: a release's install takes its prebuilt runtime)
                 using var installer = new InstallerForm(workDir, repo);
+                UiLocale.Attach(installer);
                 Application.Run(installer);
                 if (!installer.Installed || !WindowSmash.IsBuilt(repo)) return;
             }
-            Application.Run(new LauncherForm(workDir, repo, WindowSmash.BuildDir(repo)));
+            using var launcher = new LauncherForm(workDir, repo, WindowSmash.BuildDir(repo));
+            UiLocale.Attach(launcher);
+            Application.Run(launcher);
         }
 
         // ---------------------------------------------------------------------------
@@ -100,7 +127,7 @@ namespace OpenSmash.Launcher
             foreach (string name in asm.GetManifestResourceNames())
             {
                 // The marketplace UI is read straight out of the assembly on demand.
-                if (name.EndsWith(".html", StringComparison.OrdinalIgnoreCase)) continue;
+                if (name.EndsWith(".html", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".js", StringComparison.OrdinalIgnoreCase) || name.StartsWith("Locales.", StringComparison.Ordinal)) continue;
 
                 // Resources carry their file name as the logical name; fall back to
                 // the last two dot-separated segments for the default naming scheme.
@@ -123,7 +150,7 @@ namespace OpenSmash.Launcher
     {
         static readonly string[] ClearedVars =
         {
-            "SSBU_DATA_ROOT", "SSBU_INPUT", "SSBU_NET_HOST", "SSBU_NET_RELAY", "SSBU_NET_BIND",
+            "SSBU_NET_BACKEND", "SSBU_YUZU_PASSWORD", "SSBU_YUZU_TOKEN", "SSBU_DATA_ROOT", "SSBU_INPUT", "SSBU_RENDERER", "SSBU_DISPLAY", "SSBU_NET_HOST", "SSBU_NET_RELAY", "SSBU_NET_BIND",
             "SSBU_NET_ROOM", "SSBU_NET_NAME", "SSBU_NET_DIRECT", "SSBU_NET_PORT"
         };
 
@@ -156,11 +183,14 @@ namespace OpenSmash.Launcher
         [DllImport("user32.dll")]
         static extern bool AllowSetForegroundWindow(int dwProcessId);
 
-        public static Process? StartGame(string repo)
+        public static Process? StartGame(string repo, string? onlinePassFile = null)
         {
             string exe = Path.Combine(BuildDir(repo), "ssbu.exe");
             if (!File.Exists(exe)) return null;
             string log = Path.Combine(BuildDir(repo), "play.log");
+            // The last session's log kept as play.prev.log: a player who starts again before sending it still has it
+            // (the settings' Experimental tab, "Open log folder"; docs/adr/0002).
+            try { if (File.Exists(log) && new FileInfo(log).Length > 0) File.Copy(log, Path.Combine(BuildDir(repo), "play.prev.log"), true); } catch { }
             try { File.WriteAllText(log, ""); } catch { }
             var psi = new ProcessStartInfo
             {
@@ -173,6 +203,7 @@ namespace OpenSmash.Launcher
                 RedirectStandardError = true,
             };
             foreach (string v in ClearedVars) psi.EnvironmentVariables.Remove(v);
+            if (onlinePassFile != null) psi.EnvironmentVariables["SSBU_ONLINE_TICKET_FILE"] = onlinePassFile;   // (v0.5.0: the account's lobby ticket)
             var logLock = new object();
             var proc = Process.Start(psi);
             if (proc == null) return null;

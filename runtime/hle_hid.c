@@ -22,6 +22,12 @@ enum {   /* nn::hid::NpadButton */
 
 static volatile LONG64 sampling;
 
+/* While the renderer prepares the shaders (and lets the title screen's demo match make DXVK's
+ * pipeline states), the game gets no input: the user cannot start a match into the remaining
+ * hitches. Scripted runs and the benchmark keep their own input. */
+static volatile int input_gate;
+void pad_input_gate_set(int on) { input_gate = on; }
+
 /* SSBU_SEQ (input_seq.h): player 1 is the sequence's - its pad is not read - and the keyboard is
  * nobody's unless SSBU_SEQ_KEYBOARD=1, so that a run goes the same way whatever is plugged in or
  * typed. Players 2-8 keep their pads. */
@@ -158,7 +164,8 @@ u64 bench_buttons(i32 *lx, i32 *ly);
 int rb_slot_remote(u32 id);
 int rb_slot_remote_gc(u32 id);   /* (version 12: a remote player's GameCube controller, from its choice) */
 /* (Host/Join: which of this PC's own controller slots the game's slot `id` reads. A joining PC's controller and keyboard
- * are its player 1, as on any PC; once the host gives the game player N, the game's slot N reads them: hle_rb_core.c) */
+ * are its player 1, as on any PC; once the host gives the game player N, the game's slot N reads them. An Online
+ * match's: the game's slot of this game's number reads the slot its player picked its fighter with: hle_rb_core.c) */
 u32 rb_slot_phys(u32 id);
 
 /* A player is connected while a pad drives it, while it is the keyboard's, and (player 1) during
@@ -265,8 +272,11 @@ static void npad_state(u64 out, u32 id, u32 style) {
         }
         if (ph == NPAD_NO1 && !bench_on()) buttons |= scripted_buttons(&lx, &ly);
         if ((int)ph == keyboard_slot() && (!bench_on() || bench_pads())) buttons |= keyboard_buttons(&lx, &ly, &rx, &ry);
-        if (menu_blocks_input()) { buttons = 0; lx = ly = rx = ry = 0; }   /* the settings menu has them (still connected) */
+        if (menu_blocks_input() || (input_gate && !bench_on() && !input_seq_on() && !getenv("SSBU_INPUT"))) {
+            buttons = 0; lx = ly = rx = ry = 0;   /* (the menu, or the shader preparation, has them; still connected) */
+        }
         rb_pad(id, &buttons, &lx, &ly, &rx, &ry, &lt, &rt);
+        if (id == NPAD_NO1) { void vi_lat_poll(u64 b); vi_lat_poll(buttons); }   /* (SSBU_LAT_TRACE: ipc_vi.c) */
         {
             /* the stick directions also exist as buttons */
             if (lx < -16384) buttons |= 1ull << B_SL_LEFT;

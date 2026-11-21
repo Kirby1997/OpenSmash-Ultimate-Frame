@@ -63,6 +63,12 @@ static void test_steps(void) {
         long got = fight_steps(&s, POLLS[i].frame, POLLS[i].on);
         CHECK(got == POLLS[i].want, "poll %u (frame %lld, ready-go %d): %ld ticks, wanted %ld", i + 1, POLLS[i].frame, POLLS[i].on, got, POLLS[i].want);
     }
+    FightSteps u = {0};   /* paused: the fight frame still with ready-go on: after FIGHT_PAUSE_POLLS polls, one a poll */
+    fight_steps(&u, 9, 1);
+    long sum = 0;
+    for (int i = 0; i < FIGHT_PAUSE_POLLS + 5; i++) sum += fight_steps(&u, 9, 1);
+    CHECK(sum == 5, "paused for %d polls: %ld ticks, wanted 5", FIGHT_PAUSE_POLLS + 5, sum);
+    CHECK(fight_steps(&u, 10, 1) == 1, "unpaused: fight frames again");
     FightSteps t = {0};
     fight_steps(&t, -2, 0);   /* (before any fight: a lower count is no tick, counted as 0) */
     CHECK(t.hist[0] == 1, "a poll with no new frame is counted");
@@ -89,8 +95,16 @@ static void test_parse(void) {
     CHECK(m.p2type == -1 && m.form == -1 && m.items == -1 && m.stock == -1 && !m.name[0][0] && !m.stage[0], "nothing set");
     dm_parse(&m, "p1=mario,p2=link,p2=cpu,p3=kirby,p4=fox,stage=fd,form=omega,hazards=off,cpu=9,items=on,stock=2,time=3");
     CHECK(!strcmp(m.name[0], "mario") && !strcmp(m.name[1], "link") && !strcmp(m.name[2], "kirby") && !strcmp(m.name[3], "fox"), "the four fighters");
-    CHECK(m.p2type == 1 && !strcmp(m.stage, "fd") && m.form == 2 && m.hazards == 0 && m.cpu == 9 && m.items == 1 && m.stock == 2 && m.time == 3,
+    CHECK(m.p2type == 1 && !strcmp(m.stage, "fd") && m.form == 2 && m.hazards == 0 && m.cpu == 9 && m.items == 2 && m.stock == 2 && m.time == 3,
           "the rest: p2type %d stage %s form %d hazards %d cpu %d items %d stock %d time %d", m.p2type, m.stage, m.form, m.hazards, m.cpu, m.items, m.stock, m.time);
+    {   /* (items: the match block's item appearance word - on is 2, as the block always had it) */
+        DebugMatch it;
+        dm_init(&it);
+        dm_parse(&it, "items=low"); CHECK(it.items == 1, "items=low");
+        dm_parse(&it, "items=high"); CHECK(it.items == 3, "items=high");
+        dm_parse(&it, "items=4"); CHECK(it.items == 4, "items=4");
+        dm_parse(&it, "items=9"); CHECK(it.items == 0, "items out of the range: none");
+    }
     dm_parse(&m, "p2=human,form=battlefield,hazards=on,items=off,,junk,p5=x");
     CHECK(m.p2type == 0 && m.form == 1 && m.hazards == 1 && m.items == 0 && !strcmp(m.name[0], "mario"), "a second text adds to the first; junk is ignored");
     dm_parse(&m, "form=normal");
@@ -149,6 +163,26 @@ static void test_player(void) {
     fight_put32(none + 0x78, 3);
     dm_player(&col, 0, none, 3, NULL);
     CHECK(none[0x90] == 0 && get64(none + 0x88) == 0, "a player with no panel: no colour either");
+    DebugMatch tag;   /* tag1..tag4: a player's name tag (#152) */
+    dm_init(&tag);
+    dm_parse(&tag, "tag1=1,tag2=0,tag3=99");
+    CHECK(tag.tag[0] == 1 && tag.tag[1] == 0 && tag.tag[2] == 0 && tag.tag[3] == -1, "tag1..tag4 parsed, out of the list: none, tag4 not set");
+    uint8_t panel[DM_PANEL];
+    memset(panel, 0, sizeof panel);
+    fight_put32(panel + 0x214, 7);
+    dm_player(&tag, 0, panel, 0, NULL);
+    CHECK(fight_get32(panel + 0x214) == 1 && panel[0x450] == 1, "player 1: tag 1 (slot + 1), a human's panel");
+    dm_player(&tag, 1, panel, 0, NULL);
+    CHECK(fight_get32(panel + 0x214) == 0 && panel[0x450] == 1, "player 2: no tag, the panel flag left as it was");
+    panel[0x450] = 0; fight_put32(panel + 0x78, 1);
+    dm_player(&tag, 0, panel, 1, NULL);
+    CHECK(fight_get32(panel + 0x214) == 1 && panel[0x450] == 0, "a CPU's panel: the tag, but no human flag");
+    fight_put32(panel + 0x78, 0);
+    fight_put32(panel + 0x214, 5);
+    dm_player(&tag, 3, panel, 0, NULL);
+    CHECK(fight_get32(panel + 0x214) == 5, "player 4: tag not set, left alone");
+    dm_player(&tag, 0, panel, 3, NULL);
+    CHECK(fight_get32(panel + 0x214) == 5, "a player with no panel: no tag either");
 }
 
 static void test_stage(void) {

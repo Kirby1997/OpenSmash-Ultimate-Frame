@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-The window Play SSBU.bat opens before the game: the game version, online, display and controller
+The window OpenSmash.exe opens before the game: the game version, online, display and controller
 settings, then Play.
 
 .DESCRIPTION
@@ -11,9 +11,9 @@ their comments and every line it does not change:
   online_server.txt the first line that is not a '#' comment: host:port [lobby code], or off
   online_name.txt   the online name (empty: the game picks one at its first online start)
   online_direct.txt on / off: direct connections
-  launcher.ini      show_launcher = 0: Play SSBU.bat starts the game directly (hold Shift for this window)
+  launcher.ini      show_launcher = 0: OpenSmash.exe starts the game directly (hold Shift for this window)
 They are in config\ once the game has made that folder (runtime/config_folder.h), in the port's folder before.
-Play saves only the values changed in the window, then starts what Play SSBU.bat starts: the game
+Play saves only the values changed in the window, then starts what OpenSmash.exe starts: the game
 with --online, its output in build\play.log. Close starts nothing and saves nothing. The game
 version shown is version.txt's (what the build wrote: 13.0.5).
 
@@ -21,10 +21,10 @@ The ini writer follows the game's own (runtime/hle_settings.c, settings_ini_set)
 tests/test_launcher_ini.py checks the two give the same files.
 
 Exit codes: 0 played or closed, 1 the game isn't built here, 2 the window could not be opened
-(Play SSBU.bat then starts the game the old way).
+(OpenSmash.exe then starts the game the old way).
 
 .PARAMETER Auto
-What Play SSBU.bat passes: start the game directly when launcher.ini says show_launcher = 0 and
+What OpenSmash.exe passes: start the game directly when launcher.ini says show_launcher = 0 and
 Shift is not held; otherwise open the window.
 .PARAMETER DryRun
 Print the files Play would change and the command line it would start, and change or start nothing.
@@ -38,13 +38,19 @@ param([switch]$Auto, [switch]$DryRun, [switch]$NoWindow, [string]$Root)
 if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 $Root = (Resolve-Path -LiteralPath $Root).Path   # (.NET's file calls want it whole)
 
-$PublicLobby = 'smash.recomps.wtf:39421'   # (the online_server.txt the port comes with)
+$PublicLobby = 'eu.lobby.opensmashultimate.com:39421'   # (the official lobby's DNS name: runtime/net.h's NET_OFFICIAL_LOBBY)
+# The official lobbies, one a region (runtime/net.h's NET_REGION_TABLE): id, the name shown, the lobby. Which one the
+# game plays on is config\server_region.txt's to say ("auto", the default: the closest; or an id), set in the game's
+# own settings menu (Esc > Online > Server region) or in OpenSmash.exe. Players on another region are not listed.
+$ServerRegions = @(
+    @{ Id = 'eu'; Label = 'EU'; Lobby = 'eu.lobby.opensmashultimate.com:39421' },
+    @{ Id = 'na-east'; Label = 'NA East'; Lobby = 'na.lobby.opensmashultimate.com:39421' })
 # The game's own values when a file or key is missing (runtime/gpu_display.c, hle_pad.c).
 $Defaults = @{
     window = 'windowed'; width = '1280'; height = '720'; pacing = 'clock'; latency = '3'
     hide_cursor = '1'; overlay = '1'; gpu = 'auto'; render_scale = '1'; keyboard_player = '1'; background = '1'
 }
-# What Play SSBU.bat clears, so the files count (the variables win over them in the game).
+# What OpenSmash.exe clears, so the files count (the variables win over them in the game).
 $ClearedVars = @('SSBU_DATA_ROOT', 'SSBU_INPUT', 'SSBU_NET_HOST', 'SSBU_NET_RELAY', 'SSBU_NET_BIND',
                  'SSBU_NET_ROOM', 'SSBU_NET_NAME', 'SSBU_NET_DIRECT', 'SSBU_NET_PORT')
 
@@ -250,7 +256,7 @@ function Get-GameVersion([string]$Dir) {
 }
 
 function Get-GameCommand {
-    <# What Play SSBU.bat runs, inside start "SSBU log" /min cmd /c "...". #>
+    <# What OpenSmash.exe runs, inside start "SSBU log" /min cmd /c "...". #>
     return 'build\ssbu.exe dump\modules --status 30 --online > build\play.log 2>&1'
 }
 
@@ -323,7 +329,8 @@ $serverWords = @(([string](Get-LineValue $serverFile)).Trim() -split '[ \t]+') +
 $lobbyHost = $serverWords[0]
 $lobbyCode = $serverWords[1]
 $netMode = if (-not $lobbyHost -or $lobbyHost -eq 'off') { 'offline' }
-           elseif ($lobbyHost -eq $PublicLobby) { if ($lobbyCode) { 'private' } else { 'public' } }
+           elseif ($lobbyHost -eq 'lan') { 'lan' }   # (the in-game menu's This network (LAN): runtime/gpu_menu.c net_load)
+           elseif (@($ServerRegions | ForEach-Object { $_.Lobby }) -contains $lobbyHost -or $lobbyHost -like 'smash.recomps.wtf*' -or $lobbyHost -like 'opensmash-lobby.duckdns.org*' -or @('auto', 'na', 'eu') -contains $lobbyHost) { if ($lobbyCode) { 'private' } else { 'public' } }
            else { 'custom' }
 
 try {
@@ -463,6 +470,7 @@ $modeBox = New-Choice @(
     @{ Value = 'public'; Text = 'Public lobby' },
     @{ Value = 'private'; Text = 'Private lobby (a code)' },
     @{ Value = 'custom'; Text = 'Your own server' },
+    @{ Value = 'lan'; Text = 'This network (LAN)' },
     @{ Value = 'offline'; Text = 'Offline' }) $netMode $RC 118 $RW `
     "Public lobby: everyone's rooms in Local Wireless, and Online.`nPrivate lobby: only the players with the same code.`nYour own server: the host:port of a lobby you run (docs\MULTIPLAYER.md)."
 [void](New-Text 'Lobby code' $R 155 120)
@@ -470,8 +478,11 @@ $codeBox = New-TextBox $lobbyCode 32 $RC 152 $RW 'A word your friends type too, 
 [void](New-Text 'Server' $R 189 120)
 $serverBox = New-TextBox $(if ($netMode -eq 'custom') { $lobbyHost } else { '' }) 0 $RC 186 $RW 'host:port, e.g. 192.168.1.20:39420'
 $directBox = New-Check 'Direct connections' (-not ((Get-LineValue $directFile) -match '^(?i)off')) $R 222 344 `
-    "The players in your rooms connect to you directly, which is faster.`nOff: everything goes through the lobby, and they don't learn your internet address."
+    "Private rooms and This network (LAN) only: the players connect to each other directly, which is faster, and a room on this network is announced.`nThe official lobbies never connect players directly, whatever this says."
 $netNote = New-Text '' $R 250 344 34 -Dim
+# (config\server_region.txt as the game reads it: a region's id, anything else auto)
+$regionWord = ([string](Get-LineValue (Join-Path (Join-Path $Root 'config') 'server_region.txt'))).Trim() -split '[ \t]+' | Select-Object -First 1
+$regionNow = @($ServerRegions | Where-Object { $_.Id -eq $regionWord } | ForEach-Object { $_.Label }) + @('Auto: the closest') | Select-Object -First 1
 $updateNet = {
     $m = $modeBox.SelectedItem.Value
     $codeBox.Enabled = $m -eq 'private' -or $m -eq 'custom'
@@ -479,7 +490,7 @@ $updateNet = {
     $nameBox.Enabled = $m -ne 'offline'
     $directBox.Enabled = $m -ne 'offline'
     $netNote.Text = switch ($m) {
-        'public' { "The game joins $PublicLobby." }
+        'public' { "The game joins the official lobby of your server region ($regionNow)." }
         'private' { 'Only the players with the same code (same capitals too) see your rooms.' }
         'custom' { 'Your own lobby server; the code is optional.' }
         'offline' { 'The game does not go online.' }
@@ -534,7 +545,8 @@ function Get-WindowValues {
     $code = $codeBox.Text -replace '\s', ''
     $server = switch ($modeBox.SelectedItem.Value) {
         'offline' { 'off' }
-        'public' { $PublicLobby }
+        'lan' { 'lan' }
+        'public' { 'auto' }
         'private' { "$PublicLobby $code" }
         'custom' { $s = $serverBox.Text.Trim(); if (-not $s) { $s = '127.0.0.1:39420' }; if ($code) { "$s $code" } else { $s } }
     }
@@ -575,7 +587,7 @@ function Save-WindowValues($Before, $Now) {
             continue
         }
         if ($file -eq $launcherIni -and -not (Test-Path -LiteralPath $file)) {
-            [IO.File]::WriteAllText($file, "; launcher.ini: the window Play SSBU.bat opens (tools\launcher.ps1).`r`n" +
+            [IO.File]::WriteAllText($file, "; launcher.ini: the window OpenSmash.exe opens (tools\launcher.ps1).`r`n" +
                 "; show_launcher = 0: start the game directly; hold Shift while starting to see the window.`r`n", [Text.Encoding]::ASCII)
         }
         [void](Set-IniValue $file $section $key $v)

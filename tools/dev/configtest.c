@@ -20,6 +20,7 @@
 const char *padusb_start(void) { return NULL; }
 void padusb_poll(PadUsbState out[PADUSB_PORTS]) { memset(out, 0, sizeof(PadUsbState) * PADUSB_PORTS); }
 void padusb_rumble(int port, int on) { (void)port; (void)on; }
+void padusb_set_switch(int on) { (void)on; }
 #endif
 
 /* (gpu_display.c's, which is not built here: display.ini's defaults, made up) */
@@ -70,7 +71,7 @@ int main(int argc, char **argv) {
     config_defaults();
     if (!strcmp(what, "paths")) {
         static const char *const NAMES[CONFIG_FILES] = {"display", "controllers", "launcher", "online_server", "online_name", "online_direct",
-                                                        "online_protocol", "online_rollback"};
+                                                        "online_protocol", "online_rollback", "online_delay"};
         for (int f = 0; f < CONFIG_FILES; f++) printf("%s: %s\n", NAMES[f], config_path((enum ConfigFile)f));
         return 0;
     }

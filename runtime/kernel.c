@@ -141,6 +141,9 @@ static void rb_park(KThread *me) {
 volatile LONG rb_fast;
 void *rb_main_kthread;
 volatile u64 rb_main_wait_ns, rb_main_waits;
+/* (rollback, hle_rb_core.c's barrier) when the main guest thread went into its current kernel wait, 0: not in one */
+static volatile u64 rb_main_wait_since;
+double kernel_rb_main_wait_ms(void) { u64 t = rb_main_wait_since; return t ? (now_ns() - t) / 1e6 : 0; }
 static int kwait(KThread *me, u64 deadline) {
     if (rb_hold) { rb_park(me); return 1; }
     DWORD ms = INFINITE;
@@ -150,10 +153,12 @@ static int kwait(KThread *me, u64 deadline) {
         ms = (DWORD)((deadline - now + 999999) / 1000000);
     }
     me->rb_state = 1;
+    if ((void *)me == rb_main_kthread) rb_main_wait_since = now_ns();
     u64 w0 = rb_fast > 0 && (void *)me == rb_main_kthread ? now_ns() : 0;
     SleepConditionVariableCS(&me->woken, &klock, ms);
     if (w0) { rb_main_wait_ns += now_ns() - w0; rb_main_waits++; }   /* (the profile of re-run frames: the main thread's waits) */
     me->rb_state = 0;
+    if ((void *)me == rb_main_kthread) rb_main_wait_since = 0;
     if (rb_hold) rb_park(me);
     return 1;
 }
@@ -264,9 +269,47 @@ static void unqueue_objects(KThread *t) {
     t->wait_count = 0;
 }
 
-/* Object `o` became signalled: every thread waiting for it in WaitSynchronization is woken, first
- * come first (and leaves its other objects' queues: one signal wakes it once). */
+/* (rollback, 2026-11-21: the crash of the #498 review's delay-3 runs, "reading address 0x88" in kernel_signal_event
+ * under rb_load_age) A WaitSynchronization's queue nodes are on the waiting thread's host stack (wait_objects' local[]).
+ * kernel_rb_load puts the objects' queues back as at the save - pointers into the threads' stacks as they were then -
+ * but the stacks themselves are copied back only at the load's end (hle_rb_state.c: the other threads at copy_ev, the
+ * main thread in run_on_scratch). In between, a signal - vi_rb_load's and audio_rb_load's own, or a host thread's (the
+ * audio reaper, the vsync thread) - walked a queue into stack memory that holds whatever the thread has there now: a
+ * waiter held at another place than at the save left a node naming no thread, and notify read t->wait_count of NULL
+ * (shown with SSBU_RB_LOAD_SIGNALS=0: audio_rb_load's signal of audio.event, during the 2:00 resource load, more often
+ * with the barrier keeping threads elsewhere for longer). Now, from kernel_rb_load to kernel_rb_load_done
+ * (finish_load, every stack back), a signal only marks the object; its waiters are woken at the end, when the nodes are
+ * the save's again. (Every guest thread is held meanwhile, and each looks at its wait again once let go: nothing is
+ * lost.) SSBU_RB_LOAD_SIGNALS=0: as before. */
+static int rb_sig_defer = -1;        /* (the switch, read at the first load) */
+static int rb_sig_window;            /* (under the lock) from kernel_rb_load to kernel_rb_load_done */
+static u32 rb_sig_k[32], rb_sig_n;   /* (the objects signalled meanwhile; more than 32: every object looked at) */
+static long long rb_sig_deferred, rb_sig_stale, rb_sig_stale0, rb_sig_loads, rb_sig_bad_after;
+static int rb_sig_queue_bad(const KObject *o);
+static void notify_now(KObject *o);
 static void notify(KObject *o) {
+    if (rb_sig_window) {
+        int bad = 0;
+        if (o->first) {
+            rb_sig_deferred++;
+            if ((bad = rb_sig_queue_bad(o))) rb_sig_stale++;   /* (what the old code would have walked into) */
+        }
+        if (!rb_sig_defer) {   /* (SSBU_RB_LOAD_SIGNALS=0: walked at once, as before - said first when it will go wrong) */
+            if (bad && rb_sig_stale <= 20) {
+                fprintf(stderr, "[kernel] a signal in the middle of a load (object %u) walks a queue that disagrees with the stacks not yet put back (SSBU_RB_LOAD_SIGNALS=0)\n", (u32)(o - objects));
+                fflush(stderr);
+            }
+            notify_now(o);
+            return;
+        }
+        u32 k = (u32)(o - objects);
+        if (rb_sig_n < 32) { int seen = 0; for (u32 i = 0; i < rb_sig_n; i++) seen |= rb_sig_k[i] == k; if (!seen) rb_sig_k[rb_sig_n++] = k; }
+        else rb_sig_n = 33;
+        return;
+    }
+    notify_now(o);
+}
+static void notify_now(KObject *o) {
     while (o->first) {
         KThread *t = o->first->thread;
         unqueue_objects(t);
@@ -704,13 +747,83 @@ void kernel_map_status(void) {
 u64 rb_mem_changed[RB_CHANGES][2];
 volatile LONG rb_mem_nchanged;
 static int rb_switch = -1;   /* kernel_rb_switch(), once */
+#ifdef _WIN32   /* (hle_rb_state.c is Windows-only, as rollback is) */
+void rb_shadow_note(u64 at, u64 size);   /* (hle_rb_state.c: the shadow's copies of pages it shares with memory, made now) */
+#endif
 void rb_mem_note(u64 at, u64 size) {   /* (host.c too: modules loaded) */
     if (rb_switch < 0) rb_switch = kernel_rb_switch();
     if (!rb_switch) return;
+#ifdef _WIN32
+    rb_shadow_note(at, size);
+#endif
     LONG i = InterlockedIncrement(&rb_mem_nchanged) - 1;
     if (i < RB_CHANGES) { rb_mem_changed[i][0] = at; rb_mem_changed[i][1] = size; }
 }
+/* ---- the memory map's recent changes, for a crash report (kernel_fault_report) ----
+ * Every commit and decommit of guest memory the kernel makes (and a rollback load's, hle_rb_state.c), the last 1024,
+ * with when and on which host thread: a fault on an address that is not mapped then says what last happened there.
+ * Always on: an entry is a few stores. */
+typedef struct MemEvent { u64 ns, addr, size; u32 tid; char kind; } MemEvent;
+static MemEvent mem_events[1024];
+static volatile LONG64 mem_event_n;
+void kernel_mem_event(char kind, u64 addr, u64 size) {
+    LONG64 i = InterlockedIncrement64(&mem_event_n) - 1;
+    MemEvent *e = &mem_events[i & 1023];
+    e->ns = now_ns(); e->addr = addr; e->size = size; e->tid = GetCurrentThreadId(); e->kind = kind;
+}
+static const char *mem_event_name(char k) {
+    return k == 'C' ? "committed" : k == 'D' ? "decommitted (UnmapPhysicalMemory)" : k == 'U' ? "unmapped (UnmapMemory)" :
+           k == 'L' ? "pages decommitted by a rollback load, within" : k == 'R' ? "pages recommitted by a rollback load, within" : "?";
+}
+/* (host.c, a crash's report) What the kernel's map and Windows say about guest address g, and the recent changes near it.
+ * 0, nothing said: g is in none of the guest's reservations (a host pointer, 0xffff...: the report says so). */
+static const struct { u64 base, size; } guest_areas[] = {{HEAP_BASE, HEAP_LIMIT}, {ALIAS_BASE, ALIAS_SIZE}, {STACK_BASE, STACK_SIZE}, {KERNEL_BASE, TLR_AREA}};
+int kernel_fault_report(void (*line)(const char *), u64 g) {
+    char t[320];
+    MEMORY_BASIC_INFORMATION m;
+    int have = VirtualQuery(G2H(g), &m, sizeof m) != 0, guest = 0;
+    for (u32 i = 0; have && i < sizeof guest_areas / sizeof *guest_areas; i++)   /* (the kernel's own reservations) */
+        if (m.AllocationBase == G2H(guest_areas[i].base)) guest = 1;
+    if (have && m.AllocationBase && g >= 0x7100000000ull && g < NATIVE_BASE) guest = 1;   /* (a module's reservation, host.c) */
+    if (!guest) return 0;
+    int locked = TryEnterCriticalSection(&klock), found = 0;
+    for (u32 i = 0; i < region_count; i++)
+        if (g >= regions[i].base && g < regions[i].base + regions[i].size) {
+            snprintf(t, sizeof t, "  kernel map: %#llx in the region %#llx..%#llx (state %#x, permission %u)%s\n", g, regions[i].base,
+                     regions[i].base + regions[i].size, regions[i].state, regions[i].perm, locked ? "" : " (read without the kernel's lock)");
+            line(t); found = 1;
+        }
+    if (locked) LeaveCriticalSection(&klock);
+    if (!found) { snprintf(t, sizeof t, "  kernel map: %#llx is in no region of the guest's%s\n", g, locked ? "" : " (read without the kernel's lock)"); line(t); }
+    {
+        snprintf(t, sizeof t, "  Windows: the page is %s, protection %#lx, in the run %p..%p of the reservation at %p\n",
+                 m.State == MEM_COMMIT ? "committed" : m.State == MEM_RESERVE ? "reserved, not committed" : "free",
+                 (unsigned long)m.Protect, m.BaseAddress, (u8 *)m.BaseAddress + m.RegionSize, m.AllocationBase);
+        line(t);
+    }
+    LONG64 n = mem_event_n, from = n > 1024 ? n - 1024 : 0;
+    u64 now = now_ns();
+    int shown = 0;
+    line("  the memory map's changes within 16 MB of it, newest first (of the last 1024 changes):\n");
+    for (LONG64 i = n - 1; i >= from && shown < 24; i--) {
+        MemEvent *e = &mem_events[i & 1023];
+        if (e->addr + e->size + (16ull << 20) < g || e->addr > g + (16ull << 20)) continue;
+        snprintf(t, sizeof t, "    %.3f s ago, host thread %lu: %#llx..%#llx %s%s\n", (double)(now - e->ns) / 1e9, (unsigned long)e->tid,
+                 e->addr, e->addr + e->size, mem_event_name(e->kind), g >= e->addr && g < e->addr + e->size ? "  <- holds the address" : "");
+        line(t); shown++;
+    }
+    if (!shown) line("    (none)\n");
+    line("  the last 6 changes anywhere:\n");
+    for (LONG64 i = n - 1; i >= from && i >= n - 6; i--) {
+        MemEvent *e = &mem_events[i & 1023];
+        snprintf(t, sizeof t, "    %.3f s ago, host thread %lu: %#llx..%#llx %s\n", (double)(now - e->ns) / 1e9, (unsigned long)e->tid,
+                 e->addr, e->addr + e->size, mem_event_name(e->kind));
+        line(t);
+    }
+    return 1;
+}
 static void *commit(u64 at, u64 size, const char *what) {
+    kernel_mem_event('C', at, size);
     rb_mem_note(at, size);
     void *p = VirtualAlloc(G2H(at), size, MEM_COMMIT, PAGE_READWRITE);
     if (!p) rt_fatal("kernel: cannot commit %llu KiB at %#llx for %s (error %lu)", size >> 10, at, what, (unsigned long)GetLastError());
@@ -832,6 +945,13 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 
     t->mask = (u32)core < 3 ? 1ull << core : CORES;   /* (any core without SSBU_CORE_MASKS) */
     t->processor = (u32)core < 3 ? core : 0;
     t->id = next_thread_id++;
+    {   /* (SSBU_RB_IO_TRACE=1, test aid: the guest threads made and ended, to name the one behind a rollback's "LOAD
+         * refused: another number of guest threads than at the save"; hle_fs.c traces the files) */
+        static int trace = -1;
+        if (trace < 0) { const char *e = getenv("SSBU_RB_IO_TRACE"); trace = e && *e == '1'; }
+        if (trace) fprintf(stderr, "[rb-io] guest thread %u made: entry %#llx, priority %d, core %d (%u threads)\n", (unsigned)t->id,
+                           (unsigned long long)entry, (int)priority, (int)core, (unsigned)nthreads);
+    }
     if (recycle) reap();
     if (nspare_tlrs) {
         t->tlr = spare_tlrs[--nspare_tlrs];
@@ -860,13 +980,21 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 
 static __thread jmp_buf *exit_point;
 #endif
 
+extern int (*kernel_rb_io_enter)(void *kthread, const char *what);
+extern void (*kernel_rb_io_leave)(int token);
 static _Noreturn void exit_thread(KThread *t) {
+    int io = kernel_rb_io_enter ? kernel_rb_io_enter(t, "a guest thread ending") : 0;   /* (SSBU_RB_IO_BARRIER) */
+    {   static int trace = -1;   /* (SSBU_RB_IO_TRACE=1: see new_thread) */
+        if (trace < 0) { const char *e = getenv("SSBU_RB_IO_TRACE"); trace = e && *e == '1'; }
+        if (trace) fprintf(stderr, "[rb-io] guest thread %u ends (entry %#llx)\n", (unsigned)t->id, (unsigned long long)t->entry);
+    }
     EnterCriticalSection(&klock);
     t->exited = 1;
     objects[index_of(t->handle)].signaled = 1;
     notify(&objects[index_of(t->handle)]);
     if (recycle) release(index_of(t->handle));   /* (freed now if its handle was closed already) */
     LeaveCriticalSection(&klock);
+    if (io && kernel_rb_io_leave) kernel_rb_io_leave(io);
 #ifndef _WIN32
     if (exit_point) RT_LONGJMP(*exit_point, 1);
 #endif
@@ -977,6 +1105,10 @@ static u32 get_info(Cpu *c, u32 id, u64 sub, u64 *out) {
 /* An object signalled ends the call (the first in the handles), otherwise a cancel, otherwise a
  * timeout of 0; else the thread waits in each object's queue until a signal of one of them
  * (notify), a cancel or the deadline wakes it, and looks again. */
+/* (SSBU_RB_STDBENCH, hle_rb_core.c's rollback bench: test only) told when the display's buffer queue (ipc_vi.c) has no
+ * free buffer for the game (2) and when it next hands one out (3): between the two the guest main thread only waits
+ * for the display - the end of its tick. Unset (the default): nothing is called. */
+void (*kernel_pace_hook)(int phase);
 static u32 wait_objects(Cpu *c, u64 handles, u32 count, i64 timeout, u32 *index) {
     KThread *me = c->thread;
     u64 deadline = deadline_of(timeout);
@@ -1103,9 +1235,14 @@ static void system_call(Cpu *c, u32 n) {
     if (rt_trace) fprintf(stderr, "[svc %#04x] thread %llu x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n", n, me->id, x[0], x[1], x[2], x[3]);
 
     void skyline_note_sleep(void);
+    int movie_preroll_skip(u64 ns);
     /* calls that never touch shared kernel state */
     switch (n) {
     case 0x0B:   /* SleepThread(ns): non-positive values are yield requests */
+        if ((i64)x[0] > 0 && movie_preroll_skip(x[0])) {   /* (hle_movie.c: a movie's pre-roll with nothing left to wait for) */
+            SwitchToThread();
+            return;
+        }
         if ((i64)x[0] > 0) skyline_note_sleep();   /* (hle_skyline.c: ARCropolis' event thread going round) */
         if ((i64)x[0] > 0) {
             if (rb_switch > 0) {   /* (rollback: a kwait nothing wakes but a hold, so a hold can park it) */
@@ -1145,6 +1282,12 @@ static void system_call(Cpu *c, u32 n) {
         void *s = kernel_session_of(h);
         if (!s) { x[0] = R_INVALID_HANDLE; return; }
         x[0] = ipc_request(c, s, n == 0x21 ? c->tpidrro : x[0], n == 0x21 ? 0x100 : x[1]);
+#ifdef _WIN32
+        {   /* (rollback: the display buffer was handed out or refused - hle_rb_core.c rb_wait_point; no lock is held here) */
+            extern volatile LONG rb_vi_point; void rb_wait_point(Cpu *c);
+            if (rb_vi_point) rb_wait_point(c);
+        }
+#endif
         return;
     }
     }
@@ -1189,6 +1332,7 @@ static void system_call(Cpu *c, u32 n) {
                 gpu_memory_unmapping(maps[i].dst, maps[i].size);   /* (queued GPU work and the renderer may read it) */
                 watch_decommitting(maps[i].dst, maps[i].size);
                 rb_mem_note(maps[i].dst, maps[i].size);
+                kernel_mem_event('U', maps[i].dst, maps[i].size);
                 VirtualFree(G2H(maps[i].dst), maps[i].size, MEM_DECOMMIT);
                 unmap_range(maps[i].dst, maps[i].size);
                 maps[i].size = 0;
@@ -1321,6 +1465,7 @@ static void system_call(Cpu *c, u32 n) {
         gpu_memory_unmapping(x[0], x[1]);   /* (queued GPU work and the renderer may read it) */
         watch_decommitting(x[0], x[1]);
         rb_mem_note(x[0], x[1]);
+        kernel_mem_event('D', x[0], x[1]);
         VirtualFree(G2H(x[0]), x[1], MEM_DECOMMIT);
         unmap_range(x[0], x[1]);
         x[0] = R_OK;
@@ -1346,8 +1491,29 @@ static void system_call(Cpu *c, u32 n) {
     if (rt_trace) fprintf(stderr, "[svc %#04x] -> %#llx (x1=%#llx)\n", n, x[0], x[1]);
 }
 
+/* (rollback: hle_rb_core.c's barrier) A guest thread waiting for the barrier's window naps as SleepThread does under
+ * rollback - a kwait nothing wakes but its deadline or a hold - so a savestate's hold parks it there, in the kernel's own
+ * wait, as any sleeping thread. */
+void kernel_rb_nap(void *kthread, u32 ms) {
+    KThread *me = kthread;
+    if (!me) { Sleep(ms); return; }
+    u64 deadline = now_ns() + (u64)ms * 1000000ull;
+    EnterCriticalSection(&klock);
+    while (kwait(me, deadline)) {}
+    LeaveCriticalSection(&klock);
+}
+
+/* (rollback: hle_rb_core.c's barrier before an irreversible event, SSBU_RB_IO_BARRIER - set while a networked fight runs)
+ * A guest thread made or started: asked before, done after; a thread ending asks in exit_thread. */
+int (*kernel_rb_io_enter)(void *kthread, const char *what);
+void (*kernel_rb_io_leave)(int token);
 void rt_svc(Cpu *c, u32 n) {
+    /* (a thread made, 0x08, or started, 0x09: review of #498 - a start changes what a state holds of the threads too) */
+    static int start_on = -1;   /* (SSBU_RB_IO_START=0: a start not waited for, as before) */
+    if (start_on < 0 && kernel_rb_io_enter) { const char *e = getenv("SSBU_RB_IO_START"); start_on = !(e && *e == '0'); }
+    int io = (n == 0x08 || (n == 0x09 && start_on > 0)) && kernel_rb_io_enter ? kernel_rb_io_enter(c->thread, n == 0x08 ? "a guest thread made" : "a guest thread started") : 0;
     system_call(c, n);
+    if (io && kernel_rb_io_leave) kernel_rb_io_leave(io);
     if (host_priorities) follow_priority(c->thread);   /* (a priority changed during the call, its own or by another thread) */
 }
 
@@ -1382,6 +1548,14 @@ void kernel_thread_states(void (*line)(const char *text)) {
  * module code or the shared fonts. On Windows the guest lives at its own addresses, among the
  * host's own allocations, so this map, not the address range, says what is the guest's. Writes
  * up to max ranges to out[] (base, size); returns how many there are. */
+/* (diagnostic) The region holding guest address a: its state, base and size; -1 none. */
+int kernel_rb_region_at(u64 a, u64 *base, u64 *size) {
+    int s = -1;
+    EnterCriticalSection(&klock);
+    for (u32 i = 0; i < region_count; i++) if (a >= regions[i].base && a < regions[i].base + regions[i].size) { s = (int)regions[i].state; *base = regions[i].base; *size = regions[i].size; break; }
+    LeaveCriticalSection(&klock);
+    return s;
+}
 u32 kernel_rb_regions(u64 (*out)[2], u32 max) {
     u32 n = 0;
     EnterCriticalSection(&klock);
@@ -1410,6 +1584,19 @@ void kernel_rb_census(const void *self, u32 *alive, u32 *waiting, u32 *sleeping,
         else if (*nbusy < max) busy[(*nbusy)++] = t->id;
         else ++*nbusy;
     }
+}
+
+/* (rollback build) For a hold that failed: the alive guest threads other than `self`, up to max: each one's record
+ * (what kernel_rb_park is given), id, entry and host thread id. Read without the lock, as the census. */
+u32 kernel_rb_list(const void *self, void **kthread, u64 *id, u64 *entry, unsigned long *tid, u32 max) {
+    u32 n = 0;
+    for (u32 i = 0; i < nthreads && n < max; i++) {
+        KThread *t = threads[i];
+        if (!t || t == self || !t->started || t->exited || !t->host) continue;
+        kthread[n] = t; id[n] = t->id; entry[n] = t->entry; tid[n] = (unsigned long)GetThreadId(t->host);
+        n++;
+    }
+    return n;
 }
 
 /* (rollback build, M2) Wakes every guest thread from kwait, for a hold (rb_hold already set). */
@@ -1534,7 +1721,53 @@ void kernel_rb_load(const void *p) {
     rb_clock_fixed = s->clock_fixed; rb_vtick = s->vtick; rb_clock_off = s->clock_off;
     rb_gpu_base = s->gpu_base; rb_vtick_base = s->vtick_base; rb_gpu_off = s->gpu_off;
     rb_clock_gen++;   /* (every thread's per-read count starts again, as after the save's safe point) */
+    /* (the queues now point into the stacks as at the save, which come back at the load's end: signals wait for it) */
+    if (rb_sig_defer < 0) {
+        const char *e = getenv("SSBU_RB_LOAD_SIGNALS");
+        rb_sig_defer = !(e && *e == '0');
+        if (!rb_sig_defer) fprintf(stderr, "[kernel] SSBU_RB_LOAD_SIGNALS=0: a signal in the middle of a load wakes its waiters at once, as before\n");
+    }
+    rb_sig_window = 1; rb_sig_n = 0; rb_sig_stale0 = rb_sig_stale;   /* (switched off: only looked at, notify walks at once) */
     LeaveCriticalSection(&klock);
+}
+
+/* (diagnostic, counted in kernel_rb_load_done's line) Whether a queue as the load put it back disagrees with the threads'
+ * records - also put back - and with what their stacks hold now: each node must lie in a waiting thread's nodes and name
+ * that thread and this object. Only memory inside a thread's own nodes (its stack, as in use at the save) is read. What
+ * notify would have walked in the old code: a node naming no thread was the crash, others wake a thread whose record does
+ * not say it waits, or loop. */
+static int rb_sig_queue_bad(const KObject *o) {
+    const KWaitNode *n = o->first, *prev = NULL;
+    for (int steps = 0; n; steps++) {
+        const KThread *t = NULL;
+        for (u32 i = 0; i < nthreads && !t; i++) {
+            const KThread *u = threads[i];
+            if (u->wait == WAIT_OBJECTS && u->nodes && n >= u->nodes && n < u->nodes + u->wait_count) t = u;
+        }
+        if (!t || steps > 1024 || n->thread != t || n->object != o || n->prev != prev) return 1;
+        prev = n; n = n->next;
+    }
+    return o->last != prev;
+}
+
+/* (hle_rb_state.c finish_load: every thread's stack and the main thread's are the save's again) The signals that came
+ * during the load wake their waiters now. */
+void kernel_rb_load_done(void) {
+    EnterCriticalSection(&klock);
+    if (!rb_sig_window) { LeaveCriticalSection(&klock); return; }
+    rb_sig_window = 0;
+    if (rb_sig_n <= 32) {
+        for (u32 i = 0; i < rb_sig_n; i++) if (objects[rb_sig_k[i]].first && rb_sig_queue_bad(&objects[rb_sig_k[i]])) rb_sig_bad_after++;   /* (should stay 0) */
+        for (u32 i = 0; i < rb_sig_n; i++) if (objects[rb_sig_k[i]].signaled) notify_now(&objects[rb_sig_k[i]]);
+    }
+    else for (u32 i = 1; i < 4096; i++) if (objects[i].signaled && objects[i].first) notify_now(&objects[i]);
+    int say = rb_sig_n && (++rb_sig_loads <= 5 || rb_sig_loads % 500 == 0 || (rb_sig_stale > rb_sig_stale0 && rb_sig_stale <= 20));
+    u32 n = rb_sig_n;
+    rb_sig_n = 0;
+    LeaveCriticalSection(&klock);
+    if (say)
+        fprintf(stderr, "[kernel] a load: %u object(s) signalled during it, their waiters woken at its end (so far %lld loads; %lld signals found waiters, "
+                "%lld of them a queue that disagreed with the stacks not yet put back - what crashed before; %lld disagreed still at its end)\n", n, rb_sig_loads, rb_sig_deferred, rb_sig_stale, rb_sig_bad_after);
 }
 
 void kernel_dump_threads(void) {
@@ -1615,7 +1848,7 @@ void kernel_init(void) {
     for (u32 i = 0; i < sizeof areas / sizeof *areas; i++) {
         DWORD watch = areas[i].renderer || ring || rb_switch ? MEM_WRITE_WATCH : 0;
         if (VirtualAlloc(G2H(areas[i].base), areas[i].size, MEM_RESERVE | watch, PAGE_READWRITE) != G2H(areas[i].base))
-            rt_fatal("kernel: cannot reserve the %s area at %#llx", areas[i].what, areas[i].base);
+            rt_fatal("kernel: cannot reserve the %s area at %#llx (Windows error %lu)", areas[i].what, areas[i].base, GetLastError());
         if (ring) watch_add(areas[i].base, areas[i].size, (areas[i].renderer ? 1u << WATCH_RENDERER : 0) | 1u << WATCH_RING);
     }
     if (ring)

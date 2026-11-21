@@ -5,7 +5,21 @@
 #include <stddef.h>
 
 struct GfxBackend;
-/* (gpu_backend.c, once, at the first GPU work, when display.ini's renderer = vulkan) Start it: the
- * game's window, a device, a swap chain. Its entry points, or NULL with `why` saying why (Direct3D
- * 11 then draws). */
-const struct GfxBackend *vk_backend_start(char *why, size_t size);
+/* (gpu_backend.c, once, at the first GPU work, when display.ini's renderer = vulkan, or auto on
+ * Windows) Start it: the game's window, a device, a swap chain. Its entry points, or NULL with `why`
+ * saying why (Direct3D 11 then draws). automatic (renderer = auto): only on an AMD card, and not
+ * after two auto starts in a row that stopped before its 600th frame (a crash or a kill:
+ * vulkan_auto_trial.txt in the shader cache's folder counts them, gpu_vk.c's trial; renderer =
+ * vulkan takes it away). */
+const struct GfxBackend *vk_backend_start(char *why, size_t size, int automatic);
+/* (gpu_backend.c's gfx_present_again) the last frame shown once more, overlay and menu on top: 1, or 0
+ * before any frame (or with no Vulkan back end in this program). */
+int vk_present_again(void);
+/* (gpu_backend.c's gfx_match_want / gfx_match_wait, hle_fight_test.c) a match being set up: its fighters' and stage's
+ * pipelines made first (key: the ui_chara or ui_stage hash40; first: the match's first key), and its fight's first frame
+ * waits for them (the warm start's groups, gpu_vk.c). */
+void vk_match_want(unsigned long long key, int first);
+void vk_match_wait(void);
+/* (gpu_backend.c's gfx_warm_hint, hle_fight_test.c) pick 1: a human player's fighter or the stage of the match being set up,
+ * counted for the next starts (warm_picks.txt); pick 0: the stage the stage screen chose, its pipelines made next. */
+void vk_warm_hint(unsigned long long key, int pick);

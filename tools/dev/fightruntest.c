@@ -22,6 +22,7 @@
 #include "game_addr.h"
 #include "fight_test.h"
 #include "input_seq.h"
+#include "pad.h"
 
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -139,7 +140,9 @@ static SeqStepsFn *steps_fn;
 static int steps_set;
 void input_seq_set_steps(SeqStepsFn *fn) { steps_fn = fn; steps_set++; }
 int rb_ra_predicting(void) { return 0; }   /* (hle_rb_core.c: run-ahead, off here) */
+int net_match_on(void) { return 0; }       /* (hle_rb_core.c: no networked match here) */
 int input_seq2_on(void) { return 0; }      /* (hle_hid.c: player 2's sequence, SSBU_SEQ2: off here) */
+int pad_get(u32 slot, PadState *out) { (void)slot; (void)out; return 0; }   /* (hle_pad.c: no pad on any slot here) */
 static LPTHREAD_START_ROUTINE thread_fn;
 static int threads;
 HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID param, DWORD flags, DWORD *id) {
@@ -151,6 +154,9 @@ HANDLE CreateThread(void *security, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPV
 BOOL CloseHandle(HANDLE h) { (void)h; return 1; }
 static void (*sleep_tick)(void);
 void Sleep(DWORD ms) { (void)ms; if (sleep_tick) sleep_tick(); }
+void gfx_match_want(unsigned long long key, int first) { (void)key; (void)first; }   /* (gpu_backend.c: no renderer here) */
+void gfx_match_wait(void) {}
+void gfx_warm_hint(unsigned long long key, int pick) { (void)key; (void)pick; }
 void rt_upnp_remove(void) { fprintf(stderr, "(the relay's port mapping removed)\n"); }
 void ExitProcess(UINT code) { fflush(NULL); _exit((int)code); }
 

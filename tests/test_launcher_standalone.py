@@ -1,9 +1,9 @@
-"""OpenSmash.exe on its own (the release's OpenSmash Setup.exe): the first start's folder checks, the
+"""OpenSmash.exe on its own (the release's OpenSmash.exe): the first start's folder checks, the
 project ZIP's unpacking (ProjectSetup.InstallAsync) and the shortcuts, through the launcher's
 test entry points (--fetch-project, --find-project, --make-shortcuts), which open no window. ZIPs are
 made here, so nothing is downloaded; the remembered folder goes to OPENSMASH_SETTINGS_DIR and the
 shortcuts to a temporary folder, never the real desktop. Skipped off Windows and where the launcher
-is not built (Build Launcher.bat, or dotnet publish into OpenSmash.Launcher/bin/publish)."""
+is not built (toolsuild_launcher.ps1, or dotnet publish into OpenSmash.Launcher/bin/publish)."""
 from pathlib import Path
 import os
 import shutil
@@ -62,8 +62,8 @@ class StandaloneLauncherTests(unittest.TestCase):
         # an exe somewhere else, with no project around it, finds the remembered folder
         lone = self.dir / 'Downloads'
         lone.mkdir()
-        shutil.copy2(EXE, lone / 'OpenSmash Setup.exe')
-        code, out = self.run_exe('--find-project', exe=lone / 'OpenSmash Setup.exe')
+        shutil.copy2(EXE, lone / 'OpenSmash.exe')
+        code, out = self.run_exe('--find-project', exe=lone / 'OpenSmash.exe')
         self.assertEqual((code, out), (0, [str(target)]))
 
     def test_build_output_finds_its_repo(self):
@@ -126,15 +126,34 @@ class StandaloneLauncherTests(unittest.TestCase):
                 '"$($s.TargetPath)|$($s.Arguments)|$($s.WorkingDirectory)|$($s.IconLocation)"')
         for folder in (desk, start / 'OpenSmash'):
             got = {}
-            for name in ('OpenSmash.lnk', 'Play SSBU.lnk'):
+            self.assertFalse((folder / 'Play SSBU.lnk').exists(), folder)
+            self.assertFalse((folder / 'OpenSmash.lnk').exists(), folder)
+            for name in ('OpenSmash-Launcher.lnk', 'OpenSmash-Ultimate.lnk'):
                 lnk = folder / name
                 self.assertTrue(lnk.is_file(), lnk)
                 r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', read],
                                    capture_output=True, text=True, timeout=60, env=dict(os.environ, LNK=str(lnk)))
                 got[name] = r.stdout.strip().split('|')
-            self.assertEqual(got['OpenSmash.lnk'], [str(target / 'OpenSmash.exe'), '', str(target), str(target / 'OpenSmash.exe') + ',0'])
-            self.assertEqual(got['Play SSBU.lnk'], [str(target / 'OpenSmash.exe'), '--play', str(target),
-                                                    str(target / 'docs' / 'assets' / 'windowsmash.ico') + ',0'])
+            icon = str(target / 'OpenSmash.exe') + ',0'
+            self.assertEqual(got['OpenSmash-Launcher.lnk'], [str(target / 'OpenSmash.exe'), '', str(target), icon])
+            self.assertEqual(got['OpenSmash-Ultimate.lnk'], [str(target / 'OpenSmash.exe'), '--play', str(target), icon])
+
+    def test_a_windowsmash_folder_has_no_launcher_fingerprint(self):
+        # A WindowSmash copy (no OpenSmash.Launcher, no tools/build_launcher.ps1) with the release's OpenSmash.exe put
+        # in it: Update compares this before and after, and an error here stopped the update before it ran.
+        ws = self.dir / 'WindowSmash'
+        (ws / 'tools').mkdir(parents=True)
+        (ws / 'tools' / 'install_windowsmash.ps1').write_text("$RepoName = 'WindowSmash'")
+        (ws / 'tools' / 'source_version.txt').write_text('598d05240fc146f7184b3450653e2eec2ee97312 2026-11-03')
+        (ws / 'Install WindowSmash.bat').write_text('@echo off')
+        code, out = self.run_exe('--launcher-fingerprint', str(ws))
+        self.assertEqual((code, out), (0, ['none']))
+        (ws / 'OpenSmash.Launcher').mkdir()
+        (ws / 'OpenSmash.Launcher' / 'OpenSmash.Launcher.csproj').write_text('<Project />')
+        (ws / 'tools' / 'build_launcher.ps1').write_text('# build')
+        code, out = self.run_exe('--launcher-fingerprint', str(ws))
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out[0], r'^fingerprint [0-9A-F]{64}$')
 
     def test_shortcuts_need_a_desktop_folder(self):
         code, out = self.run_exe('--make-shortcuts', str(self.dir))

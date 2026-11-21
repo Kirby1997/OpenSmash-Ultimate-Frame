@@ -12,7 +12,10 @@ import ladder
 import progress
 from ladder import CRASH_SIGNS, RETRY, crash_cause, crash_report, crashed  # noqa: F401 (the crash retry's, here before)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The folder as Windows spells it on disk (realpath there): the compile commands name it (runtime/, deps/), and
+# objcache.py keys each object on its command, so a build started from a folder typed in other capitals
+# (C:\users\... for C:\Users\..., as a WSL shell or a typed cd gives) compiled the whole game again.
+ROOT = os.path.dirname(os.path.dirname((os.path.realpath if os.name == "nt" else os.path.abspath)(__file__)))
 RUNTIME = os.path.join(ROOT, "runtime")
 DEPS_LLVM = os.path.join(ROOT, "deps", "llvm")   # tools/msvc_deps.py sets these two up
 DEPS_MSVC = os.path.join(ROOT, "deps", "msvc")
@@ -82,7 +85,7 @@ def base_cflags(target):
 
 
 BASE_CFLAGS = base_cflags(ISA)
-CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
+CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME, "/I", os.path.join(ROOT, "third_party", "enet", "include")]
 # runtime/cpu_check.c's: for any x64 processor, as it checks the processor before anything else runs
 CHECK_CFLAGS = [*base_cflags(isa.ANY), "/I", RUNTIME]
 # The generated C's flags: it includes recomp.h or module.h, which read none of the runtime's defines and
@@ -192,7 +195,7 @@ def compile_command(src, obj, opt, flags=None, header=None):
 
 
 def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, compiled=None, flags=None, shown=None,
-                 infos=None, steps=None, times=None):
+                 infos=None, steps=None, times=None, failed=None, skip=None):
     """Compile (src, obj, opt) triples in parallel, in order, with flags (CFLAGS unless given); returns
     [(src, error text)] for failures. started(job) and finished(job, seconds), if given, are called
     (from the worker threads) as each one starts and ends (shown: a progress.Build, which also hears
@@ -200,10 +203,24 @@ def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, com
     it compiled at. A file the compiler crashed on is compiled again once the others are done, on its
     own (RETRY); log() says so. infos {obj: ladder.Info}: the generated files, which have a time limit
     and the rest of the ladder (steps: the build's ladder.Ladder, else one of its own); times: the
-    build folder's ladder.Times."""
+    build folder's ladder.Times. failed(job) and skip(job): ladder.Ladder.compile's."""
     steps = steps or ladder.Ladder(progress.level_cost, "clang-cl", log)
     return steps.compile(jobs_list, jobs, lambda job, level, header: compile_command(job[0], job[1], level, flags, header),
-                         infos, shown, started, finished, compiled, times)
+                         infos, shown, started, finished, compiled, times, failed, skip)
+
+
+def link_map(out):
+    """The linker's option for the program's map (build/ssbu.map, 0.8 GB: only runtime/debug_profile.c's profiler
+    reads it, for names). SSBU_LINK_MAP=0: none written, and one left by an earlier link removed (it would name
+    another program's addresses)."""
+    path = out[:-4] + ".map"
+    if os.environ.get("SSBU_LINK_MAP", "1").strip() != "0":
+        return ["/MAP:" + path]
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return []
 
 
 def link_command(rsp, exe, options=(), libs=()):
@@ -281,7 +298,7 @@ def link(objs, exe, options=()):
         with open(rsp, "w") as f:
             f.write("\n".join(f'"{o}"' for o in inputs))
         r = subprocess.run(link_command(rsp, exe, ["/HIGHENTROPYVA:NO", "/MANIFEST:NO", "/OPT:REF", "/OPT:NOICF",
-                                                   "/MAP:" + exe[:-4] + ".map", *options], EXTRA_LIBS),
+                                                   *link_map(exe), *options], EXTRA_LIBS),
                            capture_output=True, text=True)
         if not r.returncode:
             break
@@ -301,7 +318,7 @@ def library_command(rsp, dll):
     the runtime calls (the game's C reaches the runtime through the tables the library hands it). Placed as
     the program is (/HIGHENTROPYVA:NO); its one export is the function that hands over those tables."""
     return [CLANG, "/nologo", "/LD", *LINK_FLAGS, "@" + rsp, "/Fe" + dll, "/link", *LINK_OPTIONS, "/HIGHENTROPYVA:NO",
-            "/MAP:" + dll[:-4] + ".map"]
+            *link_map(dll)]
 
 
 def link_library(objs, dll):

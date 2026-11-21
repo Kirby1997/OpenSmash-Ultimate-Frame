@@ -192,6 +192,114 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertIn('--game D:\\G --keys D:\\K --no-firmware', out)
         self.assertIn('--game D:\\G --keys D:\\K --firmware D:\\F', out)
 
+    def test_update_build_answers_use_saved_game_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game, keys, fw = (os.path.join(tmp, n) for n in ('Game', 'Keys', 'Firmware'))
+            for d in (game, keys, fw):
+                os.makedirs(d)
+            got = ps(f"$global:saved = @{{ game = '{game}'; keys = '{keys}'; firmware = '{fw}' }}; "
+                     "function Get-SavedFolders { $global:saved }; "
+                     "function Get-FolderCandidates { @{ Game = @(); Keys = @(); Firmware = @() } }; "
+                     "$a = Get-UpdateBuildAnswers; "
+                     "@{ game = $a.Game; keys = $a.Keys; firmware = $a.Firmware }")
+            self.assertEqual(got, {'game': game, 'keys': keys, 'firmware': fw})
+
+            # (a saved folder that is gone - moved, a drive unplugged - is left out, not an error: a game already set
+            # up needs none, and the launcher has no setup to open; issue #340)
+            os.rmdir(game)
+            out = ps_text(f"$global:saved = @{{ game = '{game}'; keys = '{keys}' }}; "
+                          "function Get-SavedFolders { $global:saved }; "
+                          "function Get-FolderCandidates { @{ Game = @(); Keys = @(); Firmware = @() } }; "
+                          "try { $a = Get-UpdateBuildAnswers; 'GAME: [' + $a.Game + '] KEYS: [' + $a.Keys + ']' } "
+                          "catch { 'ERROR: ' + $_.Exception.Message }")
+            self.assertIn(f'GAME: [] KEYS: [{keys}]', out)
+            self.assertNotIn('ERROR', out)
+
+    def test_current_build_reads_the_game_folder_again_for_dlc(self):
+        # (issue #340: DLC added after the first build; no build is needed, but step 7 of build_game.py is run)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'build'))
+            Path(tmp, 'build', 'ssbu.exe').write_bytes(b'current game')
+            run = (f"$Root = '{tmp}'; $DryRun = $false; $Rebuild = $false; $SkipBuild = $false; "
+                   "$global:calls = [Collections.Generic.List[string]]::new(); "
+                   "function Invoke-Python { param($Arguments) $a = @($Arguments); $a[0] = Split-Path $a[0] -Leaf; "
+                   "$global:calls.Add($a -join ' '); if ($a[0] -eq 'build_game.py') { return $global:prep }; return 0 }; ")
+            out = ps_text(run + "$global:prep = 0; "
+                          "$r = Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' }; "
+                          "'RESULT: ' + $r; 'CALLS: ' + ($global:calls -join '|')")
+            # (--std-plugins: the standard plugins are listed before the build, SSBU_PLUGINS_FIRST)
+            self.assertIn('build_game.py --game D:\\Game --keys D:\\Keys --no-firmware --std-plugins --prepare-only', out)
+            self.assertIn('RESULT: True', out)
+            self.assertNotIn('run OpenSmash.exe again', out)
+
+            # (the folder can't be read: a warning, and the update goes on with the game as it was)
+            out = ps_text(run + "$global:prep = 1; "
+                          "$r = Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' }; 'RESULT: ' + $r")
+            self.assertIn('could not be read again', out)
+            self.assertIn('RESULT: True', out)
+
+            # (no game folder - the update's, gone since: nothing is read, nothing stops)
+            out = ps_text(run + "$global:prep = 1; "
+                          "$r = Step-Build @{ Game = $null; Keys = $null; Firmware = $null }; "
+                          "'RESULT: ' + $r; 'CALLS: ' + ($global:calls -join '|')")
+            self.assertNotIn('build_game.py', out.split('CALLS: ')[-1])
+            self.assertIn('RESULT: True', out)
+
+    def test_build_leaves_out_a_folder_it_was_not_given(self):
+        out = ps_text("$DryRun = $true; $Script:Python = @('python'); "
+                      "Step-Build @{ Game = $null; Keys = $null; Firmware = $null } | Out-Null")
+        self.assertIn('build_game.py --no-firmware', out)
+        self.assertNotIn('--game', out)
+
+    def test_update_game_build_checks_prerequisites_before_build(self):
+        out = ps_text("$global:steps = [Collections.Generic.List[string]]::new(); "
+                      "function Step-CheckPc { $global:steps.Add('pc') }; "
+                      "function Step-Python { $global:steps.Add('python') }; "
+                      "function Test-Compiler { $global:steps.Add('compiler'); @{ Ok = $true; Output = '' } }; "
+                      "function Step-Sdl3 { $global:steps.Add('sdl') }; "
+                      "function Step-Codecs { $global:steps.Add('codecs') }; "
+                      "function Get-UpdateBuildAnswers { $global:steps.Add('answers'); @{ Game = 'D:\\Game'; Keys = 'D:\\Keys' } }; "
+                      "function Step-Build { param($Answers) $global:steps.Add('build:' + $Answers.Game) }; "
+                      "Invoke-UpdateGameBuild; $global:steps -join ','")
+        self.assertIn('pc,python,compiler,sdl,codecs,answers,build:D:\\Game', out)
+
+        out = ps_text("$global:steps = [Collections.Generic.List[string]]::new(); "
+                      "function Step-CheckPc { $global:steps.Add('pc') }; "
+                      "function Step-Python { $global:steps.Add('python') }; "
+                      "function Test-Compiler { $global:steps.Add('compiler'); @{ Ok = $false; Output = 'missing clang' } }; "
+                      "function Step-Sdl3 { $global:steps.Add('sdl') }; "
+                      "function Step-Codecs { $global:steps.Add('codecs') }; "
+                      "function Get-UpdateBuildAnswers { @{ Game = 'D:\\Game'; Keys = 'D:\\Keys' } }; "
+                      "function Step-Build { $global:steps.Add('build') }; "
+                      "try { Invoke-UpdateGameBuild } catch { 'ERROR: ' + $_.Exception.Message }; "
+                      "'STEPS: ' + ($global:steps -join ',')")
+        self.assertIn('ERROR: The game compiler is not ready.', out)
+        self.assertIn('STEPS: pc,python,compiler', out)
+
+    def test_update_game_build_skips_current_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'build'))
+            Path(tmp, 'build', 'ssbu.exe').write_bytes(b'current game')
+            out = ps_text(f"$Root = '{tmp}'; $DryRun = $false; $Rebuild = $false; $SkipBuild = $false; "
+                          "function Invoke-Python { return 0 }; "
+                          "Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' } | Out-Null")
+        self.assertIn('nothing that goes into the game changed: no build', out)
+
+    def test_build_forgets_stale_prepared_shaders(self):
+        # (built, or nothing to build: tools\shader_aot.py --forget-stale asks for Prepare Shaders again when the
+        # prepared SPIR-V's names are not the game's; an update before this one may have changed them)
+        for built, forgets in (('$true', True), ('$false', False)):   # ($false: a dry run, or -SkipBuild)
+            out = ps_text("$global:calls = [Collections.Generic.List[string]]::new(); "
+                          "function Step-CheckPc { }; function Step-Python { }; function Step-Sdl3 { }; function Step-Codecs { }; "
+                          "function Test-Compiler { @{ Ok = $true; Output = '' } }; "
+                          "function Get-UpdateBuildAnswers { @{ Game = 'D:\\Game'; Keys = 'D:\\Keys' } }; "
+                          f"function Step-Build {{ {built} }}; "
+                          "function Invoke-Python { param($Arguments) $global:calls.Add((Split-Path $Arguments[0] -Leaf) + ' ' + $Arguments[1]); return 0 }; "
+                          "Invoke-UpdateGameBuild; 'CALLS: ' + ($global:calls -join '|')")
+            self.assertEqual('shader_aot.py --forget-stale' in out.split('CALLS: ')[-1], forgets, out)
+        # (the setup window's build: the same, after Step-Build in Main)
+        self.assertRegex(SCRIPT.read_text(encoding='utf-8'), r'\$built = Step-Build \$answers\s+if \(\$built\) \{ Step-StaleShaders \}')
+
     def test_firmware_question_optional(self):
         # -NoWizard: the question says it is optional and what for; Enter on nothing, or none over the one found, is none
         mocks = ("$global:prompts = @(); "
@@ -419,6 +527,158 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertIn('tools/source_version.txt export-subst', attributes.splitlines())
         self.assertIn('$Format:%H', (ROOT / 'tools/source_version.txt').read_text())
 
+    def test_foreign_commit(self):
+        shared = '8025b483b0443adb5668395eca31f9250e8c8efb'
+        other = '9fdc8fd21b3fde86c3e58a1e634a7e76a87220c7'
+        got = ps("@{ ws = (Resolve-ForeignCommit '598d05240fc146f7184b3450653e2eec2ee97312'); "
+                 "upper = (Resolve-ForeignCommit '3D5BA9095BF4A2C0D146DF31ADEC0D59B8337BBB'); "
+                 f"other = (Resolve-ForeignCommit '{other}') }}")
+        self.assertEqual(got, {'ws': shared, 'upper': shared, 'other': other})
+
+    def test_published_sha256(self):
+        h = '100e41cb62feabba16563990abbea1e1112def73a8098fa604b9b3369165c218'
+        got = ps(f"@{{ a = (Read-PublishedSha256 '{h.upper()}  OpenSmash.exe'); b = (Read-PublishedSha256 '{h}'); "
+                 f"c = (Read-PublishedSha256 'Not Found'); d = (Read-PublishedSha256 '{h}0  x') }}")
+        self.assertEqual(got, {'a': h, 'b': h, 'c': None, 'd': None})
+
+    def test_launcher_exe_refresh(self):
+        # An OpenSmash.exe that is not the latest release's is swapped for it (the old one kept as .old); the release's
+        # own, a copy following main, and a git checkout are left alone. Downloads are made up.
+        new = b'MZ new launcher'
+        new_hash = __import__('hashlib').sha256(new).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            def run(ref, exe, git=False, text=None, download=b'MZ new launcher', old_left=None, rebuilds=False):
+                for name in ('OpenSmash.exe', 'OpenSmash.exe.old', 'OpenSmash.exe.download'):
+                    if os.path.exists(os.path.join(root, name)):
+                        os.remove(os.path.join(root, name))
+                if exe is not None:
+                    Path(root, 'OpenSmash.exe').write_bytes(exe)
+                if old_left is not None:
+                    Path(root, 'OpenSmash.exe.old').write_bytes(old_left)
+                if git:
+                    os.makedirs(os.path.join(root, '.git'), exist_ok=True)
+                elif os.path.isdir(os.path.join(root, '.git')):
+                    os.rmdir(os.path.join(root, '.git'))
+                body = text if text is not None else f"'{new_hash}  OpenSmash.exe'"
+                mocks = (f"$Root = '{root}'; $Script:UpdateRef = '{ref}'; $env:OPENSMASH_LAUNCHER_REBUILDS = '{'1' if rebuilds else ''}'; "
+                         f"function Get-Text {{ param($Url) $Url | Out-File -Append -LiteralPath (Join-Path $Root 'urls.txt'); {body} }}; "
+                         f"function Invoke-Download {{ param($Url, $Dest, $What) [IO.File]::WriteAllText($Dest, '{download.decode()}') }}; ")
+                out = ps_text(mocks + "'swapped=' + (Update-LauncherExe)")
+                exe_path = Path(root, 'OpenSmash.exe')
+                self.assertFalse(os.path.exists(os.path.join(root, 'OpenSmash.exe.download')), out)   # never left behind
+                return (out, exe_path.read_bytes() if exe_path.exists() else None,
+                        os.path.exists(os.path.join(root, 'OpenSmash.exe.old')))
+            out, exe, old = run('v0.5.0', b'MZ old launcher')
+            self.assertIn('swapped=True', out)
+            self.assertIn("OpenSmash.exe is now v0.5.0's", out)
+            self.assertEqual(exe, new)
+            self.assertTrue(old)
+            self.assertIn('/releases/download/v0.5.0/OpenSmash.exe.sha256', Path(root, 'urls.txt').read_text('utf-16'))
+            out, exe, old = run('v0.5.0', new)
+            self.assertIn('swapped=False', out)
+            self.assertIn("OpenSmash.exe is v0.5.0's", out)
+            out, exe, _ = run('main', b'MZ old launcher')
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            out, exe, _ = run('v0.5.0', b'MZ old launcher', git=True)
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            out, exe, _ = run('v0.5.0', b'MZ old launcher', rebuilds=True)   # the new launcher rebuilds it itself
+            self.assertIn('swapped=False', out)
+            self.assertEqual(exe, b'MZ old launcher')
+            # a download that is not what the checksum says, no network, no checksum: the old one stays, untouched
+            for kwargs in ({'download': b'MZ tampered'}, {'text': "throw 'no network'"}, {'text': "'Not Found'"}):
+                out, exe, old = run('v0.5.0', b'MZ old launcher', **kwargs)
+                self.assertIn('swapped=False', out, kwargs)
+                self.assertEqual(exe, b'MZ old launcher', kwargs)
+                self.assertFalse(old, kwargs)
+            # last time's swap: the .old is removed; a swap that stopped half-way (no OpenSmash.exe) gets it back
+            out, exe, old = run('v0.5.0', new, old_left=b'MZ old launcher')
+            self.assertEqual((exe, old), (new, False))
+            out, exe, old = run('v0.5.0', None, old_left=b'MZ old launcher', text="throw 'no network'")
+            self.assertEqual((exe, old), (b'MZ old launcher', False))
+
+    def test_update_ref_never_main_by_mistake(self):
+        # The release channel: the API's tag; its 404 (no release) is main; the API failing (no network, its hourly limit)
+        # asks github.com's releases/latest page, and with no answer at all the ref is unknown ($null), never main: a
+        # release copy was compared with main and its finished update called unfinished (Discord, 2026-11-18).
+        def ref(api, page):
+            return ps(f"$env:OPENSMASH_UPDATE_CHANNEL = 'release'; $Root = [IO.Path]::GetTempPath(); "
+                      f"function Invoke-Api {{ param($Url) {api} }}; function Get-LatestReleaseFromPage {{ {page} }}; "
+                      "@{ ref = (Get-UpdateRef); why = $Script:UpdateRefProblem }")
+        ok = "@{ Ok = $true; Data = [pscustomobject]@{ tag_name = 'v0.4.1' } }"
+        limit = "@{ Ok = $false; NotFound = $false; Error = 'HTTP 403' }"
+        none = "@{ Ok = $false; NotFound = $true; Error = 'HTTP 404' }"
+        silent = "@{ Tag = $null; NoRelease = $false }"
+        self.assertEqual(ref(ok, "throw 'not asked'")['ref'], 'v0.4.1')
+        self.assertEqual(ref(none, "throw 'not asked'")['ref'], 'main')
+        self.assertEqual(ref(limit, "@{ Tag = 'v0.4.1'; NoRelease = $false }")['ref'], 'v0.4.1')
+        self.assertEqual(ref(limit, "@{ Tag = $null; NoRelease = $true }")['ref'], 'main')
+        self.assertEqual(ref(limit, silent), {'ref': None, 'why': 'HTTP 403'})
+        got = ps("@{ a = (Read-ReleaseTagFromUrl 'https://github.com/O/R/releases/tag/v0.4.1'); "
+                 "b = (Read-ReleaseTagFromUrl 'https://github.com/O/R/releases/tag/v1.0%2Bx'); "
+                 "c = (Read-ReleaseTagFromUrl 'https://github.com/O/R/releases'); d = (Read-ReleaseTagFromUrl '') }")
+        self.assertEqual(got, {'a': 'v0.4.1', 'b': 'v1.0+x', 'c': None, 'd': None})
+
+    def test_update_with_the_release_unknown(self):
+        # Step-Update with GitHub not saying which release is the latest: no update (to main or anything), a warning; and
+        # the launcher's proof line (__OPENSMASH_SOURCE__) when the copy is checked to be the release's.
+        with tempfile.TemporaryDirectory() as root:
+            local = 'a' * 40
+            Path(root, 'tools').mkdir()
+            Path(root, 'tools', 'source_version.txt').write_text(f'{local} 2026-11-17')
+            base = (f"$env:OPENSMASH_UPDATE_CHANNEL = 'release'; $Root = '{root}'; "
+                    "function Get-LatestReleaseFromPage { @{ Tag = $null; NoRelease = $false } }; "
+                    "function Update-FromZip { 'ZIP ' + $args[1] }; ")
+            out = ps_text(base + "function Invoke-Api { param($Url) $Url | Out-Host; @{ Ok = $false; NotFound = $false; Error = 'HTTP 403' } }; "
+                          "'result=' + (Step-Update)")
+            self.assertIn('result=False', out)
+            self.assertIn('which release is the latest (HTTP 403)', out)
+            self.assertNotIn('/commits/main', out)
+            self.assertNotIn('ZIP', out)
+            current = ("function Invoke-Api { param($Url) if ($Url -like '*/releases/latest') { @{ Ok = $true; Data = [pscustomobject]@{ tag_name = 'v0.4.1' } } } "
+                       f"else {{ @{{ Ok = $true; Data = [pscustomobject]@{{ sha = '{local}'; commit = [pscustomobject]@{{ committer = [pscustomobject]@{{ date = '2026-11-17T00:00:00Z' }} }} }} }} }} }}; ")
+            out = ps_text(base + current + "'result=' + (Step-Update)")
+            self.assertIn('result=False', out)
+            self.assertIn('__OPENSMASH_SOURCE__ ' + local, out)
+
+    def test_launcher_only_fallback(self):
+        # -LauncherOnly (a launcher rebuild that failed): the release's OpenSmash.exe, whatever OPENSMASH_LAUNCHER_REBUILDS
+        # says; $Script:LauncherIsRelease tells the helper whether OpenSmash.exe is the release's afterwards.
+        new = b'MZ new launcher'
+        new_hash = __import__('hashlib').sha256(new).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            def run(ref, exe):
+                Path(root, 'OpenSmash.exe').write_bytes(exe)
+                for name in ('OpenSmash.exe.old',):
+                    if os.path.exists(os.path.join(root, name)):
+                        os.remove(os.path.join(root, name))
+                mocks = (f"$Root = '{root}'; $Script:UpdateRef = {ref}; $env:OPENSMASH_LAUNCHER_REBUILDS = ''; "
+                         "function Get-LatestReleaseFromPage { @{ Tag = $null; NoRelease = $false } }; "
+                         "function Invoke-Api { @{ Ok = $false; NotFound = $false; Error = 'HTTP 403' } }; "
+                         f"function Get-Text {{ '{new_hash}  OpenSmash.exe' }}; "
+                         f"function Invoke-Download {{ param($Url, $Dest, $What) [IO.File]::WriteAllText($Dest, '{new.decode()}') }}; ")
+                return ps_text(mocks + "[void](Update-LauncherExe); 'release=' + $Script:LauncherIsRelease")
+            self.assertIn('release=True', run("'v0.4.1'", b'MZ old launcher'))   # swapped
+            self.assertIn('release=True', run("'v0.4.1'", new))                  # already the release's
+            self.assertIn('release=False', run("'main'", b'MZ old launcher'))    # following main: nothing to take
+            out = run('$null', b'MZ old launcher')                                 # GitHub not saying: nothing done
+            self.assertIn('release=False', out)
+            self.assertEqual(Path(root, 'OpenSmash.exe').read_bytes(), b'MZ old launcher')
+        text = SCRIPT.read_text(encoding='utf-8')
+        self.assertRegex(text, r"if \(\$LauncherOnly\) \{[^}]*OPENSMASH_LAUNCHER_REBUILDS = ''")
+        for helper in ('tools/rebuild_launcher_after_update.ps1', 'tools/rebuild-all.ps1'):
+            self.assertIn('-LauncherOnly', (ROOT / helper).read_text(encoding='utf-8'), helper)
+
+    def test_sha256(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, 'f').write_bytes(b'abc')
+            want = __import__('hashlib').sha256(b'abc').hexdigest()
+            f = os.path.join(root, 'f')
+            got = ps(f"@{{ h = (Get-Sha256 '{f}'); ok = (Test-FileSha256 '{f}' '{want.upper()}'); "
+                     f"bad = (Test-FileSha256 '{f}' '{'0' * 64}') }}")
+            self.assertEqual(got, {'h': want, 'ok': True, 'bad': False})
+
     def test_update_decision(self):
         got = ps("@{ a = (Get-UpdateDecision 'ahead'); i = (Get-UpdateDecision 'identical'); b = (Get-UpdateDecision 'behind'); "
                  "d = (Get-UpdateDecision 'diverged'); x = (Get-UpdateDecision 'something') }")
@@ -575,6 +835,26 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertEqual([got['v1'], got['v2'], got['v3'], got['v4'], got['v5']], [True, True, False, False, False])
         self.assertEqual(got['d1'], 35)
         self.assertEqual(got['d2'], 0)
+
+    def test_venv_base(self):
+        # deps\venv is made from 3.10 up to $PythonMinor (the tested one), never the Microsoft Store's Python
+        store = 'C:\\Users\\a\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_q\\python.exe'
+        got = ps("@{ ok = (Test-VenvBase '3.13.3' 'C:\\Python313\\python.exe'); top = (Test-VenvBase '3.14.2' 'C:\\Python314\\python.exe'); "
+                 "new = (Test-VenvBase '3.15.0a1' 'C:\\Python315\\python.exe'); old = (Test-VenvBase '3.9.13' 'C:\\Python39\\python.exe'); "
+                 f"store = (Test-VenvBase '3.13.3' '{store}'); none = (Test-VenvBase '3.13.3' ''); minor = $PythonMinor }}")
+        self.assertEqual(got['minor'], '3.14')
+        self.assertEqual([got[k] for k in ('ok', 'top', 'new', 'old', 'store', 'none')], [True, True, False, False, False, False])
+
+    def test_toml_check_before_python_311(self):
+        check = re.search(r"^\$TomlCheck = '(.*)'\r?$", SCRIPT.read_text(encoding='utf-8'), re.M).group(1).replace("''", "'")
+        older = "import sys; sys.version_info = (3, 10, 12, 'final', 0); "
+        r = subprocess.run([sys.executable, '-c', older + "import importlib.util as u; "
+                            "u.find_spec = lambda n, _f=u.find_spec: None if n == 'tomli' else _f(n); " + f'exec({check!r})'],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stderr), (1, ''))          # 3.10 without tomli: a plain no
+        if sys.version_info >= (3, 11):                              # (the tools still run on 3.10, maybe without tomli)
+            r = subprocess.run([sys.executable, '-c', check], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)              # this Python (3.11 or newer): tomllib
 
 
 class InstallerPatternTests(unittest.TestCase):

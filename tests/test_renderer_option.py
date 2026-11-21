@@ -57,23 +57,78 @@ class RendererOption(unittest.TestCase):
 
     def test_names(self):
         out, _ = self.run_test('parse', 'vulkan', 'parse', 'Vulkan', 'parse', 'vk', 'parse', 'd3d11', 'parse', 'DXVK', 'parse', 'metal',
-                               'parse', 'auto', 'parse', 'opengl', 'parse', '')
-        self.assertEqual(out, ['parse vulkan -> 1 vulkan', 'parse Vulkan -> 1 vulkan', 'parse vk -> 1 vulkan', 'parse d3d11 -> 0 d3d11',
-                               'parse DXVK -> 0 d3d11', 'parse metal -> 0 d3d11', 'parse auto -> 0 d3d11', 'parse opengl -> -1 -',
-                               'parse  -> -1 -'])
+                               'parse', 'auto', 'parse', 'direct3d11', 'parse', 'DX11', 'parse', 'opengl', 'parse', '')
+        # (d3d11, the value every default display.ini before auto was written with, is auto; direct3d11 is Direct3D 11)
+        self.assertEqual(out, ['parse vulkan -> 1 vulkan', 'parse Vulkan -> 1 vulkan', 'parse vk -> 1 vulkan', 'parse d3d11 -> 0 auto',
+                               'parse DXVK -> 0 auto', 'parse metal -> 0 auto', 'parse auto -> 0 auto', 'parse direct3d11 -> 2 direct3d11',
+                               'parse DX11 -> 2 direct3d11', 'parse opengl -> -1 -', 'parse  -> -1 -'])
+
+    def test_every_display_value_the_menu_writes_reads_back(self):
+        """Each Display row's values, written as runtime/gpu_menu.c's change() writes them, are read back by the game:
+        a setting changed in the menu is still there at the next start. No warning about any of them."""
+        rows = [  # (written to display.ini, what the game then has)
+            ('window = windowed\nwidth = 2580\nheight = 1080\n', 'window 0 size 2580x1080'),
+            ('window = borderless\n', 'window 1 '), ('window = fullscreen\n', 'window 2 '),
+            ('pacing = clock\n', 'pacing 0 '), ('pacing = vrr\n', 'pacing 1 '), ('pacing = display\n', 'pacing 2 '),
+            ('latency = 1\n', 'latency 1 '), ('latency = 3\n', 'latency 3 '),
+            ('hide_cursor = 0\n', 'cursor 0 '), ('hide_cursor = 1\n', 'cursor 1 '),
+            ('overlay = 0\n', 'overlay 0 '), ('overlay = 1\n', 'overlay 1 '),
+            ('render_scale = 1\n', 'scale 1 '), ('render_scale = auto\n', 'scale 0 '), ('render_scale = 1.5\n', 'scale 1.5 '),
+            ('render_scale = 2\n', 'scale 2 '), ('render_scale = 3\n', 'scale 3 '),
+            ('renderer = auto\n', 'renderer auto '), ('renderer = direct3d11\n', 'renderer direct3d11 '), ('renderer = vulkan\n', 'renderer vulkan '),
+            ('aspect = 16:9\n', 'aspect 16:9 '), ('aspect = auto\n', 'aspect auto '), ('aspect = 21:9\n', 'aspect 21:9 '), ('aspect = 32:9\n', 'aspect 32:9 '),
+            ('view = wide\n', 'view 0 '), ('view = zoomed\n', 'view 1 '), ('view = hybrid\n', 'view 2 '),
+            ('experimental_ultrawide_online = 0\n', 'uw_online 0 '), ('experimental_ultrawide_online = 1\n', 'uw_online 1 '),
+            ('timer = right\n', 'timer 0 '), ('timer = center\n', 'timer 1 '), ('timer = left\n', 'timer 2 '), ('timer = hidden\n', 'timer 3 '),
+            ('gpu = nvidia\n', 'gpu nvidia'), ('language = en_us\nvolume = 80\nrunahead = 0\n', 'settings '),
+        ]
+        for ini, want in rows:
+            out, err = self.run_test('settings', ini=ini)
+            self.assertIn(want, out[0] + ' ', ini)
+            self.assertEqual([l for l in err if l.startswith('[display]') and 'not' in l or 'unknown' in l], [], ini)
+
+    def test_shape_takes_the_monitors_in_its_range(self):
+        """21:9 and 43:18 are the monitor's shape on any 21:9-class monitor (2.22-2.45), 32:9 on a 32:9-class one;
+        outside the range the setting's own shape (bars); never past 32:9, never below 16:9."""
+        out, _ = self.run_test('shape', '21:9', '2.3889', 'shape', '43:18', '2.3704', 'shape', '21:9', '1.7778',
+                               'shape', '32:9', '2.3889', 'shape', '32:9', '3.6', 'shape', 'auto', '2.3889', 'shape', '16:9', '2.3889',
+                               'shape', '21:9', '3.7')
+        self.assertEqual(out, ['shape 21:9 2.3889 -> 2.389', 'shape 43:18 2.3704 -> 2.370', 'shape 21:9 1.7778 -> 2.333',
+                               'shape 32:9 2.3889 -> 3.556', 'shape 32:9 3.6 -> 3.556', 'shape auto 2.3889 -> 2.389',
+                               'shape 16:9 2.3889 -> 1.778', 'shape 21:9 3.7 -> 2.333'])
 
     def test_default_is_unchanged(self):
-        """No renderer key, or the default's name: Direct3D 11, and the start says nothing."""
-        for ini in ('window = windowed\n', 'renderer = d3d11\n', 'renderer = auto   ; the default\n'):
+        """No renderer key, or the default's name: auto (gpu_backend.c's choice, not made here: Direct3D 11 starts),
+        and the start says nothing."""
+        for ini in ('window = windowed\n', 'renderer = auto   ; the default\n'):
             out, err = self.run_test('chosen', 'start', ini=ini)
-            self.assertEqual(out, ['chosen d3d11', 'start d3d11'], ini)
+            self.assertEqual(out, ['chosen auto', 'start auto'], ini)
             self.assertEqual([l for l in err if 'renderer' in l], [], ini)
+
+    def test_old_launchers_d3d11_keeps_the_menus_choice(self):
+        """(#429) The v0.3.0 alphas' launcher writes renderer = d3d11 (auto) at every Play: the settings menu's last choice,
+        renderer_menu, stands under that spelling only. Any other renderer value wins, and a d3d11 alone stays auto."""
+        cases = [
+            ('renderer = d3d11\n', 'chosen auto', 0),
+            ('renderer = d3d11\nrenderer_menu = direct3d11\n', 'chosen direct3d11', 1),
+            ('renderer_menu = direct3d11\nrenderer = d3d11\n', 'chosen direct3d11', 1),
+            ('renderer = D3D11\nrenderer_menu = vulkan\n', 'chosen vulkan', 1),
+            ('renderer = auto\nrenderer_menu = direct3d11\n', 'chosen auto', 0),
+            ('renderer = vulkan\nrenderer_menu = direct3d11\n', 'chosen vulkan', 0),
+            ('renderer = direct3d11\nrenderer_menu = vulkan\n', 'chosen direct3d11', 0),
+            ('renderer = d3d11\nrenderer_menu = opengl\n', 'chosen auto', 0),
+        ]
+        for ini, want, said in cases:
+            out, err = self.run_test('chosen', ini=ini)
+            self.assertEqual(out, [want], ini)
+            self.assertEqual(len([l for l in err if 'older launcher' in l]), said, ini)
+            self.assertEqual([l for l in err if 'unknown' in l], [], ini)
 
     def test_vulkan_asked(self):
         """Vulkan checked (whatever this PC has), one line about it, and Direct3D 11 draws."""
         out, err = self.run_test('chosen', 'start', ini='renderer = vulkan\n')
         self.assertEqual(out[0], 'chosen vulkan')
-        self.assertEqual(out[1], 'start d3d11')   # (the Vulkan back end does not draw yet: Direct3D 11 does)
+        self.assertEqual(out[1], 'start auto')   # (gfx_renderer_start alone: the default, Direct3D 11, draws)
         said = [l for l in err if l.startswith('[gfx] renderer = vulkan')]
         self.assertEqual(len(said), 1, err)
         self.assertTrue(said[0].endswith('Direct3D 11 draws'), said)
@@ -81,33 +136,33 @@ class RendererOption(unittest.TestCase):
 
     def test_vulkan_without_loader(self):
         out, err = self.run_test('start', ini='renderer = vulkan\n', SSBU_VULKAN_LOADER='no-such-vulkan-loader.dll')
-        self.assertEqual(out, ['start d3d11'])
+        self.assertEqual(out, ['start auto'])
         self.assertIn('[gfx] renderer = vulkan: Vulkan cannot be used here: no Vulkan loader (no-such-vulkan-loader.dll): the graphics '
                       'driver installs it. Direct3D 11 draws', err)
 
     def test_environment_wins(self):
-        out, _ = self.run_test('chosen', ini='renderer = vulkan\n', renderer='d3d11')
-        self.assertEqual(out, ['chosen d3d11'])
+        out, _ = self.run_test('chosen', ini='renderer = vulkan\n', renderer='direct3d11')
+        self.assertEqual(out, ['chosen direct3d11'])
         out, _ = self.run_test('chosen', ini='renderer = d3d11\n', renderer='vulkan')
         self.assertEqual(out, ['chosen vulkan'])
 
     def test_unknown_value(self):
         out, err = self.run_test('chosen', ini='renderer = opengl\n')
-        self.assertEqual(out, ['chosen d3d11'])
-        self.assertTrue(any("renderer is d3d11 or vulkan, not 'opengl': d3d11 it is" in l for l in err), err)
+        self.assertEqual(out, ['chosen auto'])
+        self.assertTrue(any("renderer is auto, direct3d11 or vulkan, not 'opengl': auto it is" in l for l in err), err)
 
     def test_default_file(self):
         """The display.ini the game writes names the key, both values, and the default."""
         out, _ = self.run_test('default')
         text = '\n'.join(out)
-        self.assertIn('; renderer = d3d11 | vulkan', text)
-        self.assertIn('\nrenderer = d3d11', text)
+        self.assertIn('; renderer = auto | direct3d11 | vulkan', text)
+        self.assertIn('\nrenderer = auto', text)
         # (and it reads back as the default: the file is written when there is none)
         d = Path(tempfile.mkdtemp(dir=self.folder))
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith('SSBU_')}
         r = subprocess.run([self.exe, 'chosen'], cwd=d, env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.stdout.split(), ['chosen', 'd3d11'])
-        self.assertIn('renderer = d3d11', (d / 'display.ini').read_text())
+        self.assertEqual(r.stdout.split(), ['chosen', 'auto'])
+        self.assertIn('renderer = auto', (d / 'display.ini').read_text())
 
 
 @unittest.skipUnless(HAVE_CLANG, 'Windows with clang-cl only (deps\\llvm, or Visual Studio\'s C++ Clang tools)')

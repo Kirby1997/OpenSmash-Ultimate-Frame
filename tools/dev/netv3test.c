@@ -30,6 +30,7 @@
  *   quit                  ends (net_relay.c's exit handler sends LEAVE)
  * Anything else: "error". */
 #include "../../runtime/net_relay.c"
+#include "../../runtime/net_region.c"   /* (the server region: net_relay.c asks it for the official lobby) */
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")

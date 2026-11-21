@@ -3,7 +3,7 @@
 game (docs/SKYLINE.md).
 
 Usage:
-  skyline.py sync  [--tree <dir>]               the turned-on mods' plugins: recompiled, listed to load
+  skyline.py sync  [--tree <dir>] [--jobs N]    the turned-on mods' plugins: recompiled, listed to load
   skyline.py build [--tree <dir>] [--jobs N]    translate each mod plugin once; link the game only when it must
   skyline.py status [--tree <dir>]              what is listed, and whether the game has it built in
   skyline.py probe [--tree <dir>]               start the game once for the plugins' select-screen entries; apply the mods again if they changed
@@ -23,6 +23,7 @@ directly as well needs it built in: the runtime lists every hook target it is as
 dump/skyline/hooks.txt, and the targets the generated C calls directly are made hookable
 (tools/recomp.py HOOKABLE) by the next build, which regenerates the C of the modules they are in
 (that takes long for main: tens of minutes)."""
+import contextlib
 import filecmp
 import hashlib
 import json
@@ -33,12 +34,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECOMPILER = ("recomp.py", "lift.py", "lift_simd.py", "regcache.py", "plugin_eh.py", "eh.py")   # (what makes a plugin's C)
 sys.path.insert(0, HERE)
 ROOT = os.path.dirname(HERE)
+
+import progress  # noqa: E402  (a neighbour: after HERE is on sys.path, for python -P)
 
 # Game functions runtime/hle_skyline.c hooks itself that the game also calls directly (the CSK
 # Collection's select-screen redirect: the fighter set-up and the portrait paths)
@@ -237,6 +241,18 @@ def build_jobs():
     return max(4, min(cpus - 2, 12))
 
 
+def default_jobs():
+    """`build` without --jobs (the installer's and the launcher's way): what the first build uses for this PC's
+    memory (build_game.jobs_for_ram), and no more than build_jobs. It was 2: a plugin build that writes main's C
+    again then compiled its changed files (51 on a first install) two at a time on any PC."""
+    try:
+        import build_game
+        gb = build_game.installed_ram_gb()
+        return max(1, min(build_jobs(), build_game.jobs_for_ram(gb) if gb else 4))
+    except Exception:   # (never a reason to stop a build: the old number)
+        return 2
+
+
 def generate(p, name, log, own_exports=False, jobs=1):
     """The plugin's image and C, if missing or older than the plugin. own_exports: a standard plugin,
     whose exports stay its own (not the runtime's native versions of the same names)."""
@@ -249,7 +265,7 @@ def generate(p, name, log, own_exports=False, jobs=1):
     if fresh_c or not os.path.exists(img) or os.path.getmtime(img) < os.path.getmtime(nro):
         recomp(p, "image", nro, "--out", img)
     if fresh_c:
-        log(f"writing {name}'s C — 0%, estimating the time left")
+        log(f"writing {name}'s C")
         if own_exports:
             os.environ["SSBU_OWN_EXPORTS"] = "1"
         try:
@@ -319,6 +335,7 @@ def sync(tree, log=print, jobs=1):
             f.writelines(h + "\n" for h in missing)
     record = load_record(p)
     names = []
+    direct = set()
     skip = set()   # (dump/skyline/skip.txt: plugins left out, by module name or mod-relative file - one that does not run yet)
     if os.path.exists(os.path.join(p.skyline, "skip.txt")):
         skip = {l.split("#")[0].strip() for l in open(os.path.join(p.skyline, "skip.txt"), encoding="utf-8")} - {""}
@@ -330,6 +347,10 @@ def sync(tree, log=print, jobs=1):
             continue
         record[build_id] = {"module": name, "mod": mod, "file": os.path.relpath(source, tree)}
         generate(p, name, log, mod.startswith("(standard) "), jobs)
+        # ARCropolis discovers only a mod's plugin.nro. Other names (for example the
+        # original Training Modpack libraries) still need their entries run by Skyline.
+        if mod.startswith("(standard) ") or os.path.basename(source).lower() != "plugin.nro":
+            direct.add(name)
         if name not in names:
             names.append(name)
             log(f"{mod}: plugin {os.path.basename(source)} -> {name}")
@@ -362,11 +383,10 @@ def sync(tree, log=print, jobs=1):
         paramconfig.write(t, log)
     except Exception as e:
         log(f"paramconfig: not updated: {e}")
-    # With the real ARCropolis among the standard plugins, it loads the mods' plugins itself (its
-    # chainloader, from each mod's folder, as on the console): only the standard ones are listed
+    # Leave plugin.nro to ARCropolis so it is not initialized twice. Named libraries are
+    # not chainload candidates and must stay in the direct-load list, in dependency order.
     if any(m == "(standard) libarcropolis.nro" for m, _s in turned_on(tree)):
-        std = {module_of(p, s, record)[1] for m, s in turned_on(tree) if m.startswith("(standard) ")}
-        names = [n for n in names if n in std]
+        names = [n for n in names if n in direct]
     text = "".join(f"{n}\n" for n in names)
     old = open(p.list, encoding="utf-8").read() if os.path.exists(p.list) else ""
     if text != old:
@@ -533,7 +553,15 @@ def _stale_hooks(tree):
         if patches.get(mod, "") != (open(rec, encoding="utf-8").read() if os.path.exists(rec) else ""):
             out.append(mod)
             continue
-        if inline.get(mod):   # (the C files: is each point's rt_inline_hook in one?)
+        listed = os.path.join(folder, "inline_hooks.txt")   # (tools/recomp.py: the points its C was written with)
+        if inline.get(mod) and os.path.exists(listed):
+            with open(listed, encoding="utf-8") as f:
+                have = {base + int(h, 16) for h in f.read().split()}
+            if any(base + o not in have for o in inline[mod]):
+                out.append(mod)
+        elif inline.get(mod) and os.path.exists(os.path.join(folder, "c_trimmed.txt")):
+            pass   # (no list and its C removed, tools/trim.py: the module's stamp has its hook points - recomp.py module_fingerprint)
+        elif inline.get(mod):   # (a folder from before that list - the C files: is each point's rt_inline_hook in one?)
             have = set()
             for n in os.listdir(folder):
                 if n.startswith("g") and n.endswith(".c") and n != "g_module.c":
@@ -543,12 +571,47 @@ def _stale_hooks(tree):
     return out
 
 
+def programs(tree, platform=None):
+    """The game's programs a tree can hold, this system's first (a folder can hold another system's
+    build too: a Windows build cross-compiled for Linux keeps build/ssbu.exe beside build-linux/ssbu)."""
+    platform = platform or sys.platform
+    mac = os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu")
+    win = os.path.join(tree, "build", "ssbu.exe")
+    linux = os.path.join(tree, "build-linux", "ssbu")
+    if platform.startswith("linux"):
+        return [linux, win, mac]
+    if platform == "darwin":
+        return [mac, win, linux]
+    return [win, mac, linux]
+
+
 def program(tree):
-    for exe in (os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"),
-                os.path.join(tree, "build", "ssbu.exe"), os.path.join(tree, "build-linux", "ssbu")):
+    for exe in programs(tree):
         if os.path.exists(exe):
             return exe
     return None
+
+
+def link_commands(tree, jobs, platform=None):
+    """The commands that link the game again with the turned-on mods' plugins, on this system: macOS's
+    build_mac.py; on Linux the C written into build/ (recomp.py all --generate-only: recomp.py's own
+    compile is the Windows one, clang-cl and the MSVC libraries, which a Linux PC does not have), then
+    compiled and linked into build-linux/ssbu by build_linux.py, as tools/build_game.py's build does;
+    on Windows recomp.py all, which compiles and links build/ssbu.exe."""
+    platform = platform or sys.platform
+    exefs = os.path.join(tree, "dump", "exefs")
+    if platform == "darwin":
+        return [[sys.executable, os.path.join(HERE, "mac", "build_mac.py"), "--port", tree, "--jobs", str(jobs)]]
+    if platform.startswith("linux"):
+        out = os.path.join(tree, "build-linux")
+        import game_dll
+        dll = ["--game-dll"] if os.path.exists(os.path.join(out, game_dll.SO)) else []   # (built that way before: kept)
+        return [[sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
+                 "--jobs", str(jobs), "--tree", tree, "--generate-only"],
+                [sys.executable, os.path.join(HERE, "linux", "build_linux.py"), "--port", tree, "--out", out,
+                 "--jobs", str(jobs), *dll]]
+    return [[sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
+             "--jobs", str(jobs), "--tree", tree]]
 
 
 def probe(tree, log=print):
@@ -560,6 +623,15 @@ def probe(tree, log=print):
     with open(p.list, encoding="utf-8") as listed:
         if not listed.read().strip():
             return False
+    # ARCropolis reads the mods itself. A checkout that previously applied them into
+    # data.arc must restore the original archive before the first discovery boot:
+    # the expanded native tables cannot be read by ARCropolis' share lookup builder.
+    if os.path.isfile(os.path.join(tree, "skyline", "plugins", "libarcropolis.nro")):
+        import mods
+        view = mods.Tree(tree)
+        if view.is_modded() and not (view.applied() or {}).get("arcropolis"):
+            log("preparing the original game archive for ARCropolis (keeping the enabled mods)")
+            mods.apply(view, log)
     path = os.path.join(p.skyline, "csk.json")
 
     def entries():   # (as data: a plugin's maps come out in a different order each start)
@@ -590,7 +662,7 @@ def probe(tree, log=print):
     with tempfile.TemporaryDirectory(prefix="skyline-probe-") as data:
         env["SSBU_DATA_ROOT"] = data
         try:
-            with open(probe_log, "w", encoding="utf-8") as output:
+            with open(probe_log, "w", encoding="utf-8") as output, counting(log, "testing the plugins in the game", PROBE):
                 ran = subprocess.run([exe, os.path.join(tree, "dump", "modules")], env=env,
                                      timeout=180, cwd=tree, stdout=output, stderr=subprocess.STDOUT)
         except subprocess.TimeoutExpired:
@@ -612,16 +684,56 @@ def probe_and_apply(tree, log=print):
 
 
 _BAR = re.compile(r"^\[[#-]+\]\s+(\d+)%\s+(.*?)\s*(?:\(\s*(.*?)\s*\))?\s*$")
+# A plugin build relinking the game (main's hooks, the plugins, the link), before its own bar has a time left.
+# (one guess for every PC: 3-4 min on a fast one; the build's own bar replaces it as soon as it has a time left)
+RELINK = 180.0
+# A test boot (probe): runtime/hle_skyline.c's probe_timer ends it a fixed 60 s after the plugins have loaded (the
+# real ARCropolis), and getting there took about 5 s (i5-12600K). The game says nothing meanwhile: the bar goes by this.
+PROBE = 65.0
+_CHAIN = None
 
 
-def run_logged(cmd, log, keep=60):
+def chain():
+    """This run's one bar (progress.Chain) across every program run_logged starts: the Mods app's
+    bar follows one command (os_mods.py build), so it does not start over at each program."""
+    global _CHAIN
+    if _CHAIN is None:
+        _CHAIN = progress.Chain()
+    return _CHAIN
+
+
+@contextlib.contextmanager
+def counting(log, label, seconds, every=2.0):
+    """While a program of known length runs and prints nothing (the test boot), the bar goes on by its time,
+    a line every `every` seconds: `label — percent%, time left`, as run_logged's."""
+    whole, stop, t0 = chain(), threading.Event(), time.time()
+    whole.start(0.0)
+
+    def tick():
+        while not stop.wait(every):
+            spent = time.time() - t0
+            frac, left = whole.update(min(spent / seconds, 0.99), max(seconds - spent, 5.0))
+            log(f"{label} — {int(frac * 100)}%, {progress.left_text(frac, left)}")
+    thread = threading.Thread(target=tick, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
+def run_logged(cmd, log, keep=60, later=None):
     """Run the game's build with its output in `log` (the Mods app's window and manager.log - its
     pythonw.exe has no console, and a failed build said nothing of why): what reads as a problem as
     it comes, and when it fails, its last `keep` lines. Each progress line becomes
-    `what it is doing — percent%, time left` so a bar can follow the step, not only a spinner."""
+    `what it is doing — percent%, time left`, the percent and the time left being the whole run's
+    (chain(); `later`: seconds estimated for what comes after this program), so a bar can follow it."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", bufsize=1)
-    tail = []
+    whole = chain()
+    whole.start(later)
+    tail, detail = [], "building the game"
     for line in proc.stdout:
         line = line.rstrip()
         if not line:
@@ -629,9 +741,9 @@ def run_logged(cmd, log, keep=60):
         tail = (tail + [line])[-keep:]
         bar = _BAR.match(line.strip())
         if bar:
-            detail = (bar.group(3) or "building the game").strip()
-            eta = (bar.group(2) or "").strip()
-            log(f"{detail} — {int(bar.group(1))}%, {eta}")
+            detail = (bar.group(3) or detail).strip()   # (its last line, "100%  done", names nothing)
+            frac, left = whole.update(int(bar.group(1)) / 100, progress.seconds_left(bar.group(2) or ""))
+            log(f"{detail} — {int(frac * 100)}%, {progress.left_text(frac, left)}")
         elif re.search(r"error|failed|warning: .*(undeclared|implicit)|did not compile|LNK\d", line, re.I):
             log(line[:400])
         elif re.search(r"generating its C|C up to date|modules reused|linking the|applying the mods", line, re.I):
@@ -681,13 +793,16 @@ extern const RtModule rt_module_{name};
 static GuestFn *(*plugin_lookup)(u64);
 static GuestFn *(*plugin_lookup_cached)(u64, RtCache *);
 static void (*plugin_trap)(Cpu *, u64, const char *);
+static void (*plugin_svc)(Cpu *, u32);
 GuestFn *rt_lookup(u64 addr) {{ return plugin_lookup(addr); }}
 GuestFn *rt_lookup_cached(u64 addr, RtCache *cache) {{ return plugin_lookup_cached(addr, cache); }}
 void rt_trap(Cpu *c, u64 pc, const char *why) {{ plugin_trap(c, pc, why); }}
+/* A plugin whose code makes a system call (an svc: Raichu's svcQueryMemory) calls this. */
+void rt_svc(Cpu *c, u32 number) {{ plugin_svc(c, number); }}
 __declspec(dllexport) const RtModule *ssbu_plugin_module(void) {{ return &rt_module_{name}; }}
 __declspec(dllexport) void ssbu_plugin_bind(GuestFn *(*lookup)(u64), GuestFn *(*lookup_cached)(u64, RtCache *),
-                                            void (*trap)(Cpu *, u64, const char *)) {{
-    plugin_lookup = lookup; plugin_lookup_cached = lookup_cached; plugin_trap = trap;
+                                            void (*trap)(Cpu *, u64, const char *), void (*svc)(Cpu *, u32)) {{
+    plugin_lookup = lookup; plugin_lookup_cached = lookup_cached; plugin_trap = trap; plugin_svc = svc;
 }}
 """
 
@@ -785,9 +900,11 @@ def unbuilt_mod_plugin(tree):
     return None
 
 
-def game_link_reason(tree):
+def game_link_reason(tree, mods=True):
     """Why the program itself must be linked again, or None. On Windows a mod plugin's own file is not
-    a reason: the game loads that at start. On macOS and Linux it is compiled into the program."""
+    a reason: the game loads that at start. On macOS and Linux it is compiled into the program.
+    mods=False (Play without mods): only what the game and the community plugins need, not the mods'
+    plugins or the hook points and code patches the plugins asked for (the lists don't say whose)."""
     exe = program(tree)
     if not exe:
         return "the game isn't built"
@@ -803,21 +920,27 @@ def game_link_reason(tree):
                     return f"{rel} is newer than the game"
     p = Paths(tree)
     patches = os.path.join(p.skyline, "patches.txt")
-    if os.path.exists(patches) and os.path.getmtime(patches) > built:
+    if mods and os.path.exists(patches) and os.path.getmtime(patches) > built:
         return "dump/skyline/patches.txt is newer than the game"
     import std_plugins
     for name, plugin in std_plugins.PLUGINS.items():
         if plugin[5] == "runs" and not os.path.exists(os.path.join(std_plugins.folder(tree), name)):
             return f"{name} isn't fetched"
-    missing = unbuilt_standard(tree) or (unbuilt_mod_plugin(tree) if os.name != "nt" else None)
+    missing = unbuilt_standard(tree) or (unbuilt_mod_plugin(tree) if mods and os.name != "nt" else None)
     if missing:
         return missing
     listed = os.path.join(p.skyline, "plugins.txt")
     names = [l.split("#")[0].strip() for l in open(listed, encoding="utf-8")] if os.path.exists(listed) else []
+    dynamic = set()
+    if os.name == "nt":
+        dlls = os.path.join(p.skyline, "plugin_dlls.txt")
+        if os.path.isfile(dlls):
+            with open(dlls, encoding="utf-8") as listed:
+                dynamic = {os.path.splitext(os.path.basename(line.strip()))[0] for line in listed if line.strip()}
     for name in names:
-        if name and not built_in(tree, name):
+        if name and name not in dynamic and not built_in(tree, name):
             return f"the standard plugin {name} isn't in the game"
-    if stale_hooks(tree):
+    if mods and stale_hooks(tree):
         return "a plugin hooks a function the game has no slot for"
     return None
 
@@ -827,26 +950,29 @@ def build(tree, jobs, log=print, again=True):
     into the program). Link the game only when a plugin it should have is missing, the runtime
     changed, or a plugin's inline hook or code patch is not in it.
     A function hook is patched into that one function when the game starts."""
+    global _CHAIN
+    if again:   # (a bar of its own: the Mods app runs every build in one process, and would start at the last one's end)
+        _CHAIN = progress.Chain()
+    chain().later = (RELINK if game_link_reason(tree) else 0.0) + PROBE   # (the bar: a relink, then a test boot)
     sync(tree, log, jobs)
     cache_mod_plugins(tree, jobs, log)
     reason = game_link_reason(tree)
     if reason:
         exefs = os.path.join(tree, "dump", "exefs")
-        for mod in stale_hooks(tree):
-            log(f"writing {mod}'s C again — 0%, estimating the time left")
+        # (recomp.py all writes again the C of a module whose hooks or code patches changed - its fingerprint
+        # has them - so writing it here first was done twice: main's, the biggest. macOS's link, build_mac.py,
+        # writes no C: there it is written here.)
+        for mod in stale_hooks(tree) if sys.platform == "darwin" else ():
+            log(f"writing {mod}'s C again")
             src = os.path.join(exefs, mod) if mod in ("main", "subsdk0", "sdk") else os.path.join(tree, "dump", "nro", mod + ".nro")
             out = os.path.join(tree, "build", mod) if mod in ("main", "subsdk0", "sdk") else os.path.join(tree, "build", "nro", mod)
             recomp_stream(Paths(tree), log, "build", src, "--out", out, "--jobs", str(jobs))
         log(f"linking the game once ({reason})")
-        if sys.platform == "darwin":
-            cmd = [sys.executable, os.path.join(HERE, "mac", "build_mac.py"), "--port", tree, "--jobs", str(jobs)]
-        else:
-            cmd = [sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
-                   "--jobs", str(jobs), "--tree", tree]
-        log(" ".join(cmd))
-        rc = run_logged(cmd, log)
-        if rc:
-            return rc
+        for cmd in link_commands(tree, jobs):
+            log(" ".join(cmd))
+            rc = run_logged(cmd, log, later=PROBE)
+            if rc:
+                return rc
     else:
         log("the mod plugins are translated; the game itself was left as it is")
     probe_and_apply(tree, log)
@@ -858,10 +984,11 @@ def build(tree, jobs, log=print, again=True):
 
 # What isn't part of the game's program: an update that changes only these needs no build (the Mods
 # app's files are read as it runs; the tools here run as they are)
-NOT_BUILT = ("tools/modmanager/", "tools/dev/", "tools/mods.py", "tools/os_mods.py", "tools/progress.py", "tools/std_plugins.py", "tools/csk.py", "tools/miis.py",
-             "tools/unlock_all.py", "tools/install_windowsmash.ps1", "tools/update.py", "tools/arc.py", "tools/prc.py",
-             "tools/msbt.py", "tools/ssbu_online_lobby.py", "tools/ssbu_relay.py", "tools/skyline.py",
-             "tools/shader_aot.py")
+NOT_BUILT = ("tools/modmanager/", "tools/weblauncher/", "tools/app_window.py", "tools/linux/askpass.sh",
+             "tools/dev/", "tools/mods.py", "tools/os_mods.py", "tools/progress.py", "tools/std_plugins.py",
+             "tools/csk.py", "tools/miis.py", "tools/unlock_all.py", "tools/install_windowsmash.ps1",
+             "tools/update.py", "tools/arc.py", "tools/prc.py", "tools/msbt.py",
+             "tools/skyline.py", "tools/shader_aot.py", "tools/find_python.bat")
 
 
 def plugin_refresh_reason(tree):
@@ -926,9 +1053,9 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     tree = os.path.abspath(arg("--tree", ROOT))
     if sys.argv[1] == "sync":
-        sync(tree)
+        sync(tree, jobs=int(arg("--jobs", str(default_jobs()))))
     elif sys.argv[1] == "build":
-        sys.exit(build(tree, int(arg("--jobs", "2"))))
+        sys.exit(build(tree, int(arg("--jobs", str(default_jobs())))))
     elif sys.argv[1] == "status":
         status(tree)
     elif sys.argv[1] == "probe":   # (the plugins' select-screen entries again, and the mods applied if they changed)

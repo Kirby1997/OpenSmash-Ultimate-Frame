@@ -81,7 +81,8 @@ LAUNCHERS = ["Install WindowSmash.command", "Play SSBU.command", "launchers/Play
              "launchers/Host SSBU Netplay.command", "launchers/Join SSBU Netplay.command",
              "launchers/Unlock All Fighters.command", "launchers/Build WindowSmash.command",
              "Mods.command", "launchers/WindowSmash Mods.command", "launchers/Uninstall WindowSmash Mods.command",
-             "launchers/Import Miis.command", "tools/mac/launch.sh"]
+             "launchers/Import Miis.command", "OpenSmash Launcher.command", "tools/mac/launch.sh",
+             "tools/mac/rebuild-all.command", "Build Launcher macOS.command"]
 EMULATORS = ("yuzu", "eden", "sudachi", "citron", "suyu", "torzu")   # yuzu and the forks with its layout
 SSBU_TITLES = "01006a800016"   # (Super Smash Bros. Ultimate's title ids: the game's, its update's and DLC's)
 NAME_MAX = 32   # (as the Windows setup window's box)
@@ -1141,10 +1142,23 @@ def make_launcher_app(app, root=ROOT, bundle_id=LAUNCHER_ID, icns=None):
     return True
 
 
+def step_opensmash_launcher(a):
+    """(v0.5.0) the OpenSmash launcher (OpenSmash.Avalonia.app: Windows' launcher, with the account sign-in the official
+    lobbies need) into this folder: built here with the .NET SDK, else the newest release's (tools/launcher_fetch.py).
+    Not needed to play: when neither works OpenSmash Launcher.command opens the web launcher, and nothing stops."""
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import launcher_fetch
+    try:
+        launcher_fetch.ensure(ROOT, log=info, dry_run=a.dry_run)
+    except Exception as e:   # (never the setup's end: the web launcher is there)
+        info(f"the OpenSmash launcher: not now ({type(e).__name__}: {e}); the web launcher stays")
+
+
 def step_launchers(a, files):
     step_header(8, "Launchers")
     if not a.dry_run:
         make_executable()
+    step_opensmash_launcher(a)
     info("in this folder: Play SSBU.command (online); in launchers/: Play SSBU Offline, Host SSBU Netplay, "
          "Join SSBU Netplay, Unlock All Fighters, Build WindowSmash (.command)")
     if not files.get("launcher"):
@@ -1232,6 +1246,7 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the memory)")
     ap.add_argument("--skip-build", action="store_true", help="everything but compiling the game")
     ap.add_argument("--no-update", action="store_true", help="don't look for a newer WindowSmash")
+    ap.add_argument("--update-only", action="store_true", help="only get the newest WindowSmash (the launcher's Update)")
     ap.add_argument("--no-wizard", action="store_true", help="ask in this window instead of in dialogs")
     ap.add_argument("--yes", action="store_true", help="take the folders found or given, without asking")
     ap.add_argument("--dry-run", action="store_true", help="say what each step would do, do nothing")
@@ -1247,6 +1262,10 @@ def main(argv=None):
             args = [x for x in (argv if argv is not None else sys.argv[1:]) if x != "--no-update"]
             os.execv(sys.executable, [sys.executable, "-u", os.path.join(ROOT, "tools", "mac", "install_mac.py"),
                                       *args, "--no-update"])
+        if a.update_only:
+            step_opensmash_launcher(a)   # (the launcher's Update: a launcher of the updated sources, or a newer release's)
+            print("Update done." if not a.dry_run else "")
+            return 0
         step_check_mac()
         step_tools(a)
         step_python(a)

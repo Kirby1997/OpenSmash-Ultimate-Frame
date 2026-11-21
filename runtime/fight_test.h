@@ -131,10 +131,15 @@ static inline void fight_frame_end(FightDrops *d, uint8_t *count, uint8_t *resul
 
 /* SSBU_SEQ's ticks for one poll from the first fighter's fight frame and the game's ready-go
  * flag: the fight frames since the last poll while a fight runs; after it has ended (ready-go
- * cleared) one a poll again until the next one; a new fight's count starting lower is no step. */
-typedef struct FightSteps { long long last, hist[4]; int was_on, ended; } FightSteps;
+ * cleared) one a poll again until the next one; a new fight's count starting lower is no step.
+ * Paused (ready-go on, the fight frame still for FIGHT_PAUSE_POLLS polls), one a poll too, so a
+ * sequence can work the pause menu and camera. */
+enum { FIGHT_PAUSE_POLLS = 30 };
+typedef struct FightSteps { long long last, hist[4]; int was_on, ended, still; } FightSteps;
 static inline long fight_steps(FightSteps *s, long long frame, int on) {
     long long n = frame - s->last;
+    s->still = on && n == 0 ? s->still + 1 : 0;
+    if (s->still > FIGHT_PAUSE_POLLS) { s->hist[0]++; return 1; }
     if (on) { s->was_on = 1; s->ended = 0; }
     else if (s->was_on) s->ended = 1;
     if (n < 0 && s->was_on) { s->last = frame; return s->ended ? 1 : 0; }
@@ -174,18 +179,20 @@ static inline uint64_t fixed_entropy(uint64_t n, uint64_t sub) { return fixed_mi
 
 /* ---- SSBU_DEBUG_MATCH ------------------------------------------------------------------- */
 /* "p1=<fighter>,p2=<fighter>|cpu|human,p3=..,p4=..,c1=<colour>..c4=<colour>,stage=<name>,
- * form=omega|battlefield|normal,hazards=on|off,cpu=<level>,items=on|off,stock=<n>,time=<min>"
+ * form=omega|battlefield|normal,hazards=on|off,cpu=<level>,items=on|off|low|high|<0-4>,stock=<n>,time=<min>"
+ * (items: the match block's item appearance word, 0 none, on = 2 as before, high = 3; round 7)
  * (ssbu-recomp's debug match; c1..c4: a player's costume, 0-7, as ssbu-recomp's c1..c8). A
- * key left out keeps what it was (a list's lines add up); -1: not set. time is read and, as
- * there, not used. */
+ * key left out keeps what it was (a list's lines add up); -1: not set. time: the time limit in
+ * minutes (the match block's +0x48, in frames). tag1..tag4=<n>: the player plays with the save's
+ * name tag n (1: the list's first slot, 0: none), as if picked on the select screen (#152). */
 typedef struct DebugMatch {
     char name[4][32], stage[48];
-    int p2type, form, hazards, cpu, items, time, stock, colour[4];
+    int p2type, form, hazards, cpu, items, time, stock, colour[4], tag[4];
 } DebugMatch;
 static inline void dm_init(DebugMatch *m) {
     memset(m, 0, sizeof *m);
     m->p2type = m->form = m->hazards = m->cpu = m->items = m->time = m->stock = -1;
-    for (int i = 0; i < 4; i++) m->colour[i] = -1;
+    for (int i = 0; i < 4; i++) m->colour[i] = m->tag[i] = -1;
 }
 static inline void dm_parse(DebugMatch *m, const char *text) {
     char buf[256];
@@ -200,11 +207,12 @@ static inline void dm_parse(DebugMatch *m, const char *text) {
         if (!strcmp(k, "p2") && (!strcmp(v, "cpu") || !strcmp(v, "human"))) m->p2type = !strcmp(v, "cpu");
         else if ((k[0] == 'p') && k[1] >= '1' && k[1] <= '4' && !k[2]) snprintf(m->name[k[1] - '1'], sizeof m->name[0], "%s", v);
         else if (k[0] == 'c' && k[1] >= '1' && k[1] <= '4' && !k[2]) m->colour[k[1] - '1'] = atoi(v) & 7;
+        else if (!strncmp(k, "tag", 3) && k[3] >= '1' && k[3] <= '4' && !k[4]) { int t = atoi(v); m->tag[k[3] - '1'] = t < 0 || t > 60 ? 0 : t; }   /* (the list has 60 slots) */
         else if (!strcmp(k, "stage")) snprintf(m->stage, sizeof m->stage, "%s", v);
         else if (!strcmp(k, "form")) m->form = !strcmp(v, "omega") ? 2 : !strcmp(v, "battlefield") ? 1 : 0;
         else if (!strcmp(k, "hazards")) m->hazards = !strcmp(v, "on");
         else if (!strcmp(k, "cpu")) m->cpu = atoi(v);
-        else if (!strcmp(k, "items")) m->items = !strcmp(v, "on");
+        else if (!strcmp(k, "items")) m->items = !strcmp(v, "on") ? 2 : !strcmp(v, "low") ? 1 : !strcmp(v, "high") ? 3 : v[0] >= '0' && v[0] <= '4' && !v[1] ? v[0] - '0' : 0;
         else if (!strcmp(k, "time")) m->time = atoi(v);
         else if (!strcmp(k, "stock")) m->stock = atoi(v);
     }
@@ -216,7 +224,7 @@ static inline void dm_parse(DebugMatch *m, const char *text) {
  * level, +0x224 (all ones with a level). Changed before the game's function runs, so all it
  * derives is the game's. Players 3 and 4 copy player 2's state (as changed: p2) when the screens
  * left them none. Returns the type it was, as changed. */
-enum { DM_STATE = 0x230 };
+enum { DM_STATE = 0x230, DM_PANEL = 0x460 };   /* (a name tag, tagN, writes up to + 0x450: the whole panel, DM_PANEL) */
 static inline void dm_chara(uint8_t *st, const char *name) {
     char nm[64];
     snprintf(nm, sizeof nm, "ui_chara_%s", name);
@@ -241,6 +249,11 @@ static inline uint32_t dm_player(const DebugMatch *m, int idx, uint8_t *st, uint
         if (m->cpu > 0 && fight_get32(st + 0x78) == 1) { st[0x91] = (uint8_t)m->cpu; fight_put32(st + 0x224, 0xffffffffu); }
     }
     if (idx >= 0 && idx < 4 && m->colour[idx] >= 0 && type_was != 3) st[0x90] = (uint8_t)m->colour[idx];
+    /* (a name tag: + 0x214 the tag's slot + 1, + 0x450 a human's panel - a CPU's 0 leaves the tag unused, and stays so: hle_rb_core.c) */
+    if (idx >= 0 && idx < 4 && m->tag[idx] >= 0 && type_was != 3) {
+        fight_put32(st + 0x214, (uint32_t)m->tag[idx]);
+        if (m->tag[idx] && fight_get32(st + 0x78) == 0) st[0x450] = 1;
+    }
     return type_was;
 }
 
@@ -259,7 +272,7 @@ static inline void dm_stage(const DebugMatch *m, uint8_t *sel, uint8_t *hazards,
     }
     if (m->form >= 0) fight_put32(sel + 8, (uint32_t)m->form);
     if (m->hazards >= 0) *hazards = (uint8_t)m->hazards;
-    if (m->items >= 0) fight_put32(items, m->items ? 2u : 0u);
+    if (m->items >= 0) fight_put32(items, (uint32_t)m->items);
 }
 
 /* The next line of SSBU_DEBUG_MATCH_LIST at a new match set-up: a blank line keeps the match

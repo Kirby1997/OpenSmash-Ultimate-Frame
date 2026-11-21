@@ -26,6 +26,11 @@ headless, offline test options. It still loads the enabled Skyline plugins from 
 configured game tree: those are the plugins being inspected. Its data directory is
 removed after the probe; diagnostics remain in `dump/skyline/probe.log`.
 
+When ARCropolis has been installed over a tree using the native mod overlay, the probe
+first reapplies the enabled mods in ARCropolis mode. This restores `romfs_vanilla.cfg`
+before starting the game; reading a pre-expanded archive again can make ARCropolis' share
+lookup index past the original file table. The enabled mod selection is preserved.
+
 If a listed plugin cannot load, the runtime exits the probe with an error before running
 plugin entry points. Nonzero exits and timeouts fail the Python probe rather than being
 treated as an unchanged successful result. Normal game launches keep their existing
@@ -76,9 +81,19 @@ The dependency plugins themselves (latest releases):
 
 | Plugin | Imports | How it works on the console |
 | --- | --- | --- |
-| Smashline 2 v1.6.8 | Skyline 5 (incl. `A64InlineHook`), main 11, lua2cpp_common 12, SDK 59 | hooks the game's agent factories (main+0x64c310 ...), lua2cpp_common's coroutine call and status lines with **inline** hooks at single instructions |
+| Smashline 2 v2.0.0 (was 1.6.8) | Skyline 5 (incl. `A64InlineHook`), main 11, lua2cpp_common 12, SDK 59 | hooks the game's agent factories (main+0x64c310 ...), lua2cpp_common's coroutine call and status lines with **inline** hooks at single instructions |
 | lib_paramconfig 6.5 | Skyline 3, ARCropolis 2, main 20 | on console: hooks param getters; reads `config_param.toml`. Here: the `.nro` is not run (its main hangs); `tools/paramconfig.py` + `runtime/hle_paramconfig.c` apply each enabled mod's toml natively. Movesets that link paramconfig into their own `plugin.nro` still work. |
-| CSK Collection 5.0.6 | Skyline 5 (incl. `A64InlineHook`), ARCropolis 6 (`arcrop_register_callback`: rewrites files as the game loads them) | patches `ui_chara_db` and friends at load time |
+| CSK Collection 6.0.1 | Skyline 5 (incl. `A64InlineHook`), ARCropolis 6 (`arcrop_register_callback`: rewrites files as the game loads them) | patches `ui_chara_db` and friends at load time |
+
+Smashline 2.0 changed `smashline_clone_weapon`, `smashline_update_weapon_count` and
+`smashline_whitelist_kirby_copy_article` (a clone is a new weapon kind; counts and the Kirby
+whitelist go by fighter and generate-article id, not weapon kind), and plugins built for 1.6
+crash calling them. `hle_skyline.c` answers `LookupSymbol` for those three with adapters: a
+plugin with 2.0's new function names in it (or whose `clone_weapon` call has 2.0's arguments) gets
+2.0's calls as they are, any other gets 1.6's turned into 2.0's. Not the same as 1.6: a 1.6 plugin
+that compares its clone's weapon kind with the original's (the clone has a new kind now); the
+original owner a 1.6 `clone_weapon` names, when it isn't the article's own (2.0 takes the
+article's); a 1.6 `update_weapon_count` reaches clones the 1.6 plugins made, not 2.0 plugins'.
 
 ## How plugins run in WindowSmash (prototype)
 
@@ -195,13 +210,19 @@ hashbrown maps for the cXX/characall fields) into `csk.json`, and `tools/csk.py`
 `mods.py apply`) adds them to `ui_chara_db.prc` / `ui_layout_db.prc` (a copy of the fighter's
 entry, the plugin's fields set). CSK's `color_start_index` is not a game field: the runtime does
 CSK's redirect itself - at the fighter set-up (main+0x66dcf0) a player whose record names a new
-character gets costume start+k for color k, and the portrait-path function (main+0x3238a70) maps
+character in its own ui_chara field (+0; a hash further in can be another player's) gets costume
+start+k for color k, and the portrait-path function (main+0x3238a70) maps
 c120+k back to the character's own portraits (the HUD). Both are called directly by the game, so
-they are on the hookable list (`NATIVE_HOOKS` in skyline.py).
+they are on the hookable list (`NATIVE_HOOKS` in skyline.py). A character a mod adds with its
+`ui_chara_db.prcxml` alone, no plugin (Popple: Mario with `color_start_index` 24), is redirected the
+same way: `mods.py apply` lists such characters in `dump/skyline/prcxml_redirects.txt` and the runtime
+adds them when the plugins load.
 
-The CSK Collection itself (5.0.6) is built for game 13.0.4: in 13.0.5 the code from about
+The CSK Collection itself was built for game 13.0.4 up to 5.0.6: in 13.0.5 the code from about
 main+0x1788000 up moved by 0x5B0 (Smashline's `+ 0x5B0` offsets), and most of its work is code
-patches and inline hooks - it can't run as a plugin here, hence the native version.
+patches and inline hooks - it could not run as a plugin here, hence the native version. 6.0.1 is
+built for 13.0.5 but for one inline hook left at its 13.0.4 address, which `tools/port_plugin.py`
+moves when the plugin is fetched (`tools/ports/the_csk_collection-6.0.1.txt`).
 
 ARCropolis' API: event callbacks (run once the plugins' mains have: Shadow registers its entries
 from one), `arcrop_is_mod_enabled`, versions. `mods:/` (ARCropolis' view of all turned-on mods'
@@ -266,3 +287,8 @@ Mods it unlocks, in order: movesets over an existing fighter that use only ACMD 
 main-loop callbacks (Sonic Re-Imagined and most mRama movesets: Knuckles, Funky Kong, Kamek,
 Bandana Dee, Silver/Waluigi once costume filtering and CSK are in), then new characters
 (CSK), then mods that depend on inline hooks.
+
+With ARCropolis enabled, mods named `plugin.nro` are left for its chainloader.
+Other named libraries stay in Skyline's direct-load list, in dependency order;
+the skip list still applies, and each module is listed once. Windows plugin DLLs
+already in `plugin_dlls.txt` do not require relinking the game executable.

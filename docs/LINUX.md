@@ -12,8 +12,12 @@ The same recompiled game as the Windows build, as a native x86-64 Linux program.
 
 There are two ways to get it:
 
+- **The OpenSmash Launcher** (the easiest): double-click `OpenSmash Launcher` in the folder, or run
+  `bash opensmash-launcher.sh`. Setup, updates, Play, settings and the mod manager in a window, with a
+  mouse or a game pad, no terminal. It works in Steam's Game Mode too. See
+  [The OpenSmash Launcher](#the-opensmash-launcher).
 - **Install it on Linux.** `install-windowsmash.sh` sets up WindowSmash on the Linux machine and
-  builds the game there from your own files, as `Install WindowSmash.bat` does on Windows. See
+  builds the game there from your own files, as `OpenSmash.exe` does on Windows. See
   [Installing on Linux](#installing-on-linux).
 - **Copy over a package from Windows.** A Windows PC that has built the game can make an
   `ssbu-linux` folder to copy to a Linux machine or virtual machine. See [Setting up](#setting-up).
@@ -26,6 +30,7 @@ As on Windows, the game must be version 13.0.5, its last update
 
 ## Contents
 
+- [The OpenSmash Launcher](#the-opensmash-launcher)
 - [Installing on Linux](#installing-on-linux)
 - [What you need](#what-you-need)
 - [Setting up](#setting-up)
@@ -36,6 +41,98 @@ As on Windows, the game must be version 13.0.5, its last update
 - [Saves](#saves)
 - [If something goes wrong](#if-something-goes-wrong)
 - [Building it](#building-it)
+
+## The OpenSmash Launcher
+
+**Since v0.5.0** the launcher on Linux is the same program as Windows': `OpenSmash.Avalonia` in the
+WindowSmash folder, with the account sign-in the official lobbies need (they let in only a signed-in
+player's game). The setup puts it there (`tools/launcher_fetch.py`: built from the folder with the .NET 8
+SDK when it is installed, else the newest release's `OpenSmash-linux-x64.tar.gz`, checked against the
+SHA-256 the release names), and `OpenSmash Launcher` / `opensmash-launcher.sh` start it. Press **SIGN IN**
+on its home page: the sign-in opens in your browser and comes back to the launcher. At Play it gives the
+game a lobby ticket (`build/cache/online_pass.txt`, readable by you alone) and renews it while the game runs.
+`play-ssbu.sh` started on its own uses the ticket the launcher wrote last while it is still good.
+
+The web launcher below stays as the fallback: `bash opensmash-launcher.sh --web`, or automatically when
+`OpenSmash.Avalonia` is not there or stops at once (its reason goes to `build/launcher.log`). It cannot sign
+in: on the official lobbies it uses a ticket a signed-in launcher left, and says to sign in when there is none.
+
+`OpenSmash.exe` is Windows-only. On Linux the same features run in a browser window instead. The
+launcher is a small server on your own computer (`tools/weblauncher/launcher.py`, Python's standard
+library only, reachable from this computer alone and only with the key it opens the page with).
+
+To start it, double-click **`OpenSmash Launcher`** in the WindowSmash folder. On KDE (SteamOS's and
+Bazzite's Desktop Mode) choose *Continue* when it asks. On GNOME, right-click it and choose *Allow
+Launching*. You can also run `bash opensmash-launcher.sh`. It needs Python 3.10 or newer, which
+almost every distribution has. The first start adds **OpenSmash Launcher** to your applications menu.
+The window is a Chrome, Chromium, Brave or Edge app window if one is installed (from the distribution
+or as a Flatpak). Without one, the launcher opens in your default browser.
+
+| Tab | What it does | What runs |
+| :--- | :--- | :--- |
+| **Play** | *Play* (online, the lobby in Settings), *Play offline*, *Play without mods*. Before the game starts, it applies the turned-on mods, and asks to build the mods' plugins into the game when they need it. It then shows the game's log while the game runs. | `play-ssbu.sh`, `launchers/play-ssbu-offline.sh`; `tools/os_mods.py apply`, `vanilla`, `build` |
+| **Setup** | The first-run setup: your game, keys and firmware folders (found by themselves when an emulator has them; *Browse…* picks another), your online name, then the whole install and build with its log. *Build again* builds what changed; *Build game + launcher* also checks the Python launcher's syntax. | `tools/linux/install_linux.py`, `tools/build_game.py`, `tools/linux/rebuild-all.sh` |
+| **Mods** | Opens WindowSmash Mods (GameBanana's mods: browse, install, turn on and off, modpacks) in the same window. *Back to the launcher* (or B) returns. *Build plugins into the game* compiles movesets' and new characters' code into the game. | `tools/modmanager/server.py`, `tools/os_mods.py build` |
+| **Settings** | Display, online (name, public or private lobby, lobby code, your own server, direct connections) and controllers. These are the same files and values `OpenSmash.exe` and the game's own settings menu write. | `display.ini`, `controllers.ini`, `online_*.txt`, `launcher.ini` |
+| **Update** | Checks GitHub for a newer OpenSmash and installs it (a `git pull`, or the newer files of a ZIP download). Your game files, save, settings and builds stay. | `install_linux.py --update-only` |
+
+**Build game + launcher** shows the incremental build's live progress in the launcher. The Linux launcher is Python and has no separate binary to compile; the process checks its syntax after the game build. Run the same process outside the launcher with `bash tools/linux/rebuild-all.sh` (optionally followed by `--jobs N`).
+
+The setup installs the build's packages with `sudo`. With no terminal, `sudo` asks for your password
+in a dialog (`tools/linux/askpass.sh`: zenity, kdialog or ssh-askpass). The notes in
+[Installing on Linux](#installing-on-linux) apply as they are:
+
+- **Steam Deck (SteamOS):** run `sudo steamos-readonly disable` (and `passwd`, if the `deck` user
+  has no password) in Konsole first.
+- **Bazzite** and other image-based systems: the packages may only arrive after a restart. The log
+  says so. Restart, then press *Set up and build* again.
+
+Run the setup in Desktop Mode. A password dialog may not show in Game Mode.
+
+### Steam Deck and Game Mode
+
+1. In Desktop Mode, open Steam, choose *Games > Add a Non-Steam Game to My Library*, tick
+   **OpenSmash Launcher** (the launcher's first start put it in the list), and press *Add Selected
+   Programs*.
+2. In Game Mode, start it from your library. In Game Mode (gamescope) the launcher fills the screen.
+3. The page works with the controller:
+
+   | Control | Action |
+   | :--- | :--- |
+   | D-pad or left stick | Move |
+   | A | Press |
+   | B | Back, or close a dialog |
+   | LB / RB | Change tab |
+   | Start | Play |
+   | Right stick | Scroll |
+   | Left or right on a list | Change the setting |
+
+   The arrow keys, Enter and Escape do the same. If the pad does nothing, set the shortcut's
+   controller layout to a *Gamepad* one in Steam, or to a keyboard-and-mouse layout, which also
+   works. Steam's on-screen keyboard (Steam + X) types the name and the lobby code.
+4. *Play* starts the game from the launcher, so Steam keeps counting it as running, and the game's
+   window comes in front. Set *Window* to *Full screen* in Settings for Game Mode. When the game
+   closes, the launcher comes back. When the launcher's window is closed (and no game or build is
+   running), the launcher ends, and Steam sees the game as closed.
+
+Its own log is `build/launcher.log`. The game's log is still `build/play.log`.
+
+### Mods on Linux
+
+The mod manager is the same as on Windows and macOS. These fixes make it work fully on Linux:
+
+- **Movesets and new characters work.** *Build plugins into the game* (and the plugin build *Play*
+  asks for) compiles the mods' plugins into `build-linux/ssbu`: the C written by
+  `recomp.py all --generate-only`, then `tools/linux/build_linux.py`. Before, it ran the Windows
+  link, which can't work on Linux, so a moveset's fighter stayed the original.
+- **.7z and .rar mods unpack.** GNU tar reads neither. The mod manager now uses bsdtar, 7-Zip
+  (`7zz`, `7z`, `7za`), `unrar` or `unar`, whichever is installed. The setup also adds `py7zr`,
+  which opens .7z on its own. For .rar you need one of those programs. Arch and SteamOS usually have
+  `bsdtar` already. On Fedora install `bsdtar` or `7zip`. On Bazzite and other image-based systems
+  use `rpm-ostree install bsdtar`. On Debian and Ubuntu install `libarchive-tools` or `7zip`.
+- **The game being open is noticed.** The mod manager no longer applies mods under a running game
+  on Linux.
+- **Its window opens** in a Flatpak Chrome, Chromium, Brave or Edge, too.
 
 ## Installing on Linux
 
@@ -124,11 +221,11 @@ The launchers work like the Windows ones: `play-ssbu.sh` at the top of the folde
 
 | Launcher | On Windows | What it does |
 | :--- | :--- | :--- |
-| `play-ssbu.sh` | `Play SSBU.bat` | The game, online through the lobby in `online_server.txt` ([Multiplayer](MULTIPLAYER.md)). |
-| `launchers/play-ssbu-offline.sh` | `Play SSBU Offline.bat` | The game, offline. |
+| `play-ssbu.sh` | `OpenSmash.exe` | The game, online through the lobby in `online_server.txt` ([Multiplayer](MULTIPLAYER.md)). |
+| `launchers/play-ssbu-offline.sh` | the launcher's Offline lobby setting | The game, offline. |
 | `launchers/host-ssbu-netplay.sh`, `launchers/join-ssbu-netplay.sh` | `Host/Join SSBU Netplay.bat` | A private room. |
 | `launchers/unlock-all-fighters.sh` | `Unlock All Fighters.bat` | The unlock tool, on this folder's save. Run it with the game closed. |
-| `launchers/prepare-shaders.sh` | `Prepare Shaders.bat` | Compiles all of the game's shaders in advance ([below](#shaders-and-first-time-stutter)). |
+| `launchers/prepare-shaders.sh` | the launcher's shader preparation | Compiles all of the game's shaders in advance ([below](#shaders-and-first-time-stutter)). |
 
 The game reads its data in place from your game folder, or from the decrypted copy in
 `dump/modules` when the game had to be decrypted first. If your game folder is on a disk or shared
@@ -161,8 +258,40 @@ progress bar with the time left, runs at low priority, and keeps the PC awake me
 makes about 65,000 shaders: half an hour on a 16-thread desktop, and probably an hour or two on
 a Steam Deck. You can stop it with Ctrl+C and start it again later; what is done stays done. It
 needs the game built first, and the game files where they were. It prepares the first step, the
-shader programs themselves; DXVK and the graphics driver still make their own GPU code from them
-as each shader is first used, and keep it for next time.
+shader programs themselves.
+
+When the compile finishes, it also draws the cache once through DXVK
+(`build-linux/ssbu --warm-shaders dump/shadercache`), so DXVK makes each Vulkan pipeline and the
+graphics driver compiles its GPU code in advance, instead of during a match. The warm pass makes
+no window, runs below normal priority and uses up to `SSBU_WARM_THREADS` threads (1–6). A full
+pass uses one thread by default, and a later pass over a matching `warm.done` uses half the
+processors (up to 6): on a full pass DXVK's shader-cache writer and the driver's cache writes are the
+bottleneck, so more workers only wait at the end for them. It draws 512 programs between waits for
+the GPU (the pipeline is made during its draw, so a wait per program was only round trips), which
+lets DXVK's compiler threads work meanwhile: on a 16-thread desktop the full pass takes about
+6.5 minutes from empty caches and about a minute when they already hold the programs.
+`SSBU_WARM_THREADS` overrides the count. It writes `warm.log` in the shader cache
+and remembers what it drew in `warm.done`; a lock file keeps two passes apart. A warm pass that
+fails (no Vulkan GPU, say) does not fail Prepare Shaders: the compiled shaders are kept and the
+game makes the missing GPU code at first use as before. `--no-warm` skips it.
+
+It runs after every successful compile, and draws only what `warm.done` says an earlier pass has
+not drawn, so running Prepare Shaders again to compile a few new shaders costs little. `warm.done`
+is keyed by this game, DXVK's libraries and the Vulkan driver's ICD manifest and library (Mesa's
+version is in the manifest), so a Mesa/RADV, DXVK or other driver update draws everything again by
+itself. `--rewarm` (or `SSBU_SHADER_WARM_ALL=1`) forces that, as does deleting `warm.done` (for
+example after clearing `~/.cache/dxvk` and `~/.cache/mesa_shader_cache`).
+
+Expect the first full pass to take a while and the caches to grow: the roughly 1,300 shaders the
+game has played already use about 0.5 GB of DXVK/Mesa cache, and a 65,000-shader cache can add
+several gigabytes (about 2.7 GB of DXBC itself, plus DXVK's and Mesa's caches), so check free disk
+space. The pass draws each program in one default state (a 1x1
+R8G8B8A8 target, no depth or blend), which covers DXVK's DXBC-to-SPIR-V translation and the
+driver's code for that state; a different pipeline state, or a program whose synthetic partner
+cannot be built, can still compile once at first use. On DXVK the renderer also waits up to 50 ms
+for a shader that is already in the cache, instead of skipping the first draw that needs it, so a
+new move's effect appears at once rather than a frame or two late; a shader that is not in the
+cache is still skipped rather than waiting for a full compile.
 
 The rest of this guide is about the package from Windows, apart from those sections.
 
@@ -235,7 +364,7 @@ with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> and press <kbd>Enter</kbd>.
 
    The log goes to `build/play.log` and to the terminal.
 
-`run.sh` plays online, as `Play SSBU.bat` does on Windows: the game joins the online lobby named
+`run.sh` plays online, as `OpenSmash.exe` does on Windows: the game joins the online lobby named
 in `online_server.txt`, and Local Wireless lists every room that players in the same lobby
 create, on Windows or Linux ([Multiplayer](MULTIPLAYER.md)). The first time, it asks for the name other
 players see and keeps it in `online_name.txt`.
@@ -327,16 +456,48 @@ log names each pad as it connects, with its type and GUID.
 
 **Shaders:** this folder carries the Windows build's compiled shaders that the game has used. Any
 other shader is compiled the first time it's needed, so a new effect can show a moment late once.
-The Windows build's start-up shader prewarm is off here: under DXVK it made a Vulkan pipeline for
-every cached shader at once and held up the first frame (`SSBU_SHADER_PREWARM=1` turns it on).
-The Windows build's ahead-of-time shaders (`launchers\Prepare Shaders.bat`) aren't in the package (about
-1.5 GB).
+The start-up shader prewarm is on: while the game starts, its compiler threads make the shader
+objects of the programs you have played before, so using one again takes no wait (it stops at a
+third of the PC's memory; `SSBU_SHADER_PREWARM=0` turns it off, `SSBU_SHADER_PREWARM_MB` sets its
+budget). On a PC with 12 GB of memory or more it also makes every program in the shader cache
+that the game has not used yet; from 8 GB it makes the unused vertex programs (the ones a
+match's first draws wait for), and below 8 GB only the played ones. `SSBU_SHADER_PREWARM_UNPLAYED`
+overrides that: `=vs`, `=all` or `=0`. The first game start after Prepare Shaders' warm pass makes
+**every** program once, even on a PC below those thresholds: on the earlier 65,283-program cache
+that is about 22 seconds and 4.2 GB of RAM. While it runs, the middle of the picture shows
+`Preparing shaders... N%` and a bar. The shader objects are the prewarm's part; DXVK makes its
+Vulkan pipeline states when the game first draws a program with the match's state, and the title
+screen's demo match draws those states. The first whole-cache start then counts the distinct draw
+states it sees: it shows `Settling title screen... N states` while the demo match runs, and
+`Ready to play` once no new state (or new state whose first draw took over 2 ms) has appeared for
+3 s. The game's own input is held during the prewarm and this settle, so a match cannot start into
+the remaining hitches; scripted runs (`SSBU_BENCH`, `SSBU_SEQ`, `SSBU_INPUT`) bypass the hold, and
+the host's F1/F2 keys still work. `SSBU_SHADER_SETTLE` is now the longest it will settle, in
+seconds (default 60; 0: no settle); later starts skip it. The log's `[gfx] prewarm: the whole
+cache was prepared once` line says the shader objects are ready, `[gfx] prewarm: settling done...`
+says how many draw states the demo match made, and `[status] pipeline states` tracks them later.
+A match started before `Ready to play` can still wait on the programs the prewarm has not reached
+(measured: 10 waits of 5–13 ms while the menus ran during preparation) or make DXVK's pipeline
+states itself; after the settle, the first match made 269 first draws with none over 4 ms and no
+shader wait. A marker in the cache (`prewarm-all.done`) stops the one-time whole-cache pass; later
+starts follow the memory-based default above. Delete it, or run Prepare Shaders again, to do every
+program again. A PC with less memory prewarms as many as fit in the budget; raise
+`SSBU_SHADER_PREWARM_MB` for more (0: no limit).
+
+The same threads also decode a sRGB block-compressed texture's clear margin off the render
+thread (the stock icons' masks): the compressed texture draws until the decoded copy is ready, so
+a texture's first use can show its margin as a black square for a frame.
+`SSBU_ASYNC_DECODE=0` decodes on the render thread as before.
+The Windows build's ahead-of-time shaders (`python tools\shader_aot.py`) aren't in the package (about
+1.5 GB). On Linux, `bash launchers/prepare-shaders.sh` makes them, then draws them once through
+DXVK so its pipelines and the driver's GPU code are made in advance
+([above](#shaders-and-first-time-stutter)).
 
 ## Other launchers
 
 | Launcher | What it does |
 | :--- | :--- |
-| `run-offline.sh` | The game without going online, as `launchers\Play SSBU Offline.bat` on Windows. |
+| `run-offline.sh` | The game without going online, as the launcher's Offline lobby setting on Windows. |
 | `host-netplay.sh`, `join-netplay.sh` | A private room, as `launchers\Host SSBU Netplay.bat` and `launchers\Join SSBU Netplay.bat` on Windows ([Multiplayer](MULTIPLAYER.md)). |
 | `unlock-all-fighters.sh` | The unlock tool, on this folder's save. Run it with the game closed. Like `launchers\Unlock All Fighters.bat`, it knows 13.0.5's save layout (it checks that this folder's game is 13.0.5) and changes nothing otherwise. |
 
