@@ -278,8 +278,8 @@ static int sky_svc(Ctx *c, uint32_t n) {
         memset((void *)(uintptr_t)out, 0, 0x28);
         if (sky_find_seg(a, &s)) { wr64(out, s.start); wr64(out + 8, s.end - s.start); wr32(out + 0x10, s.type); wr32(out + 0x18, s.perm); }
         else {
-            MEMORY_BASIC_INFORMATION mi;
-            if (VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) {
+            MEMORY_BASIC_INFORMATION mi;     /* the guest's address space ends at 2^47: the host's own mappings above it (aarch64 Linux) stay hidden */
+            if (a < 0x800000000000ull && VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) {
                 uint32_t p = mi.Protect & 0xff, perm = p == PAGE_READONLY ? 1 : p == PAGE_READWRITE || p == PAGE_WRITECOPY ? 3 : p == PAGE_EXECUTE_READ ? 5 : p == PAGE_EXECUTE_READWRITE ? 7 : 0;
                 wr64(out, (uint64_t)(uintptr_t)mi.BaseAddress); wr64(out + 8, mi.RegionSize);
                 wr32(out + 0x10, mi.State == MEM_COMMIT ? 5 : 0); wr32(out + 0x18, mi.State == MEM_COMMIT ? perm : 0);   /* Heap / Unmapped */
