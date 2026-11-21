@@ -45,9 +45,7 @@ static int gerrno(void) { return (int)CALL(SO("12GetLastErrnoEv"), 0); }
 static void sockaddr_loop(uint8_t sa[16], uint16_t port_host) { memset(sa, 0, 16); sa[0] = 16; sa[1] = 2; sa[2] = port_host >> 8; sa[3] = port_host & 0xff; sa[4] = 127; sa[7] = 1; }
 
 int main(void) {
-#ifdef __APPLE__
-    signal(SIGPIPE, SIG_IGN);                             /* macOS has no MSG_NOSIGNAL (Linux: nnnet.c adds it to every send) */
-#endif
+    signal(SIGPIPE, SIG_IGN);                             /* nnnet_c4a.inc's send() / sendto() pass no MSG_NOSIGNAL (macOS has none); the exe ignores SIGPIPE in plat_crash.c, this test does not call that */
     c4a_register();
     CHECK(svc_nimports > 20);
     static uint8_t pool[0x100000] __attribute__((aligned(4096)));
