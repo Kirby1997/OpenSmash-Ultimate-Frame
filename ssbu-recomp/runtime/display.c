@@ -503,10 +503,10 @@ static bool SDLCALL close_watch(void *user, SDL_Event *e) {
  * window's thread (display_pump, every few ms) turns it into the close request. A second SIGTERM ends the process at once,
  * and before the window exists the default action is kept. SDL's own handlers stay off (SDL_HINT_NO_SIGNAL_HANDLERS). */
 #include <signal.h>
-static volatile sig_atomic_t g_term_sig;
+static volatile int g_term_sig;                      /* written in the handler (any thread), read by display_pump: lock-free atomics, async-signal-safe */
 static void term_handler(int sig) {
-    if (g_term_sig) { signal(sig, SIG_DFL); raise(sig); return; }      /* async-signal-safe only */
-    g_term_sig = sig;
+    if (__atomic_load_n(&g_term_sig, __ATOMIC_RELAXED)) { signal(sig, SIG_DFL); raise(sig); return; }      /* async-signal-safe only */
+    __atomic_store_n(&g_term_sig, sig, __ATOMIC_RELEASE);
 }
 static void term_install(void) {
     struct sigaction sa;
@@ -518,7 +518,7 @@ static void term_install(void) {
 }
 static void term_service(void) {
     static int done;
-    if (!g_term_sig || done) return;
+    if (done || !__atomic_load_n(&g_term_sig, __ATOMIC_ACQUIRE)) return;
     done = 1;
     printf("\nSIGTERM: the game is closing as if its window were closed (a second SIGTERM ends it at once)\n");
     fflush(stdout);

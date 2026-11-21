@@ -3726,7 +3726,8 @@ static void prep_first_hold(LONG64 frame) {
 static volatile LONG g_early_posted;
 static PresentJob g_early_job;                      /* win = NULL: no game picture, only the screen */
 static int prep_early_wanted_now(void) {
-    return ps_early_wanted(nvn_vk_prep_mode(), g_prep_thread != NULL, g_prep_marked, g_prep_limited, __atomic_load_n(&g_prep_state, __ATOMIC_ACQUIRE),
+    /* have_prep = 1: started only from inside prep_main (nvn_vk_m4.c), which may run before prep_start has stored g_prep_thread */
+    return ps_early_wanted(nvn_vk_prep_mode(), 1, g_prep_marked, g_prep_limited, __atomic_load_n(&g_prep_state, __ATOMIC_RELAXED) /* written with plain stores: read again each call, for display only, orders nothing */,
                            prep_stopped() || g_m4_quit, (int)__atomic_load_n(&g_game_presented, __ATOMIC_ACQUIRE));
 }
 void nvn_vk_prep_early_job(void *arg) {             /* render thread (nvn_front.c) */
@@ -3752,7 +3753,7 @@ static DWORD WINAPI prep_early_main(void *arg) {
     }
     return 0;
 }
-void prep_early_start(void) {                       /* nvn_vk_m4.c prep_start, after the preparation thread is made (no marker) */
+void prep_early_start(void) {                       /* nvn_vk_m4.c prep_main, after the store's stale check (no marker) */
     const char *e = getenv("SSBU_VK_EARLY_SCREEN");
 #ifdef _WIN32
     int on = e && atoi(e);

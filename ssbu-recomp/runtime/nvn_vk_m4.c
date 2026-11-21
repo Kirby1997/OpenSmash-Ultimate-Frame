@@ -43,6 +43,7 @@ static void wd_leave(int i) { if (i >= 0) g_wd_wait[i].tid = 0; }
 #define WD_SLEEP(cv, lock, ms) do { int wd_i_ = wd_enter(__func__, __LINE__); SleepConditionVariableCS(cv, lock, ms); wd_leave(wd_i_); } while (0)
 VkPipelineCache g_pcache;
 static LONG64 g_pw_stages, g_pw_pipes, g_pw_failed; LONG64 g_pipe_miss;
+#include "nvn_vk_prepscreen.h"                       /* 2026-11: ps_prep_whole, ps_marker_due, ps_marked_after_store_check (tests/port/prepscreen) */
 #include "nvn_vk_prewarm.h"                         /* PR #33: SSBU_VK_PREWARM_PROFILE=1, the prewarm's measurements; pw_graphics / pw_compute */
 VStage *g_vstage[4096]; static VStage *g_vh[4096];        /* by hb, by h */
 uint32_t g_vstage_ids;
@@ -2369,10 +2370,13 @@ static DWORD WINAPI prep_main(void *arg) {
             stale = 1;
             printf("nvn_vk_store: STALE: the container store in %s was made from another data.arc (%.60s now: %.60s): its files and the preparation's marker are removed, the store is built again\n", dir, was, stamp);
             if (prep_list(dir)) for (int i = 0; i < g_prep_nfiles; i++) { snprintf(path, sizeof path, "%s/%s", dir, g_prep_file[i].name); DeleteFileA(path); }
-            DeleteFileA(g_prep_marker); g_prep_marked = 0;
+            DeleteFileA(g_prep_marker); g_prep_marked = ps_marked_after_store_check(g_prep_marked, 1);
             DeleteFileA(spath);
         }
     }
+    /* 2026-11: the first-run screen from now on (not only from the game's first frame). Here and not in prep_start: a store
+     * found STALE just above (a new data.arc) clears g_prep_marked, and that start is a whole first run (store + preparation) */
+    if (!g_prep_marked) prep_early_start();
     snprintf(path, sizeof path, "%s/store_building.txt", dir);
     if (!prep_list(dir) || GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
         g_prep_state = 5;                          /* the store is being built: the progress overlay says so */
@@ -2474,7 +2478,12 @@ static DWORD WINAPI prep_main(void *arg) {
         SleepConditionVariableCS(&g_sh_cv, &g_sh_lock, 200);
         if (tk() - last > 10 * fq.QuadPart) { last = tk(); LeaveCriticalSection(&g_sh_lock); prep_line("progress"); EnterCriticalSection(&g_sh_lock); }
     }
-    int whole = g_pq_done == g_pq_queued && g_prep_read == todo;
+    /* 2026-11: not whole once the game is closing: job_prep leaves a job between two stages and the worker still counts it
+     * done, so the last few jobs of a run stopped near its end would make done == queued and write the marker (prep_stopped
+     * is read after the counts under the lock: an abandoned job's done++ comes after its own read of the stop) */
+    LONG64 pq_done = g_pq_done, pq_queued = g_pq_queued;
+    int stop_seen = prep_stopped();                /* after the counts (both under g_sh_lock, so either order is safe; this one is plain to read) */
+    int whole = ps_prep_whole(pq_done, pq_queued, g_prep_read, todo, stop_seen);      /* nvn_vk_prepscreen.h (tests/port/prepscreen) */
     LeaveCriticalSection(&g_sh_lock);
     {   /* TEST ONLY, SSBU_VK_PREP_END_AT=<frame>: the end below is held back until that game frame (to place it in a fight or a loading screen) */
         LONG64 at = getenv("SSBU_VK_PREP_END_AT") ? atoll(getenv("SSBU_VK_PREP_END_AT")) : 0;
@@ -2487,7 +2496,7 @@ static DWORD WINAPI prep_main(void *arg) {
            (long long)g_prep_stages, (long long)g_prep_fromrec, (long long)g_prep_libs, (long long)g_prep_dup, (long long)g_prep_had, (double)g_prep_tr_tk / (double)fq.QuadPart, (double)g_prep_lib_tk / (double)fq.QuadPart, g_prep_cap, g_prep_fight_cap);
     if (g_prep_loadall) g_prep_urgent = 0;
     if (whole && g_prep_marked) { g_prep_state = 2; prep_line(g_prep_loadall ? "FINISHED: every container of the game's data is in memory (shader_load = start)" : "FINISHED (the containers kept in memory; the rest was prepared by an earlier run)"); }
-    else if (whole) {
+    else if (ps_marker_due(whole, g_prep_marked)) {
         g_prep_state = 2;
         prep_line("FINISHED: every stage of every container of the game's data is made");
         /* session 12: NOT saved here any more (see pcache_save_at: this thread serialising the live cache during play was the
@@ -2571,8 +2580,7 @@ static void prep_start(void) {
          * whole at its loading screen on every start; it queues nothing (before: no thread, so no index, on a marked start) */
     }
     if (!on || !g_m4_on) { printf("nvn_vk_prep: the preparation of every container is off (%s)\n", e ? "SSBU_VK_PREP=0" : "no stage libraries: SSBU_VK_GPL is not 2 or the driver lacks VK_EXT_graphics_pipeline_library"); return; }
-    g_prep_thread = CreateThread(NULL, 0, prep_main, NULL, 0, NULL);
-    if (g_prep_thread && !g_prep_marked) prep_early_start();      /* 2026-11: the first-run screen from now on, not only from the game's first frame */
+    g_prep_thread = CreateThread(NULL, 0, prep_main, NULL, 0, NULL);      /* 2026-11: it starts the first-run screen (prep_early_start) */
 }
 /* `ssbu_vk1.exe --prepare-shaders [folder]` (boot.c): no game, no window, no Vulkan device. Every *.bnsh file of the folder
  * (tools_vk/bnsh_extract.py writes them from data.arc) is walked as the scan above walks a container in the game's memory

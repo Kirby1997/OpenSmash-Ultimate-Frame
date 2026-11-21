@@ -127,6 +127,35 @@ int main(void) {
         CHECK(ps_early_wanted(0, 1, 0, 0, 1, 1, 0) == 0);      /* the game is closing */
         CHECK(ps_early_wanted(0, 1, 0, 0, 1, 0, 1) == 0);      /* the game presented: the hold owns the screen */
     }
+    SECTION("the preparation's end: whole and the marker (review_firstrun.md MEDIUM 1)");
+    {   /* a model of prep_main + the workers: 521 files, 100 jobs queued; a job left by job_prep after the stop still counts done */
+        long long queued = 100, done = 0;
+        int read = 521, todo = 521, stopped = 0;
+        for (; done < queued; done++) ;             /* a normal finish */
+        CHECK(ps_prep_whole(done, queued, read, todo, stopped) == 1);
+        CHECK(ps_marker_due(ps_prep_whole(done, queued, read, todo, stopped), 0) == 1);      /* first run: marker written */
+        CHECK(ps_marker_due(ps_prep_whole(done, queued, read, todo, stopped), 1) == 0);      /* marked start: the marker is there already */
+        done = 0; stopped = 0;
+        for (; done < 97; done++) ;                 /* the stop lands while the last 3 jobs run ... */
+        stopped = 1;
+        for (; done < queued; done++) ;             /* ... job_prep leaves them, pw_main counts them done anyway */
+        CHECK(done == queued);
+        CHECK(ps_prep_whole(done, queued, read, todo, stopped) == 0);      /* the race: done == queued, yet not whole */
+        CHECK(ps_marker_due(ps_prep_whole(done, queued, read, todo, stopped), 0) == 0);      /* no marker: the next start prepares again */
+        CHECK(ps_prep_whole(40, queued, 200, todo, 1) == 0);               /* a stop in the middle */
+        CHECK(ps_prep_whole(40, queued, 200, todo, 0) == 0);               /* not stopped, not finished either */
+        CHECK(ps_prep_whole(queued, queued, 520, todo, 0) == 0);           /* one container not read yet */
+    }
+    SECTION("a STALE store (a new data.arc): the marker goes, the screen before the first frame is shown (MEDIUM 2)");
+    {   int marked = 1;                             /* prep_start found the marker of the old data */
+        CHECK(ps_early_wanted(0, 1, marked, 0, 0, 0, 0) == 0);             /* what prep_start alone would have decided */
+        marked = ps_marked_after_store_check(marked, 1);                   /* prep_main: the store is stale */
+        CHECK(marked == 0);
+        CHECK(ps_early_wanted(0, 1, marked, 0, 5, 0, 0) == 1);             /* the store being built again: the screen shows */
+        CHECK(ps_marked_after_store_check(1, 0) == 1);                     /* the same data.arc: still prepared, no screen */
+        CHECK(ps_early_wanted(0, 1, ps_marked_after_store_check(1, 0), 0, 1, 0, 0) == 0);
+        CHECK(ps_marked_after_store_check(0, 0) == 0);
+    }
     printf("%-14s %s (%d checks, %d failed)\n", "prepscreen", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

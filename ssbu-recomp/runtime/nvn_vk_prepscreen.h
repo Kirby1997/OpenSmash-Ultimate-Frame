@@ -80,4 +80,17 @@ static inline int ps_early_wanted(int mode, int have_prep, int marked, int limit
     if (mode != 0 || !have_prep || marked || limited || stopped || game_presented) return 0;
     return state != 2 && state != 3;                /* finished / no container source: nothing to show */
 }
+/* The preparation's END (nvn_vk_m4.c prep_main): whole = every container read and every queued job done, and the game
+ * NOT closing. Once prep_stopped(), job_prep leaves a job between two stages and the worker still counts it done, so a
+ * stop during the last jobs gives done == queued although stages were dropped: without `stopped` that run would write
+ * the marker and the next start would skip the preparation (review_firstrun.md, MEDIUM 1). `stopped` must be read AFTER
+ * done / queued (under g_sh_lock): an abandoned job's done++ comes after its own read of the stop. */
+static inline int ps_prep_whole(long long done, long long queued, int read, int todo, int stopped) {
+    return !stopped && done == queued && read == todo;
+}
+/* the marker (with the pipeline cache) is due only for a whole run that was not already prepared by an earlier one */
+static inline int ps_marker_due(int whole, int marked) { return whole && !marked; }
+/* prep_main's store check: a store made from another data.arc (stale) removes the marker, so that start is a first run
+ * again (store + whole preparation) and gets the screen before the first frame (review_firstrun.md, MEDIUM 2) */
+static inline int ps_marked_after_store_check(int marked, int stale) { return marked && !stale; }
 #endif
