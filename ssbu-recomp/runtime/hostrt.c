@@ -423,10 +423,12 @@ static __declspec(thread) Ctx *t_cur_ctx;
 /* not inlined: the guest call can switch fibers and resume on another host thread, and a thread variable's address
  * kept across it would be the old thread's (os_threads.c, fiber_cur) */
 static __attribute__((noinline)) void set_cur_ctx(Ctx *c) { __asm__ volatile("" ::: "memory"); t_cur_ctx = c; }
+/* the entry side through one too (swap in c, return the one before): call_guest itself then reads no thread pointer
+ * (tests/port/threads/run_frame.sh checks that), and it still makes two calls */
+static __attribute__((noinline)) Ctx *swap_cur_ctx(Ctx *c) { __asm__ volatile("" ::: "memory"); Ctx *old = t_cur_ctx; t_cur_ctx = c; return old; }
 
 void call_guest(Ctx *c, uint64_t addr) {
-    Ctx *saved = t_cur_ctx;
-    set_cur_ctx(c);
+    Ctx *saved = swap_cur_ctx(c);
     call_indirect(c, addr);
     set_cur_ctx(saved);
 }

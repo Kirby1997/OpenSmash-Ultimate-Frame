@@ -464,6 +464,9 @@ static void so_recv(Ctx *c, uint64_t addr, uint64_t lenp) {   /* (fd, buf, size,
 }
 static void socket_Recv(Ctx *c) { so_recv(c, 0, 0); }
 static void socket_RecvFrom(Ctx *c) { if (!A4 || !A5 || !M32(A5)) so_recv(c, 0, 0); else so_recv(c, A4, A5); }
+#ifndef MSG_NOSIGNAL                                      /* Windows (no SIGPIPE) and macOS (plat_crash.c ignores it) */
+#define MSG_NOSIGNAL 0
+#endif
 static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, flags [, const sockaddr *, len]) */
     uint64_t buf = A1, size = A2;
     int gf = (int)A3, flags = 0;
@@ -479,8 +482,11 @@ static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, fla
     else if (addr && !so_is_loopback(a.sin_addr.s_addr)) e = 101;                 /* no network */
     else {
         if (temp) so_nonblock(o, 1);
-        if (addr) n = sendto(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf) & MSG_OOB, (struct sockaddr *)&a, sizeof a);
-        else n = send(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf) & MSG_OOB);
+        /* Linux: a send after the peer closed fails with EPIPE (the guest's 32) instead of raising SIGPIPE, whether or not
+         * plat_crash.c's SIG_IGN has run (tests/port/services/test_net.c never calls it) */
+        int hf = (so_host_flags(gf) & MSG_OOB) | MSG_NOSIGNAL;
+        if (addr) n = sendto(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), hf, (struct sockaddr *)&a, sizeof a);
+        else n = send(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), hf);
         if (n < 0) e = so_wsa_errno(WSAGetLastError(), 1);
         if (temp) so_nonblock(o, 0);
     }
