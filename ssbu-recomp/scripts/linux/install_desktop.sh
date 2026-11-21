@@ -24,7 +24,7 @@ if [ "${1:-}" = "--remove" ]; then
     exit 0
 fi
 BUILD=build-linux; RUNARG=--linux; TARGET=linux
-if [ "$(uname -m)" = aarch64 ]; then BUILD=build-linux-arm64; RUNARG=--linux-arm64; TARGET=linux-arm64; fi
+if [ "$(uname -m)" = aarch64 ] && [ -x "$REPO/build-linux-arm64/work/ssbu_native" ] && [ ! -x "$REPO/build-linux/work/ssbu_native" ]; then BUILD=build-linux-arm64; RUNARG=--linux-arm64; TARGET=linux-arm64; fi
 [ -x "$REPO/$BUILD/work/ssbu_native" ] || { echo "no Linux build in $REPO/$BUILD: run scripts/setup.py --target $TARGET first" >&2; exit 1; }
 [ -x "$REPO/deps/venv/bin/python" ] || { echo "deps/venv is missing: run scripts/linux/install_deps.sh first" >&2; exit 1; }
 
