@@ -1602,6 +1602,9 @@ static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeo
 void prewarm_start(void) {
     InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
+    /* ..\cache first: CreateDirectory makes one level, and only scripts/run.py made ..\cache before the start. A first run
+     * started otherwise (by hand, a Steam shortcut on the Frame) wrote no pipeline cache and no pipes.bin at its exit. */
+    if (!getenv("SSBU_VK_CACHE")) CreateDirectoryA("../cache", NULL);
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SSBU_VK_CACHE")) printf("nvn_vk: cache folder %s (SSBU_VK_CACHE)\n", vkc_dir());
     {   HMODULE m = LoadLibraryA("ssbu_glslang.dll");
