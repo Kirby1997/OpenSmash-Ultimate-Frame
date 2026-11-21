@@ -123,6 +123,11 @@ This fork's lifter matches the Switch more closely in a few edge cases (CLREX, F
 LSE / LDAPR encodings that now trap instead of being skipped), on every host, Windows included. A fork build and an upstream
 build are therefore not guaranteed to simulate identically, which matters for a rollback match between them.
 
+"Upstream build" here means upstream's ssbu-recomp runtime, the one this port is made from. OpenSmash's own releases
+(0.5 and later) are made from the root runtime instead, and their official lobbies do not serve this runtime's online
+protocol. Since the merge of upstream's 0.5 code this runtime also has no default lobby: a game that names no server
+starts offline (`online_server` in `graphics.ini`, `SSBU_ONLINE`, or LAN / host / join; [ONLINE.md](ONLINE.md)).
+
 ## Graphics (Adreno 750 / Turnip)
 
 The game draws with the Vulkan renderer (`runtime/nvn_vk*.c`, the default). The Frame's GPU is an Adreno 750 on Mesa's
