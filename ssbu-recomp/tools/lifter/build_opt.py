@@ -15,7 +15,9 @@ Why a file can take hours at -O1/-O2: a few lifted functions have tens of thousa
 215,493) in one C function with thousands of labels; several LLVM passes are worse than linear in that. Rule used
 here, automatic and bounded in time:
   1. every function longer than OPTNONE_LINES statements is compiled unoptimised (`optnone`), the rest of its file at
-     the chosen level; the attribute is given through a generated header (-include), the generated C is untouched;
+     the chosen level; the attribute is given through a generated header (-include), the generated C is untouched
+     (linux-arm64, SPLIT: those functions are compiled at -O0 in a translation unit of their own instead, joined to the
+     rest with ld.lld -r - see SPLIT below);
   2. if a file still exceeds TIME_LIMIT seconds, it is retried with the limit divided by 4, then by 16;
   3. if that still exceeds the time limit, the whole file is compiled at -O0.
 Every fallback is printed and written to <obj dir>\\_opt_report.txt.
@@ -58,8 +60,29 @@ EXTRA = ['-ffp-contract=off'] + getattr(build, 'CODEGEN_FLAGS', []) + os.environ
 INLINE_FLAG = '-Dinline=__inline__ __attribute__((always_inline))'
 INLINE = os.environ.get('RECOMP_INLINE', '0') not in ('', '0')      # the game code only (cmd_main); the script modules keep EXTRA
 INLINE_LIMIT = float(os.environ.get('RECOMP_INLINE_LIMIT', '20'))   # seconds an inlined compile may take; longer: the file is compiled without
+# linux-arm64 at -O2 / -O3: the inlined compile is the file's only compile, with the normal ladder (no separate 20 s try).
+# There the -O2 inliner inlines the helpers by itself, so with or without INLINE_FLAG the compile takes the same time and
+# makes nearly the same code (measured 2026-11-21, LLVM 19 cross: c_04cd.c 19.3 / 19.1 s, 27 of 31 functions identical and
+# the same 362 calls, none to a helper; c_04ce.c 48 / 53 s): the 20 s try only cost time on the files that need longer
+# (the Frame's first build: 376 files went over it, ~2 compiler-hours spent on tries that were thrown away).
+INLINE_ONE_TRY = INLINE and TARGET_ARM64 and OPT in ('-O2', '-O3') and os.environ.get('RECOMP_INLINE_ONE_TRY', '1') not in ('', '0')
 OPTNONE_LINES = int(os.environ.get('RECOMP_OPTNONE_LINES', '20000'))
 TIME_LIMIT = float(os.environ.get('RECOMP_TIME_LIMIT', '180'))
+# linux-arm64 (RECOMP_SPLIT, default on there): a function over the ladder's statement limit is not marked `optnone` in its
+# own file but compiled in a translation unit of its own (split_source) at SPLIT_OPT, the rest of the file at OPT, and the
+# two objects are joined into the file's one object (ld.lld -r). The long function gets the code optnone gave it (-O0; it
+# was noinline already, so nothing could be inlined from or into it either way; helpers as calls, see split_finish), same
+# flags otherwise (-ffp-contract=off ...).
+# Why: nearly every such function dispatches its `br` through a switch with a case for EVERY instruction (recomp_eh.py,
+# L_dispatch). At -O2, `optnone` skips the optimisation passes but not the analyses the -O2 code generator asks for:
+# MachineCycleInfo on that irreducible graph ran out of memory (measured 2026-11-21, LLVM 19 cross to aarch64, c_03d9.c, one
+# function of 77,061 statements: over 9 GB in llc's "Machine Cycle Info Analysis"; the Frame's first build: 257 s and an
+# 11.3 GB reservation). Alone at -O0 the same function takes 14 s and 1.5 GB, the rest of the file 1.5 s at -O2; c_00a3.c
+# and c_013a.c, which fell back to WHOLE FILE -O0, take 2 + 39 s and 4 + 17 s that way, the rest of each fully at -O2.
+SPLIT_WANTED = TARGET_ARM64 and os.environ.get('RECOMP_SPLIT', '1') not in ('', '0')
+SPLIT = False          # set by cmd_main / `one` (the game's own files, whose functions funcs.h declares); the script modules: optnone as before
+SPLIT_OPT = os.environ.get('RECOMP_SPLIT_OPT', '-O0')
+LLD = os.environ.get('RECOMP_LLD') or (os.path.join(os.path.dirname(CLANG), 'ld.lld') if os.path.exists(os.path.join(os.path.dirname(CLANG), 'ld.lld')) else 'ld.lld')
 # Linux build: address-space limit per compiler, bytes (0: none). Set by limit_memory(): the most one compiler may get.
 MEM_LIMIT = 0
 # Linux and macOS builds (RECOMP_TARGET linux / linux-arm64 / macos): the RAM all compilers share, bytes (0: no sharing, as on Windows).
@@ -68,6 +91,7 @@ MEM_LIMIT = 0
 # reservation is also the compiler's address-space limit: a file that passes it is compiled again with twice as much (up
 # to MEM_BUDGET) before it takes the next step of the fallback ladder. macOS enforces no limit: there it only paces.
 MEM_BUDGET = 0
+MEM_KEY = [0]                            # the budget's part of the _ladder.json key: RAM-based, not what was free at the start
 # A compile waiting for its share of RAM checks the queue this often, and prints one line each time it has waited this long
 # (RECOMP_MEM_WAIT_WARN, seconds; 0: never): a step that stops making progress then says so in logs/compile.log instead of
 # going quiet, which is what made the 2026-10-22 report (issue 75) take days to read.
@@ -112,6 +136,91 @@ def optnone_header(src, obj, limit):
     return path, len(big), sum(b[0] for b in big)
 
 
+def split_source(src, obj, limit):
+    """SPLIT: write <obj>.split_a.c (src without its functions longer than `limit` statements) and <obj>.split_b.c (those
+    functions only), both with src's own lines before its first function (the comment and the #includes; every function
+    is declared in funcs.h, and a generated file has nothing else at file scope: one-line wrappers such as
+    `void f_X(Ctx *c) { u_X(c, 0); }` stay in part a). Returns (a, b, count, statements); (None, None, 0, 0) when no
+    function is that long (nothing written; old parts removed)."""
+    base = obj[:-4]
+    head, a, b = [], [], []
+    big = []
+    cur = None
+    with open(src, encoding='latin-1') as f:
+        for line in f:
+            if cur is None:
+                if DEF.match(line.rstrip('\n')):
+                    cur, n = [line], 0
+                elif not a and not b and (line.startswith('#') or line.startswith('/*')):
+                    head.append(line)
+                else:
+                    a.append(line)
+            else:
+                cur.append(line)
+                if line.startswith('}'):
+                    if n > limit:
+                        b.extend(cur)
+                        big.append(n)
+                    else:
+                        a.extend(cur)
+                    cur = None
+                else:
+                    n += 1
+    if cur is not None:                  # (an unterminated function: not a generated file; compiled as it is)
+        big = []
+    paths = (base + '.split_a.c', base + '.split_b.c')
+    if not big:
+        for p in paths + (base + '.part_a.o', base + '.part_b.o'):
+            if os.path.exists(p):
+                os.remove(p)
+        return None, None, 0, 0
+    for p, body in zip(paths, (a, b)):
+        with open(p, 'w', encoding='latin-1') as f:
+            f.writelines(head + body)
+    return paths[0], paths[1], len(big), sum(big)
+
+
+def split_finish(b_src, obj, extra, base_flags):
+    """SPLIT, after part a compiled to <obj>.part_a.o: compile part b (the long functions) at SPLIT_OPT, without a time limit
+    (the -O0 code generator is linear; the whole-file -O0 fallback had none either), and join both into obj with ld.lld -r.
+    Part b never gets the inlined helpers (INLINE_FLAG is taken out of `extra`): always_inline is honoured at -O0, and
+    there it tripled the code of these functions, which are not hot (Frame, clang 21: c_00a3.c's object 8.6 -> 26.9 MB of
+    text, the game library +27 MB, with range-extension thunks; LLVM 19: c_03d9.c's part 14 -> 50 s, 1.5 -> 2.9 GB).
+    Returns (exit code, output, seconds)."""
+    base = obj[:-4]
+    pa, pb = base + '.part_a.o', base + '.part_b.o'
+    cmd = [CLANG, '-c', SPLIT_OPT] + [f for f in extra if f != INLINE_FLAG] + base_flags + [b_src, '-o', pb]
+    want = mem_split_estimate(b_src) if MEM_BUDGET else 0
+    t = time.time()
+    while True:
+        if want:
+            want = mem_acquire(want)
+        try:
+            code, out, _ = run_limited(cmd, None, want)
+        finally:
+            if want:
+                mem_release(want)
+        if code is None and out == OOM and want and want < MEM_BUDGET:
+            want = min(MEM_BUDGET, want * 2)
+            continue
+        break
+    if code == 0:
+        r = subprocess.run([LLD, '-r', pa, pb, '-o', obj], capture_output=True, text=True, errors='replace')
+        code, out = r.returncode, (out + r.stdout + r.stderr)[-2000:]
+    elif code is None:
+        code = 1
+    for p in (pa, pb) + ((base + '.split_a.c', b_src) if code == 0 else ()):     # (a failed part's sources stay, to look at)
+        if os.path.exists(p):
+            os.remove(p)
+    return code, out, time.time() - t
+
+
+def mem_split_estimate(b_src):
+    """Part b's reservation: the -O0 compile of the long functions alone (measured, LLVM 19: 1.5 GB for the 4.6 MB part
+    of c_03d9.c, 1.2 GB for the 12.7 MB part of c_00a3.c); 400 bytes per byte of source, at least MEM_FLOOR."""
+    return min(MEM_BUDGET, max(MEM_FLOOR[0], os.path.getsize(b_src) * 400))
+
+
 def ram_bytes():
     """This machine's RAM in bytes (Linux: /proc/meminfo, macOS: hw.memsize), or 0 when unknown."""
     try:
@@ -137,10 +246,33 @@ def limit_memory(jobs):
     if not ram:
         return
     MEM_BUDGET = max(2 << 30, ram - (4 << 30))
+    MEM_KEY[0] = MEM_BUDGET
+    note = ''
+    if TARGET_ARM64:
+        # The Frame (2026-11-21, first native build): RAM - 4 GB = 11.3 GB for the compilers, but SteamOS + Steam + the XR
+        # service hold ~7 GB of its 15.3 GB, so ~3 GB of Steam went to swap during the build. Here the budget leaves
+        # RECOMP_MEM_RESERVE GB (default 3.5: Steam's own share) on top of the 4 GB, and never more than what is available
+        # when the build starts, less 1 GB (MemAvailable: a game or anything else running then keeps its memory too).
+        reserve = int(float(os.environ.get('RECOMP_MEM_RESERVE', '3.5')) * (1 << 30))
+        MEM_BUDGET = max(2 << 30, ram - (4 << 30) - reserve)
+        MEM_KEY[0] = MEM_BUDGET
+        avail = mem_available()
+        if avail and avail - (1 << 30) < MEM_BUDGET:
+            MEM_BUDGET = max(2 << 30, avail - (1 << 30))
+            note = ', %.1f GB available now' % (avail / 2.0 ** 30)
     if os.environ.get('RECOMP_TARGET') in ('linux', 'linux-arm64'):   # both Linux targets; macOS: no limit (no prlimit; RLIMIT_AS is not enforced there)
         MEM_LIMIT = MEM_BUDGET
-    print('compilers share %.1f GB of RAM (%s); at most %d at once' % (MEM_BUDGET / 2.0 ** 30, 'each held to its reservation'
-          if MEM_LIMIT else 'reservations pace them', jobs), flush=True)
+    print('compilers share %.1f GB of RAM (%s%s); at most %d at once' % (MEM_BUDGET / 2.0 ** 30, 'each held to its reservation'
+          if MEM_LIMIT else 'reservations pace them', note, jobs), flush=True)
+
+
+def mem_available():
+    """Linux: MemAvailable of /proc/meminfo in bytes (0 when unknown)."""
+    try:
+        with open('/proc/meminfo') as f:
+            return next(int(l.split()[1]) for l in f if l.startswith('MemAvailable:')) << 10
+    except (OSError, StopIteration, ValueError):
+        return 0
 
 
 MEM_FLOOR = [1536 << 20]                 # the smallest reservation; raised when a file reserved at the floor ran out
@@ -306,6 +438,28 @@ def hints_write(objdir):
             json.dump(d, f, indent=0, sort_keys=True)
 
 
+def long_functions(src, obj, limit):
+    """The functions of src over `limit` statements, the way this build treats them. SPLIT: in a unit of their own
+    (split_source); returns (part a, <obj>.part_a.o, None, part b, count, statements), or (src, obj, None, None, 0, 0) when
+    there are none. Otherwise `optnone` through a header: (src, obj, header, None, count, statements)."""
+    if SPLIT:
+        a, b, count, lines = split_source(src, obj, limit)
+        if a:
+            hdr = obj[:-4] + '.optnone.h'
+            if os.path.exists(hdr):
+                os.remove(hdr)
+            return a, obj[:-4] + '.part_a.o', None, b, count, lines
+        return src, obj, None, None, 0, 0
+    hdr, count, lines = optnone_header(src, obj, limit)
+    return src, obj, hdr, None, count, lines
+
+
+def long_note(count, limit, lines):
+    if SPLIT:
+        return '%d function(s) over %d statements at %s in a unit of their own (%d statements)' % (count, limit, SPLIT_OPT, lines)
+    return '%d function(s) over %d statements unoptimised (%d statements)' % (count, limit, lines)
+
+
 def compile_file(src, obj, base_flags, time_limit=None, extra=None):
     """Compile with the fallback ladder. Returns (exit code, output, seconds, description of the fallback or '')."""
     time_limit = time_limit or TIME_LIMIT
@@ -313,16 +467,17 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
     total = 0.0
     objdir, name = os.path.dirname(obj), os.path.basename(obj)
     with open(src, 'rb') as f:
-        key = hashlib.sha1(f.read() + repr((OPT, extra, base_flags, OPTNONE_LINES, time_limit) + ((MEM_LIMIT,) if MEM_LIMIT else ())).encode()).hexdigest()
+        key = hashlib.sha1(f.read() + repr((OPT, extra, base_flags, OPTNONE_LINES, time_limit) + ((MEM_KEY[0],) if MEM_LIMIT else ())
+                                           + (('split', SPLIT_OPT) if SPLIT else ())).encode()).hexdigest()
     known = ladder(objdir).get(name)
     first = known[1] if known and known[0] == key else 0
-    want = mem_estimate(src, function_sizes(src)) if MEM_BUDGET else 0      # Linux / macOS: this compile's share of RAM
+    want = mem_estimate(src, function_sizes(src)) if MEM_BUDGET and not SPLIT else 0      # Linux / macOS: this compile's share of RAM
     raised = ''
     tried = None
     for step, limit in enumerate((OPTNONE_LINES, OPTNONE_LINES // 4, OPTNONE_LINES // 16)):
         if step < first:
             continue
-        hdr, count, lines = optnone_header(src, obj, limit)
+        csrc, cobj, hdr, b_src, count, lines = long_functions(src, obj, limit)
         if step and not count:
             continue
         # Linux / macOS: as many functions unoptimised as in the attempt that just failed is the same set (each limit's set
@@ -331,7 +486,9 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
         if POSIX_TARGET and count == tried:
             continue
         tried = count
-        cmd = [CLANG, '-c', OPT] + extra + base_flags + (['-include', hdr] if hdr else []) + [src, '-o', obj]
+        if SPLIT and MEM_BUDGET:                     # part a's own estimate (its longest function is now under the limit)
+            want = max(want, mem_estimate(csrc, function_sizes(csrc)))
+        cmd = [CLANG, '-c', OPT] + extra + base_flags + (['-include', hdr] if hdr else []) + [csrc, '-o', cobj]
         while True:
             if want:
                 want = mem_acquire(want)                 # what is granted (never over the budget) is what is given back
@@ -347,16 +504,22 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
                 raised = ' (memory reservation raised to %.1f GB)' % (want / 2.0 ** 30)
                 continue
             break
+        if code == 0 and b_src:
+            code, out2, secs = split_finish(b_src, obj, extra, base_flags)
+            out = (out + out2)[-2000:]
+            total += secs
         if code is not None:
             note = ''
             if count:
-                note = '%d function(s) over %d statements unoptimised (%d statements)' % (count, limit, lines)
+                note = long_note(count, limit, lines)
             if code == 0:
                 ladder_save(objdir, name, key, step)
             return code, out, total, note + (' (step known from _ladder.json)' if first else '') + raised
     cmd = [CLANG, '-c', '-O0'] + extra + base_flags + [src, '-o', obj]
+    if SPLIT and MEM_BUDGET and not want:         # (every step skipped: known from _ladder.json)
+        want = mem_estimate(src, function_sizes(src))
     if want:
-        mem_acquire(want)
+        want = mem_acquire(want)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     finally:
@@ -377,7 +540,8 @@ def compile_file_inline(src, obj, base_flags, time_limit=None):
     """With RECOMP_INLINE: ONE inlined compile with a short time limit (RECOMP_INLINE_LIMIT, 20 s); a file that takes longer
     (the biggest generated files: inlining made the whole game compile 2-4x slower, testers 2026-10-21 "40 min -> over an
     hour") or fails is compiled the normal way (compile_file, its own ladder), so the slowdown per file is bounded. The
-    files that compile fast, most of them, keep the faster code. Without RECOMP_INLINE: compile_file."""
+    files that compile fast, most of them, keep the faster code. Without RECOMP_INLINE: compile_file. linux-arm64 at -O2
+    (INLINE_ONE_TRY): compile_file with the inlined helpers, its ladder and time limit, and no separate try."""
     if not INLINE:
         r = compile_file(src, obj, base_flags, time_limit)
         if r[0] == 0:
@@ -389,17 +553,22 @@ def compile_file_inline(src, obj, base_flags, time_limit=None):
     objdir, name = os.path.dirname(obj), os.path.basename(obj)
     key = hint_key(src)
     known = hints(objdir).get(name)
+    if INLINE_ONE_TRY:
+        r = compile_file(src, obj, base_flags, time_limit, EXTRA + [INLINE_FLAG])
+        if r[0] == 0:
+            hint_save(objdir, name, key, r[2], 1)
+        return r
     if n == 1 and known and known[0] == key and known[2] == 0:
         code, out, secs, note = compile_file(src, obj, base_flags, time_limit)
         hint_save(objdir, name, key, secs, 0)
         return code, out, secs, 'helpers not inlined (known to go over %.0f s)' % INLINE_LIMIT + ('; ' + note if note else '')
     if n == 1:
-        hdr, count, lines = optnone_header(src, obj, OPTNONE_LINES)
-        cmd = [CLANG, '-c', OPT] + EXTRA + [INLINE_FLAG] + base_flags + (['-include', hdr] if hdr else []) + [src, '-o', obj]
+        csrc, cobj, hdr, b_src, count, lines = long_functions(src, obj, OPTNONE_LINES)
+        cmd = [CLANG, '-c', OPT] + EXTRA + [INLINE_FLAG] + base_flags + (['-include', hdr] if hdr else []) + [csrc, '-o', cobj]
         # the inlined compile holds more than the plain one (the inliner's IR), but never more than the whole budget: a
         # request over it is one mem_acquire can never grant and stops every compile of the step (2026-10-22, issue 75).
         # A file that needs that much then runs alone instead.
-        want = min(MEM_BUDGET, mem_estimate(src, function_sizes(src)) * 2) if MEM_BUDGET else 0
+        want = min(MEM_BUDGET, mem_estimate(csrc, function_sizes(csrc)) * 2) if MEM_BUDGET else 0
         if want:
             want = mem_acquire(want)
         try:
@@ -410,9 +579,14 @@ def compile_file_inline(src, obj, base_flags, time_limit=None):
         finally:
             if want:
                 mem_release(want)
+        if code == 0 and b_src:          # part b: plain -O0 (split_finish)
+            code, out2, secs2 = split_finish(b_src, obj, EXTRA, base_flags)
+            out, secs = (out + out2)[-2000:], secs + secs2
+            if code:                                 # (part b failed: the normal way below, which says why)
+                code = 1
         if code == 0:
             hint_save(objdir, name, key, secs, 1)
-            return 0, out, secs, ('%d function(s) over %d statements unoptimised (%d statements)' % (count, OPTNONE_LINES, lines) if count else '')
+            return 0, out, secs, (long_note(count, OPTNONE_LINES, lines) if count else '')
         code2, out2, secs2, note2 = compile_file(src, obj, base_flags, time_limit)
         if code2 == 0:
             hint_save(objdir, name, key, secs2, 0)
@@ -445,7 +619,30 @@ def compile_one_main(name):
     return name, code, out, secs
 
 
+def split_upgrade(objdir):
+    """SPLIT, once per object folder (stamp _split.txt): the objects an older build made WHOLE FILE at -O0 (_ladder.json step
+    3) are compiled again, now with only their long functions at -O0 (first Frame build: c_00a3.c, c_013a.c, a few
+    minutes). The objects made with `optnone` functions are kept: the same functions at the same level, the rest of the
+    file was at -O2 already; they take the split way when their source changes."""
+    if not SPLIT:
+        return
+    stamp = os.path.join(objdir, '_split.txt')
+    if os.path.exists(stamp):
+        return
+    redo = sorted(n for n, (_, step) in ladder(objdir).items() if step == 3)
+    for n in redo:
+        p = os.path.join(objdir, n)
+        if os.path.exists(p):
+            os.remove(p)
+    if redo:
+        print('compiled again once, now with only their longest functions at %s instead of the whole file: %s' % (SPLIT_OPT, ' '.join(redo)), flush=True)
+    with open(stamp, 'w') as f:
+        f.write('%s\n' % SPLIT_OPT)
+
+
 def cmd_main(jobs):
+    global SPLIT
+    SPLIT = SPLIT_WANTED
     build.compile_one = compile_one_main
     _jobs[0] = jobs
     limit_memory(jobs)
@@ -465,6 +662,7 @@ def cmd_main(jobs):
     os.makedirs(build.OBJ, exist_ok=True)
     with open(stamp, 'w') as f:          # now, not after the compile: an interrupted or failed compile must not lose its objects on the next start
         f.write(want + chr(10))
+    split_upgrade(build.OBJ)
     def order_key(n):                    # slowest first by the time it took before (same source and flags), else by size
         h = hints(build.OBJ).get(n[:-2] + '.obj')
         size = os.path.getsize(os.path.join(build.GEN, n))
@@ -523,6 +721,7 @@ if __name__ == '__main__':
         jobs = int(rest.pop(0)) if rest and rest[0].isdigit() else 28
         sys.exit(cmd_nro(jobs, rest))
     if cmd == 'one':
+        SPLIT = SPLIT_WANTED
         os.makedirs(build.OBJ, exist_ok=True)
         src = sys.argv[2] if os.path.isabs(sys.argv[2]) else os.path.join(build.GEN, sys.argv[2])
         obj = os.path.join(os.environ.get('RECOMP_ONE_OUT', build.OBJ), os.path.basename(src)[:-2] + '.obj')
