@@ -497,6 +497,36 @@ static bool SDLCALL close_watch(void *user, SDL_Event *e) {
     }
     return true;
 }
+/* 2026-11 (Frame): SIGTERM (what Steam's "Exit game" and `kill` send) ends the game as the window's close does: the
+ * report, the driver's pipeline cache saved, the first-run preparation stopped between two stages (before: the default
+ * action, the process gone at once and the preparation's cache work of this run lost). The handler only notes it; the
+ * window's thread (display_pump, every few ms) turns it into the close request. A second SIGTERM ends the process at once,
+ * and before the window exists the default action is kept. SDL's own handlers stay off (SDL_HINT_NO_SIGNAL_HANDLERS). */
+#include <signal.h>
+static volatile sig_atomic_t g_term_sig;
+static void term_handler(int sig) {
+    if (g_term_sig) { signal(sig, SIG_DFL); raise(sig); return; }      /* async-signal-safe only */
+    g_term_sig = sig;
+}
+static void term_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = term_handler;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+}
+static void term_service(void) {
+    static int done;
+    if (!g_term_sig || done) return;
+    done = 1;
+    printf("\nSIGTERM: the game is closing as if its window were closed (a second SIGTERM ends it at once)\n");
+    fflush(stdout);
+    SDL_Event q;
+    SDL_zero(q);
+    q.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&q);                               /* close_watch sees it (event watches run as the event is queued) */
+}
 /* F1 > Display > Monitor (graphics.ini monitor = auto | <number> | <name>). The window is always put on a monitor by
  * its id: made with SDL_WINDOWPOS_UNDEFINED, SDL on Wayland asks for fullscreen without an output and GNOME picks one
  * (the one with the pointer or the focus): the game opened on the laptop's panel or on the external monitor at random.
@@ -656,6 +686,7 @@ static void window_open(void) {
     }
     if (!w) { printf("display: SDL_CreateWindow failed: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
     SDL_AddEventWatch(close_watch, NULL);
+    if (!(getenv("SSBU_SIGTERM") && !atoi(getenv("SSBU_SIGTERM")))) term_install();      /* SSBU_SIGTERM=0: the default action, as before */
     g_win_w = go->width; g_win_h = go->height; g_mode_now = go->window_mode;
     menu_sdl_attach(w);
     g_hwnd = (HWND)w;
@@ -669,6 +700,7 @@ void display_pump(int ms) {
     SDL_Window *w = (SDL_Window *)g_hwnd;
     SDL_Event e;
     if (SDL_WaitEventTimeout(&e, ms)) { while (SDL_PollEvent(&e)) {} }       /* the watch saw them; the keyboard state is current */
+    term_service();
     plat_window_service();
     if (w) window_mode_service(w);
     menu_sdl_service();
