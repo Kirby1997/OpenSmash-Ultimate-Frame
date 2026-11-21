@@ -178,7 +178,13 @@ static void test_failures(void) {
 #ifndef PROT_BTI
 #define PROT_BTI 0x10
 #endif
-static void bti_guard(const void *fn) { CHECK(mprotect((void *)((uintptr_t)fn & ~(uintptr_t)4095), 4096, PROT_READ | PROT_EXEC | PROT_BTI) == 0); }
+/* A guarded page can also hold code that is not ours: the toolchain's crtbegin.o (__do_global_dtors_aux, which ld.so
+ * calls through .fini_array at exit) sat in the checker's page in the gcc build, and a gcc built without
+ * --enable-standard-branch-protection (the Frame's) gives it no landing pad: SIGILL after the last check. So the pages
+ * get their protection back before main returns; everything the test calls ran with PROT_BTI. */
+static void bti_prot(const void *fn, int prot) { CHECK(mprotect((void *)((uintptr_t)fn & ~(uintptr_t)4095), 4096, prot) == 0); }
+static void bti_guard(const void *fn) { bti_prot(fn, PROT_READ | PROT_EXEC | PROT_BTI); }
+static void bti_unguard(const void *fn) { bti_prot(fn, PROT_READ | PROT_EXEC); }
 #endif
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -193,5 +199,10 @@ int main(void) {
     test_stacks();
     test_migration();
     test_failures();
+#ifdef TP_BTI
+    bti_unguard((const void *)fiber_switch_a64);
+    bti_unguard((const void *)SwitchToFiber);
+    bti_unguard((const void *)tp_regcheck);
+#endif
     return tp_done("test_fiber");
 }
