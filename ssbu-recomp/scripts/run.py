@@ -219,7 +219,12 @@ def main():
     print('game exited with code %d after %.0f s' % (p.returncode, time.time() - t0))
     if mods_ok and mods_env and env.get('SSBU_SKYLINE') != '0':
         mods.after_run(a.build, t0)                   # this run's site list, for the next start (a plugin hooking something new)
-    return p.returncode
+    return exit_code(p.returncode) if a.linux else p.returncode
+
+def exit_code(rc):
+    """The launcher's own exit status for the game's: a game ended by signal N (returncode -N) gives 128 + N, as a shell
+    reports it (sys.exit(-15) would be 241)."""
+    return 128 - rc if rc < 0 else rc
 
 def run_game(cmd, cwd, env, out, forward):
     """Run the game and return its CompletedProcess-like result. With `forward` (the Linux builds) SIGTERM, SIGINT and
@@ -227,23 +232,24 @@ def run_game(cmd, cwd, env, out, forward):
     clean-close handler (display.c) must get the signal. Other platforms: subprocess.run, as before."""
     if not forward:
         return subprocess.run(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
-    child = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    # The handlers go in BEFORE the game starts: a signal in between would end the launcher by its default action and
+    # leave the game running unsignalled. One that comes before the game exists is passed on as soon as it does. They stay
+    # after the game ended (Popen.send_signal does nothing then), so a second Exit cannot cut mods.after_run short.
+    child, pending = None, []
     def relay(signum, _frame):
+        if child is None:
+            pending.append(signum)
+            return
         try:
             child.send_signal(signum)
         except OSError:
             pass
-    old = {s: signal.signal(s, relay) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-    try:
-        while True:
-            try:
-                child.wait()
-                break
-            except InterruptedError:
-                continue
-    finally:
-        for s, h in old.items():
-            signal.signal(s, h)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, relay)
+    child = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    for s in pending:
+        relay(s, None)
+    child.wait()                                      # (PEP 475: a handled signal does not interrupt the wait)
     return child
 
 

@@ -500,13 +500,26 @@ static bool SDLCALL close_watch(void *user, SDL_Event *e) {
 /* 2026-11 (Frame): SIGTERM (what Steam's "Exit game" and `kill` send) ends the game as the window's close does: the
  * report, the driver's pipeline cache saved, the first-run preparation stopped between two stages (before: the default
  * action, the process gone at once and the preparation's cache work of this run lost). The handler only notes it; the
- * window's thread (display_pump, every few ms) turns it into the close request. A second SIGTERM ends the process at once,
- * and before the window exists the default action is kept. SDL's own handlers stay off (SDL_HINT_NO_SIGNAL_HANDLERS). */
+ * window's thread (display_pump, every few ms) turns it into the close request. A second SIGTERM 2 s or more later ends the
+ * process at once, and before the window exists the default action is kept. SDL's own handlers stay off (SDL_HINT_NO_SIGNAL_HANDLERS). */
 #include <signal.h>
+#include <time.h>
 static volatile int g_term_sig;                      /* written in the handler (any thread), read by display_pump: lock-free atomics, async-signal-safe */
+static volatile long long g_term_ms;                 /* when the first one came (CLOCK_MONOTONIC, ms) */
+/* The same request often arrives twice within milliseconds: scripts/run.py relays the launcher's SIGTERM, and a sender
+ * that signals the whole process tree, group or session (a logout, `kill -TERM -<pgid>`) reaches this process directly
+ * too. Only a second SIGTERM at least 2 s after the first ends the process at once. */
 static void term_handler(int sig) {
-    if (__atomic_load_n(&g_term_sig, __ATOMIC_RELAXED)) { signal(sig, SIG_DFL); raise(sig); return; }      /* async-signal-safe only */
-    __atomic_store_n(&g_term_sig, sig, __ATOMIC_RELEASE);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);             /* async-signal-safe (POSIX) */
+    long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (!__atomic_load_n(&g_term_sig, __ATOMIC_ACQUIRE)) {
+        int none = 0;
+        __atomic_store_n(&g_term_ms, now, __ATOMIC_RELAXED);
+        if (__atomic_compare_exchange_n(&g_term_sig, &none, sig, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return;
+    }
+    if (now - __atomic_load_n(&g_term_ms, __ATOMIC_RELAXED) < 2000) return;      /* the same request, delivered twice */
+    signal(sig, SIG_DFL); raise(sig);                /* async-signal-safe only */
 }
 static void term_install(void) {
     struct sigaction sa;
@@ -520,7 +533,7 @@ static void term_service(void) {
     static int done;
     if (done || !__atomic_load_n(&g_term_sig, __ATOMIC_ACQUIRE)) return;
     done = 1;
-    printf("\nSIGTERM: the game is closing as if its window were closed (a second SIGTERM ends it at once)\n");
+    printf("\nSIGTERM: the game is closing as if its window were closed (a second SIGTERM, 2 s or more later, ends it at once)\n");
     fflush(stdout);
     SDL_Event q;
     SDL_zero(q);
