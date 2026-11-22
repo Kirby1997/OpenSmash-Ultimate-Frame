@@ -174,6 +174,7 @@ facts: `uname`, CPU features (BTI, PAC, MTE, SVE2, LSE), glibc, compiler version
 | `threads` | stacks and `__thread` below 2^47, fibers, FLS, critical sections, nn::os threads, `setjmp` on fibers (also FORTIFY), the C++ runtime's exception state, BTI, TLS hazard | `tests/port/threads/run_frame.sh` |
 | `picker` | the data-folder picker, in an SDL window offscreen and on gamescope | `tests/port/picker/run_frame.sh` |
 | `lifter` | memory-ordering codegen, litmus tests, FP vs the instructions, NEON | `tests/arm_host/run_frame.sh` |
+| `calls` | `call_indirect`'s fast table against the old lookup (also with readers racing the build), and the code of its hot path: no stack frame, barrier, atomic read-modify-write, system call or TLS read; `bti c` and a tail call through x16/x17 with BTI | `tests/port/calls/run.sh native` |
 
 The `run_frame.sh` scripts also work alone: on the Frame they run in place, with `--local` on any host, and with an ssh host
 as the first argument they push from a PC as before. The lifter's software-FP hash is printed, and compared with another

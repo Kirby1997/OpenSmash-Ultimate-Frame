@@ -34,7 +34,7 @@ KIT_VERSION="frame-kit 1"
 
 # ---------------------------------------------------------------------------------------------------- the suites
 # name | what it checks | timeout seconds (full) | (quick)
-SUITE_NAMES="crash fs nnfs boot prepscreen plat winshim modules services io threads picker lifter"
+SUITE_NAMES="crash fs nnfs boot prepscreen plat winshim modules services io threads picker lifter calls"
 suite_desc() {
     case $1 in
     crash)   echo "crash reports: signal handler, alternate stack, report file (gcc, clang, FORTIFY, PAC); the A64 decoder of the fake audit" ;;
@@ -50,13 +50,14 @@ suite_desc() {
     threads) echo "thread / fiber stacks and __thread below 2^47, fibers, FLS, critical sections, nn::os threads, setjmp on fibers, C++ runtime exception state, BTI, TLS hazard check" ;;
     picker)  echo "data-folder picker: logic, ASan/UBSan, its SDL window offscreen and (in a gamescope session) on the display" ;;
     lifter)  echo "lifter: memory-ordering codegen, litmus tests on lifted code, FP vs the instructions, NEON, software-FP hash" ;;
+    calls)   echo "call_indirect's fast table (ci_direct.inc) against the old lookup, readers racing the build, and the code of its hot path (no frame, barrier or atomic; BTI)" ;;
     esac
 }
 suite_timeout() {
     if [ -n "$QUICK" ]; then
-        case $1 in crash) echo 300 ;; fs) echo 180 ;; nnfs) echo 300 ;; boot) echo 300 ;; prepscreen) echo 120 ;; plat) echo 300 ;; winshim) echo 300 ;; modules) echo 300 ;; services) echo 300 ;; io) echo 300 ;; threads) echo 600 ;; picker) echo 600 ;; lifter) echo 900 ;; esac
+        case $1 in crash) echo 300 ;; fs) echo 180 ;; nnfs) echo 300 ;; boot) echo 300 ;; prepscreen) echo 120 ;; plat) echo 300 ;; winshim) echo 300 ;; modules) echo 300 ;; services) echo 300 ;; io) echo 300 ;; threads) echo 600 ;; picker) echo 600 ;; lifter) echo 900 ;; calls) echo 300 ;; esac
     else
-        case $1 in crash) echo 900 ;; fs) echo 300 ;; nnfs) echo 900 ;; boot) echo 600 ;; prepscreen) echo 120 ;; plat) echo 600 ;; winshim) echo 600 ;; modules) echo 600 ;; services) echo 600 ;; io) echo 600 ;; threads) echo 1800 ;; picker) echo 1500 ;; lifter) echo 3600 ;; esac
+        case $1 in crash) echo 900 ;; fs) echo 300 ;; nnfs) echo 900 ;; boot) echo 600 ;; prepscreen) echo 120 ;; plat) echo 600 ;; winshim) echo 600 ;; modules) echo 600 ;; services) echo 600 ;; io) echo 600 ;; threads) echo 1800 ;; picker) echo 1500 ;; lifter) echo 3600 ;; calls) echo 300 ;; esac
     fi
 }
 suite_cmd() {   # what the child runs (for the plan and the report)
@@ -74,6 +75,7 @@ suite_cmd() {   # what the child runs (for the plan and the report)
     threads) echo "sh tests/port/threads/run_frame.sh --local" ;;
     picker)  echo "sh tests/port/picker/run_frame.sh --local" ;;
     lifter)  echo "sh tests/arm_host/run_frame.sh --local $PAIRS $ITERS" ;;
+    calls)   echo "sh tests/port/calls/run.sh native  (per compiler)" ;;
     esac
 }
 
@@ -131,7 +133,7 @@ child_main() {
     threads) sh tests/port/threads/run_frame.sh --local || rc=$? ;;
     picker) sh tests/port/picker/run_frame.sh --local || rc=$? ;;
     lifter) sh tests/arm_host/run_frame.sh --local "$FK_PAIRS" "$FK_ITERS" || rc=$? ;;
-    fs | nnfs | boot | prepscreen | winshim | modules | services | io)
+    fs | nnfs | boot | prepscreen | winshim | modules | services | io | calls)
         for cc in $CCS; do
             echo "######## $NAME CC=$cc"
             CC=$cc OUT="$FRAME_WORK/$cc" sh "tests/port/$NAME/run.sh" native 2>&1
