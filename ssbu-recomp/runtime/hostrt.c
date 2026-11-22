@@ -403,7 +403,12 @@ static CiDirect g_ci;
 /* not inlined: hot for the NVN functions (handed out through nvnBootstrapLoader), a separate symbol in a profile */
 static __attribute__((noinline)) void call_hostfn(Ctx *c, int i) {
     HostFn *h = &g_hostfn[i];
-    if (InterlockedIncrement64(&h->calls) == 1) {
+    /* the call count is a diagnostic (print_hostfn_summary, the audit): a plain increment after the first call, which may
+     * lose a count when two threads call the same function at once. The first call is still counted exactly once (the
+     * atomic increment from 0), and only it does the first-call work. No locked read-modify-write per call. */
+    LONG64 n = __atomic_load_n(&h->calls, __ATOMIC_RELAXED);
+    if (n) __atomic_store_n(&h->calls, n + 1, __ATOMIC_RELAXED);
+    else if (InterlockedIncrement64(&h->calls) == 1) {
         h->first = InterlockedIncrement64(&g_hostfn_seq);
         if (audit_path_hostfn(h->name)) audit_path_hit("run-time host function", h->name, c->x[30] - 4);
     }
