@@ -412,6 +412,75 @@ def compile_host(job):
     return src, r.returncode, (r.stdout + r.stderr)[-3000:]
 
 
+# The toolchain the host objects were compiled with. The host objects are rebuilt when they are older than their sources,
+# which says nothing about the compiler or the system's headers: after a system update or rollback (SteamOS beta <->
+# stable: clang 21 / glibc 2.43 / OpenSSL 3.4 / FFmpeg 8 against clang 19 / glibc 2.39 / OpenSSL 3.2 / FFmpeg 7) the old
+# objects were reused and the exe asked for symbols the system no longer has. The stamp is the compiler's version, the
+# flags and the versions of the C library and of the libraries' headers as the compiler sees them; another stamp than
+# the one in the object folder makes every host object stale (about 20 s on the Frame).
+TOOLCHAIN_PROBE = r"""
+#if defined(__has_include)
+#if __has_include(<features.h>)
+#include <features.h>
+#endif
+#if __has_include(<openssl/opensslv.h>)
+#include <openssl/opensslv.h>
+#endif
+#if __has_include(<libavcodec/version.h>)
+#include <libavcodec/version.h>
+#include <libavformat/version.h>
+#include <libavutil/version.h>
+#endif
+#if __has_include(<SDL3/SDL_version.h>)
+#include <SDL3/SDL_version.h>
+#endif
+#if __has_include(<ft2build.h>)
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#endif
+#endif
+@@libc __GLIBC__ __GLIBC_MINOR__
+@@openssl OPENSSL_VERSION_MAJOR OPENSSL_VERSION_MINOR OPENSSL_VERSION_PATCH
+@@ffmpeg LIBAVCODEC_VERSION_MAJOR LIBAVCODEC_VERSION_MINOR LIBAVFORMAT_VERSION_MAJOR LIBAVUTIL_VERSION_MAJOR
+@@sdl SDL_MAJOR_VERSION SDL_MINOR_VERSION SDL_MICRO_VERSION
+@@freetype FREETYPE_MAJOR FREETYPE_MINOR FREETYPE_PATCH
+"""
+
+
+def toolchain_stamp():
+    try:
+        version = subprocess.run([CLANG, '--version'], capture_output=True, text=True).stdout.strip().splitlines()[:1]
+    except OSError:
+        version = ['(no compiler)']
+    try:
+        r = subprocess.run([CLANG, '-E', '-P', '-x', 'c'] + [f for f in HOST_FLAGS if f != '-g'] + ['-'], input=TOOLCHAIN_PROBE,
+                           capture_output=True, text=True)
+        probe = [l.strip() for l in r.stdout.splitlines() if l.strip().startswith('@@')] or ['(probe failed: %d)' % r.returncode]
+    except OSError:
+        probe = ['(probe failed)']
+    return '\n'.join(version + probe + ['flags ' + repr(HOST_FLAGS), 'c++ ' + repr(CXX_FLAGS), 'libs ' + repr(LIBS)]) + '\n'
+
+
+def host_objects_for_toolchain(objdir):
+    """Removes the host objects of objdir when they were compiled with another toolchain (toolchain_stamp); writes the stamp."""
+    path, now = os.path.join(objdir, '_toolchain.txt'), toolchain_stamp()
+    try:
+        with open(path) as f:
+            have = f.read()
+    except OSError:
+        have = None
+    old = [n for n in os.listdir(objdir) if n.endswith('.obj')]
+    if have != now and old:
+        first = (have or '').splitlines()[:1]
+        print('host objects: %s; all %d are compiled again' % ('compiled with another toolchain (%s, now %s)' % (first[0] if first else '?', now.splitlines()[0])
+              if have is not None else 'no toolchain stamp (made before it existed)', len(old)), flush=True)
+        for n in old:
+            os.remove(os.path.join(objdir, n))
+    if have != now:
+        with open(path, 'w') as f:
+            f.write(now)
+
+
 def cmd_link(host_only=False):
     if not host_only and build_game_dll():
         return 1
@@ -419,6 +488,7 @@ def cmd_link(host_only=False):
     out = os.path.join(HERE, exe)
     objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0])
     os.makedirs(objdir, exist_ok=True)
+    host_objects_for_toolchain(objdir)
     t0 = time.time()
     newest_dep = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith(('.h', '.inc'))] + [os.path.getmtime(os.path.join(HERE, 'build.py'))])
     objs, jobs = [], []
