@@ -477,8 +477,11 @@ def host_objects_for_toolchain(objdir):
         for n in old:
             os.remove(os.path.join(objdir, n))
     if have != now:
-        with open(path, 'w') as f:
-            f.write(now)
+        try:
+            with open(path, 'w') as f:
+                f.write(now)
+        except OSError as e:                         # (read-only or locked stamp: the objects are compiled again at the next link too)
+            print('host objects: the toolchain stamp could not be written (%s)' % e, flush=True)
 
 
 def cmd_link(host_only=False):
