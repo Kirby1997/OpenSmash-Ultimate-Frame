@@ -9,7 +9,7 @@ This is OpenSmash-Ultimate Frame: branch `frame` of
 repository's `ssbu-recomp/` folder; the paths on this page (`toolchain/...`, `tests/...`, `runtime/...`) are relative to
 that folder.
 
-**Status: in progress, the game does not boot on the Frame yet.**
+**Status: the game boots and plays on the Frame**, with Steam's controllers, in Game Mode. See "Playing in Game Mode".
 
 ## Building
 
@@ -39,6 +39,72 @@ gamescope). The folder is checked and saved as `data=`.
 To change it later, start once with the picker: in Steam's launch options `%command% --pick-data` or
 `SSBU_PICK_DATA=1 %command%`. Scripted runs, `SSBU_SHOW=0` and runs without a display print the reason and exit with code 9
 instead.
+
+## Playing in Game Mode
+
+The Frame's own controllers reach the game only through Steam. Steam Input turns them into a virtual pad
+("Steam Frame Controllers") and feeds that pad only to apps Steam started. A game started from a terminal or over ssh
+sees no controller. Keep Steam Input switched on.
+
+Put the game in the Steam library once, from Desktop Mode:
+
+1. Application menu → Games → "Super Smash Bros. Ultimate (recomp)". `scripts/linux/install_desktop.sh` makes this
+   entry; on a Frame it picks `build-linux-arm64`.
+2. Right-click the entry → Add to Steam.
+3. In Game Mode: Library → Non-Steam → Play.
+
+The same entry starts the game in Desktop Mode too. There the keyboard and mouse work, but the Frame's pads do not.
+Steam's Exit closes the game cleanly: it sends SIGTERM, and the game treats that as a close of its window.
+
+### The Frame's buttons
+
+`layout = auto` is the default in `build-linux-arm64/config/controllers.ini` (written on the first start). On the
+Frame's own pads it follows the printed letters: the A button acts as A. Other pads (an Xbox pad, say) stay positional:
+the button in Nintendo's A position acts as A, whatever is printed on it. To force one way for every pad, set this:
+
+```ini
+[general]
+layout = labels
+```
+
+The values are `labels`, `positional` and `auto`. The file is read again within a second of being saved, so this can
+be changed while a game runs. `build-linux-arm64/work/ssbu_native --pad-test` prints what a pad sends.
+
+The grip button toggles the Frame's system laser pointer. While it is on, the game gets no controller input. If the pad
+stops answering in the middle of a match, check the grip first.
+
+### First run: shader preparation
+
+The first start prepares every shader of the game for this GPU, driver and game version. On a Frame that takes about
+36 minutes. A progress screen shows from the start. Quitting saves the progress, and the next start goes on from there.
+The result is kept in `build-linux-arm64/cache`, about 3 GB. Later starts draw in about a minute.
+
+Measured on a Frame: 60 fps in menus, 53 to 60 fps in a four-player fight. `shader_prepare = background` in
+`graphics.ini` skips the hold and prepares behind the running game instead. `off` skips the preparation altogether.
+
+### Saves, settings and what to back up
+
+| Path | What it holds |
+|---|---|
+| `~/.local/share/ssbu-recomp/userdata/save/save_data` | the game's saves |
+| `build-linux-arm64/config/controllers.ini` | pads, keyboard, layout |
+| `build-linux-arm64/config/graphics.ini` | display and rendering options |
+| `build-linux-arm64/cache` | the shader cache, about 3 GB: it can be regenerated, so there is no need to back it up |
+
+Back up the first three together. The launcher made by `install_desktop.sh` writes the output of the last start to
+`~/.local/share/ssbu-recomp/last_run.log`.
+
+### Fonts
+
+The game needs the console's shared fonts. Without them in the dump (`sysdata/fonts`), the open fonts staged beside the
+executable are used. They have no Chinese, Japanese or Korean glyphs. `tools/extract/fw_fonts.py <firmware_dir>
+<output_dir>` extracts the fonts from a firmware dump you own; put them in the dump's `sysdata/fonts`, or point the game
+at them with `--fonts`.
+
+### Known Frame issue: volume buttons
+
+Once, the volume buttons jumped to full or zero while the game ran. The cause was a rare loop in Steam and WirePlumber
+that kept recreating the audio sink, not the game. A reboot cleared it.
 
 ## Crash reports
 
@@ -133,8 +199,8 @@ starts offline (`online_server` in `graphics.ini`, `SSBU_ONLINE`, or LAN / host 
 The game draws with the Vulkan renderer (`runtime/nvn_vk*.c`, the default). The Frame's GPU is an Adreno 750 on Mesa's
 Turnip driver. Everything below was checked against one real Steam Frame report: vulkancapsviewer 4.13 on SteamOS 0.3.0,
 Turnip `Mesa 26.3.0-devel (git-8aa73b4b19)`, Vulkan 1.4.359, driver ID 18. It is attached to
-[vulkan.gpuinfo.org issue #139](https://github.com/SaschaWillems/vulkan.gpuinfo.org/issues/139). Nothing here has run on
-a Frame yet.
+[vulkan.gpuinfo.org issue #139](https://github.com/SaschaWillems/vulkan.gpuinfo.org/issues/139). The renderer has since run on a
+Frame; see "Playing in Game Mode" for the measured speed.
 
 ### Expected to work
 
@@ -252,4 +318,4 @@ Some of these are inferred from how Turnip works, not measured.
   arrays (scratch memory) mean high register pressure at wave sizes of 64 and 128.
 - **Every supported Vulkan 1.0-1.3 feature is enabled**, including robust buffer and image access. Enabling only the
   features in use would let the driver skip bounds checks.
-- **The 60 Hz pacing is `display.c`'s.** The Frame's panel refresh and gamescope's own pacing still have to be measured.
+- **The 60 Hz pacing is `display.c`'s.** Menus hold 60 fps on the Frame; the panel refresh and gamescope's own pacing are not measured separately.
