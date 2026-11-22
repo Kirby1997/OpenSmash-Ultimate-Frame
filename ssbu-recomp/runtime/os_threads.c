@@ -63,14 +63,31 @@ static SRWLOCK g_table_lock = SRWLOCK_INIT;
 /* Round 17 (P3 section 16): every lock / unlock / event call of every guest thread came through this look-up, which
  * took ONE process-wide lock exclusively. Records are never removed and a record's key and next pointer never change
  * once it is in the table, so a look-up can walk the bucket without the lock; only a miss takes the lock (and looks
- * again under it). SSBU_OBJ_LOCKFREE=0: the lock at every look-up, as before. */
+ * again under it). SSBU_OBJ_LOCKFREE=0: the lock at every look-up, as before.
+ * 2026-11 (Frame): on by default outside Windows. There an SRWLOCK is a pthread rwlock, and this one process-wide lock,
+ * taken twice per guest mutex lock / unlock pair by every thread, was the largest lock cost in the Frame's profile
+ * (pthread_rwlock_unlock 4.4 %, _wrlock 1.0 % of user-space samples, plus obj() itself). Windows keeps the lock (its
+ * SRWLOCK is one interlocked operation); SSBU_OBJ_LOCKFREE=0 / 1 still chooses on every system.
+ * Ordering: the bucket head is read with an acquire load that pairs with the publishing exchange below (a release at
+ * least), so a record found that way has its key, next, cs and cv visible. A record reached through next was published
+ * before the head that links to it (each insert holds g_table_lock and reads the head it links to under it), so the same
+ * acquire covers the whole chain; key and next never change after the publish, and records are never freed. */
+#ifdef _WIN32
 #define OBJ_LOCKFREE_DEFAULT 0
+#else
+#define OBJ_LOCKFREE_DEFAULT 1
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define OBJ_HEAD(h) __atomic_load_n(&g_table[h], __ATOMIC_ACQUIRE)
+#else
+#define OBJ_HEAD(h) (*(Obj *volatile *)&g_table[h])      /* MSVC x86 / x64: a volatile read is an acquire */
+#endif
 static int g_obj_lf = -1;
 static Obj *obj(uint64_t key) {
     unsigned h = (unsigned)((key >> 3) * 2654435761u) & (BUCKETS - 1);
     if (g_obj_lf < 0) { const char *e = getenv("SSBU_OBJ_LOCKFREE"); g_obj_lf = e && e[0] ? atoi(e) != 0 : OBJ_LOCKFREE_DEFAULT; }
     if (g_obj_lf) {
-        Obj *f = *(Obj *volatile *)&g_table[h];
+        Obj *f = OBJ_HEAD(h);
         while (f && f->key != key) f = f->next;
         if (f) return f;
     }
@@ -766,7 +783,7 @@ static void fib_switch(Ctx *c) {
 /* R1: look-up without the table lock (R1 holds threads that may be inside obj(); records are never removed) */
 static Obj *obj_peek(uint64_t key) {
     unsigned h = (unsigned)((key >> 3) * 2654435761u) & (BUCKETS - 1);
-    Obj *f = *(Obj *volatile *)&g_table[h];
+    Obj *f = OBJ_HEAD(h);
     while (f && f->key != key) f = f->next;
     return f;
 }

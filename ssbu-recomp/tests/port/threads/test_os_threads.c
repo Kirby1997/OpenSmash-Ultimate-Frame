@@ -171,6 +171,55 @@ static void test_concurrent_starts(void) {
     for (int i = 0; i < 8; i++) { DWORD code = 9; CHECK(WaitForSingleObject(h[i], 20000) == WAIT_OBJECT_0); GetExitCodeThread(h[i], &code); CHECK(code == 0); CloseHandle(h[i]); }
 }
 
+/* ---------------------------------------------------------------- the object table under concurrent first use */
+/* obj() looks a key up without the table lock by default outside Windows (os_threads.c). 8 host threads go through
+ * 4096 guest mutexes none of them has used before in the same order, so they meet at each key's first use: the keys
+ * fall in 16 buckets of 256 (chains that grow while they are walked). Inside each mutex a thread marks the key taken,
+ * yields and checks the mark, then counts. Two records for one key (a miss that creates a second record) let two
+ * threads in at once: an overlap. A record found before its lock word was initialised would do the same or hang.
+ * Then 8 x 20000 more rounds on random keys. Negative control (os_threads.c without the re-check under the lock):
+ * overlaps > 0 and lost increments. */
+#define MXT_KEYS 4096
+#define MXT_ROUNDS 20000
+static volatile uint64_t g_mxt_count[MXT_KEYS];
+static volatile int g_mxt_in[MXT_KEYS], g_mxt_go;
+static volatile LONG g_mxt_overlap;
+static uint64_t mxt_key(int i) {               /* (key >> 3) = base + group + (j << 16): the bucket is the group's */
+    return 0x7f0000000000ull + ((uint64_t)(i >> 4) << 19) + ((uint64_t)(i & 15) << 3);
+}
+static void mxt_one(Ctx *c, int k, int spins) {
+    IMP(I_STD_LOCK, c, mxt_key(k), 0, 0, 0, 0, 0, 0);
+    if (__atomic_exchange_n(&g_mxt_in[k], 1, __ATOMIC_ACQ_REL)) InterlockedIncrement(&g_mxt_overlap);
+    uint64_t v = g_mxt_count[k];                 /* read, give the others a chance, write: a lost update shows */
+    for (int i = 0; i < spins; i++) YieldProcessor();
+    g_mxt_count[k] = v + 1;
+    __atomic_store_n(&g_mxt_in[k], 0, __ATOMIC_RELEASE);
+    IMP(I_STD_UNLOCK, c, mxt_key(k), 0, 0, 0, 0, 0, 0);
+}
+static DWORD WINAPI mxt_fn(LPVOID p) {
+    unsigned s = (unsigned)(uintptr_t)p * 2654435761u + 1;
+    Ctx c;
+    memset(&c, 0, sizeof c);
+    while (!__atomic_load_n(&g_mxt_go, __ATOMIC_ACQUIRE)) YieldProcessor();
+    for (int k = 0; k < MXT_KEYS; k++) mxt_one(&c, k, 64);          /* first use, all threads at the same key */
+    for (int r = 0; r < MXT_ROUNDS; r++) { s = s * 1103515245u + 12345u; mxt_one(&c, (int)((s >> 8) % MXT_KEYS), r & 7); }
+    return 0;
+}
+static void test_table_first_use(void) {
+    SECTION("8 host threads: first use of 4096 guest mutexes at once (table look-up), no overlap, no lost update");
+    HANDLE h[8];
+    for (int i = 0; i < 8; i++) h[i] = CreateThread(NULL, 0, mxt_fn, (LPVOID)(intptr_t)i, 0, NULL);
+    __atomic_store_n(&g_mxt_go, 1, __ATOMIC_RELEASE);
+    int ok = 1;
+    for (int i = 0; i < 8; i++) { DWORD code = 9; if (WaitForSingleObject(h[i], 120000) != WAIT_OBJECT_0) ok = 0; GetExitCodeThread(h[i], &code); CHECK(code == 0); CloseHandle(h[i]); }
+    CHECK(ok);
+    uint64_t sum = 0, want = 8ull * (MXT_KEYS + MXT_ROUNDS);
+    for (int k = 0; k < MXT_KEYS; k++) sum += g_mxt_count[k];
+    printf("    %llu increments counted, %llu expected, %ld overlaps (SSBU_OBJ_LOCKFREE=%s)\n", (unsigned long long)sum, (unsigned long long)want, (long)g_mxt_overlap, getenv("SSBU_OBJ_LOCKFREE") ? getenv("SSBU_OBJ_LOCKFREE") : "default");
+    CHECK(g_mxt_overlap == 0);
+    CHECK(sum == want);
+}
+
 /* ---------------------------------------------------------------- sleeps and the real-time deadline */
 static int cmp64(const void *a, const void *b) { int64_t x = *(const int64_t *)a, y = *(const int64_t *)b; return x < y ? -1 : x > y; }
 static DWORD WINAPI sleep_fn(LPVOID p) {
@@ -235,6 +284,7 @@ int main(void) {
     test_console_cores();
 #endif
     test_concurrent_starts();
+    test_table_first_use();
     test_sleep();
     return tp_done("test_os_threads");
 }
