@@ -60,11 +60,13 @@ def check_split(B, bad):
     ta, tb = open(a).read(), open(b).read()
     if not (ta.startswith(HEAD.rstrip('\n')) and tb.startswith(HEAD.rstrip('\n'))):
         bad.append('the head lines are not on top of both parts')
-    names = lambda t: re.findall(r'^void (\w+)\(', t, re.M)
+    names = lambda t: re.findall(r'^void (\w+)\(.*\) \{', t, re.M)          # definitions (not part a's declarations)
     if names(ta) != ['f_7100000000', 'f_7100000100', 'f_7100000200'] or names(tb) != ['u_7100000100', 'f_7100000300']:
         bad.append('split names: a %r b %r' % (names(ta), names(tb)))
     if 'void f_7100000100(Ctx *c) { u_7100000100(c, 0); }' not in ta:
         bad.append('the one-line wrapper is not in part a')
+    if 'void u_7100000100(Ctx *c, uint64_t rp);\n' not in ta or 'void f_7100000300(Ctx *c);\n' not in ta:
+        bad.append('part a does not declare the functions moved to part b')
     if (count, lines) != (2, 130):
         bad.append('count %r lines %r' % (count, lines))
     body = lambda t: sorted(re.findall(r'^void \w+\(Ctx \*c(?:, uint64_t rp)?\) \{\n.*?^\}\n', t, re.M | re.S))
@@ -72,6 +74,13 @@ def check_split(B, bad):
         bad.append('the functions of a + b are not those of the source')
     if B.split_source(src, os.path.join(d, 'c_0001.obj'), 100)[0] is not None or os.path.exists(a):
         bad.append('no long function: parts made or old parts left')
+    st = os.path.join(d, 'c_0002.c')
+    with open(st, 'w') as f:
+        f.write(HEAD + 'static ' + fn('7100000400', 50) + 'void f_7100000500(Ctx *c) { f_7100000400(c); }\n')
+    r = B.split_source(st, os.path.join(d, 'c_0002.obj'), 20)
+    lf = B.long_functions(st, os.path.join(d, 'c_0002.obj'), 20)
+    if r[0] is not None or r[2] != -1 or lf[2] is None or lf[4] != 1:
+        bad.append('a long static function is split (part a could not call it): %r %r' % (r, lf))
     return d
 
 
@@ -86,7 +95,7 @@ def check_ladder(B, bad):
 
     def fake_run_limited(cmd, limit, mem=0):
         src, obj = cmd[-3], cmd[-1]
-        long_fn = 'f_7100100000' in open(src).read()
+        long_fn = 'void f_7100100000(Ctx *c) {' in open(src).read()     # defined there (part a only declares it)
         opt = cmd[2]
         with lock:
             calls.append((os.path.basename(src), opt, mem, limit))
@@ -136,6 +145,19 @@ def check_ladder(B, bad):
     r3 = B.compile_file_inline(os.path.join(d, 'huge.c'), os.path.join(d, 'huge2.obj'), [])
     if not B.INLINE_ONE_TRY or r3[0] or [(c[0], c[1]) for c in calls] != [('huge2.split_a.c', '-O2'), ('huge2.split_b.c', '-O0'), ('lld', '-r')] or seen != [True, False]:
         bad.append('one inlined try: %r %r %r' % (r3, calls, seen))
+    # part b's join fails: the whole file at -O0 (as before SPLIT), not recorded in _ladder.json
+    B.INLINE = False
+    B.run_limited = fake_run_limited
+
+    class Fail:
+        returncode, stdout, stderr = 1, '', 'ld.lld: error: broken'
+    B.subprocess = types.SimpleNamespace(run=lambda cmd, **kw: Fail() if cmd[0] == B.LLD else (open(cmd[-1], 'w').close(), Done())[1])
+    r4 = B.compile_file(os.path.join(d, 'huge.c'), os.path.join(d, 'huge3.obj'), [])
+    if r4[0] or 'WHOLE FILE' not in r4[3] or 'split failed' not in r4[3] or 'huge3.obj' in B.ladder(d):
+        bad.append('a failed join: %r %r' % (r4, B.ladder(d)))
+    for n in ('huge3.split_a.c', 'huge3.split_b.c', 'huge3.part_a.o', 'huge3.part_b.o'):
+        if os.path.exists(os.path.join(d, n)):
+            bad.append('%s left behind after the whole-file fallback' % n)
     if B._mem_used:
         bad.append('reservations not given back: %d' % B._mem_used)
     return d
@@ -174,10 +196,11 @@ def check_real(bad):
     with open(os.path.join(d, 'runtime.h'), 'w') as f:
         f.write('typedef unsigned long long uint64_t;\ntypedef struct Ctx { uint64_t x[32]; uint64_t fn; } Ctx;\n')
     with open(os.path.join(d, 'funcs.h'), 'w') as f:
-        f.write('void f_7100000000(Ctx *c);\nvoid f_7100000100(Ctx *c);\nvoid u_7100000100(Ctx *c, uint64_t rp);\n')
+        f.write('void f_7100000000(Ctx *c);\nvoid f_7100000100(Ctx *c);\nvoid f_7100000200(Ctx *c);\n')   # (no u_: see split_source)
     src = os.path.join(d, 'c_0001.c')
-    with open(src, 'w') as f:
-        f.write(HEAD + fn('7100000000', 50) + fn('7100000100', 10, two=True))
+    with open(src, 'w') as f:      # the long u_ (part b) calls f_7100000200 (part a); its wrapper (part a) calls it back
+        f.write(HEAD + fn('7100000100', 50, two=True).replace('}\nvoid f_', '  f_7100000200(c);\n}\nvoid f_', 1)
+                + fn('7100000000', 50) + fn('7100000200', 10))
     flags = ['--target=aarch64-linux-gnu', '-w', '-fno-strict-aliasing', '-I', d]
     r = B.compile_file(src, os.path.join(d, 'c_0001.obj'), flags, 60, ['-ffp-contract=off'])
     if r[0]:
@@ -185,10 +208,16 @@ def check_real(bad):
         return
     nm = os.path.join(os.path.dirname(clang), 'llvm-nm')
     nm = nm if os.path.exists(nm) else 'nm'                 # (SteamOS has clang without llvm-nm; binutils' nm reads the object too)
-    syms = subprocess.run([nm, os.path.join(d, 'c_0001.obj')], capture_output=True, text=True).stdout.split()
-    for s in ('f_7100000000', 'f_7100000100', 'u_7100000100'):
+    obj = os.path.join(d, 'c_0001.obj')
+    syms = subprocess.run([nm, '--defined-only', obj], capture_output=True, text=True).stdout.split()
+    undef = subprocess.run([nm, '-u', obj], capture_output=True, text=True).stdout.split()
+    for s in ('f_7100000000', 'f_7100000100', 'u_7100000100', 'f_7100000200'):
         if syms.count(s) != 1:
             bad.append('symbol %s: %d definitions in the joined object' % (s, syms.count(s)))
+        if s in undef:
+            bad.append('symbol %s undefined in the joined object' % s)
+    if 'unit of their own' not in r[3]:
+        bad.append('real: not split as expected: %r' % (r,))
     print('real: %s; joined object: %s' % (r[3], ' '.join(s for s in syms if s.startswith(('f_', 'u_')))))
 
 

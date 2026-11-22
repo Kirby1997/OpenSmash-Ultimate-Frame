@@ -140,17 +140,21 @@ def split_source(src, obj, limit):
     """SPLIT: write <obj>.split_a.c (src without its functions longer than `limit` statements) and <obj>.split_b.c (those
     functions only), both with src's own lines before its first function (the comment and the #includes; every function
     is declared in funcs.h, and a generated file has nothing else at file scope: one-line wrappers such as
-    `void f_X(Ctx *c) { u_X(c, 0); }` stay in part a). Returns (a, b, count, statements); (None, None, 0, 0) when no
-    function is that long (nothing written; old parts removed)."""
+    `void f_X(Ctx *c) { u_X(c, 0); }` stay in part a). Part a also declares every function moved to part b: recomp_eh.py
+    leaves a u_X out of funcs.h when all its landing pads belong to an outer function, and its f_X wrapper (part a) calls
+    it. Returns (a, b, count, statements); (None, None, 0, 0) when no function is that long (nothing written; old parts
+    removed); (None, None, -1, 0) when a long function is `static` (part a could not call it: optnone instead)."""
     base = obj[:-4]
     head, a, b = [], [], []
-    big = []
+    big, protos = [], []
     cur = None
+    static = False
     with open(src, encoding='latin-1') as f:
         for line in f:
             if cur is None:
-                if DEF.match(line.rstrip('\n')):
-                    cur, n = [line], 0
+                m = DEF.match(line.rstrip('\n'))
+                if m:
+                    cur, n, proto = [line], 0, 'void %s(%s);\n' % (m.group(1), m.group(2))
                 elif not a and not b and (line.startswith('#') or line.startswith('/*')):
                     head.append(line)
                 else:
@@ -161,6 +165,8 @@ def split_source(src, obj, limit):
                     if n > limit:
                         b.extend(cur)
                         big.append(n)
+                        protos.append(proto)
+                        static = static or cur[0].startswith('static ')
                     else:
                         a.extend(cur)
                     cur = None
@@ -169,15 +175,21 @@ def split_source(src, obj, limit):
     if cur is not None:                  # (an unterminated function: not a generated file; compiled as it is)
         big = []
     paths = (base + '.split_a.c', base + '.split_b.c')
-    if not big:
-        for p in paths + (base + '.part_a.o', base + '.part_b.o'):
-            if os.path.exists(p):
-                os.remove(p)
-        return None, None, 0, 0
-    for p, body in zip(paths, (a, b)):
+    if not big or static:
+        split_clean(obj)
+        return None, None, -1 if big else 0, 0
+    for p, body in zip(paths, (protos + a, b)):
         with open(p, 'w', encoding='latin-1') as f:
             f.writelines(head + body)
     return paths[0], paths[1], len(big), sum(big)
+
+
+def split_clean(obj):
+    """Remove SPLIT's intermediate files of obj (the parts' sources and objects)."""
+    base = obj[:-4]
+    for p in (base + '.split_a.c', base + '.split_b.c', base + '.part_a.o', base + '.part_b.o'):
+        if os.path.exists(p):
+            os.remove(p)
 
 
 def split_finish(b_src, obj, extra, base_flags):
@@ -204,6 +216,13 @@ def split_finish(b_src, obj, extra, base_flags):
             want = min(MEM_BUDGET, want * 2)
             continue
         break
+    if code is None and out == OOM:      # over the whole budget (a game running at the start): no address-space limit, as
+        want = mem_acquire(MEM_BUDGET)   # the whole-file -O0 fallback has none; alone, with the whole budget
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+        finally:
+            mem_release(want)
+        code, out = r.returncode, (r.stdout + r.stderr)[-2000:]
     if code == 0:
         r = subprocess.run([LLD, '-r', pa, pb, '-o', obj], capture_output=True, text=True, errors='replace')
         code, out = r.returncode, (out + r.stdout + r.stderr)[-2000:]
@@ -442,8 +461,10 @@ def long_functions(src, obj, limit):
     """The functions of src over `limit` statements, the way this build treats them. SPLIT: in a unit of their own
     (split_source); returns (part a, <obj>.part_a.o, None, part b, count, statements), or (src, obj, None, None, 0, 0) when
     there are none. Otherwise `optnone` through a header: (src, obj, header, None, count, statements)."""
+    a = None
     if SPLIT:
         a, b, count, lines = split_source(src, obj, limit)
+    if SPLIT and count >= 0:
         if a:
             hdr = obj[:-4] + '.optnone.h'
             if os.path.exists(hdr):
@@ -474,6 +495,10 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
     want = mem_estimate(src, function_sizes(src)) if MEM_BUDGET and not SPLIT else 0      # Linux / macOS: this compile's share of RAM
     raised = ''
     tried = None
+    why = 'time limit %.0fs%s exceeded three times' % (time_limit, ' or memory limit %.1f GB' % (MEM_LIMIT / 2.0 ** 30) if MEM_LIMIT else '')
+    # linux-arm64: a budget cut to what was available at the start (MEM_BUDGET under MEM_KEY) does not record a later step
+    # than the one known for the key: a build beside a running game must not leave its fallbacks to every later build
+    capped = MEM_BUDGET < MEM_KEY[0]
     for step, limit in enumerate((OPTNONE_LINES, OPTNONE_LINES // 4, OPTNONE_LINES // 16)):
         if step < first:
             continue
@@ -508,13 +533,19 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
             code, out2, secs = split_finish(b_src, obj, extra, base_flags)
             out = (out + out2)[-2000:]
             total += secs
+            if code:                     # part b or the join failed: the whole file at -O0 below, as before SPLIT (not saved)
+                print('  %s: part b of the split failed (%s); the whole file at -O0' % (name, out.strip()[-300:]), flush=True)
+                why, capped = 'part b of the split failed', True
+                break
         if code is not None:
             note = ''
             if count:
                 note = long_note(count, limit, lines)
-            if code == 0:
+            if code == 0 and not (capped and step > first):
                 ladder_save(objdir, name, key, step)
             return code, out, total, note + (' (step known from _ladder.json)' if first else '') + raised
+    if SPLIT:
+        split_clean(obj)
     cmd = [CLANG, '-c', '-O0'] + extra + base_flags + [src, '-o', obj]
     if SPLIT and MEM_BUDGET and not want:         # (every step skipped: known from _ladder.json)
         want = mem_estimate(src, function_sizes(src))
@@ -525,10 +556,9 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
     finally:
         if want:
             mem_release(want)
-    if r.returncode == 0:
+    if r.returncode == 0 and not (capped and 3 > first):
         ladder_save(objdir, name, key, 3)
-    return r.returncode, (r.stdout + r.stderr)[-2000:], total, 'WHOLE FILE at -O0 (time limit %.0fs%s exceeded three times)' % (
-        time_limit, ' or memory limit %.1f GB' % (MEM_LIMIT / 2.0 ** 30) if MEM_LIMIT else '')
+    return r.returncode, (r.stdout + r.stderr)[-2000:], total, 'WHOLE FILE at -O0 (%s)' % why
 
 
 _tries = collections.Counter()
@@ -553,11 +583,15 @@ def compile_file_inline(src, obj, base_flags, time_limit=None):
     objdir, name = os.path.dirname(obj), os.path.basename(obj)
     key = hint_key(src)
     known = hints(objdir).get(name)
-    if INLINE_ONE_TRY:
+    if INLINE_ONE_TRY and n == 1:        # (a retry round, build.py with fewer jobs: the normal way, at the end)
         r = compile_file(src, obj, base_flags, time_limit, EXTRA + [INLINE_FLAG])
         if r[0] == 0:
             hint_save(objdir, name, key, r[2], 1)
-        return r
+            return r
+        code2, out2, secs2, note2 = compile_file(src, obj, base_flags, time_limit)      # failed inlined: as the separate try did
+        if code2 == 0:
+            hint_save(objdir, name, key, secs2, 0)
+        return code2, out2, r[2] + secs2, 'helpers not inlined (the inlined compile failed)' + ('; ' + note2 if note2 else '')
     if n == 1 and known and known[0] == key and known[2] == 0:
         code, out, secs, note = compile_file(src, obj, base_flags, time_limit)
         hint_save(objdir, name, key, secs, 0)
