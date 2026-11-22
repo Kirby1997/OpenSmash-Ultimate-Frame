@@ -33,8 +33,12 @@ def main():
     src_gen, base_obj = os.path.join(HERE, 'gen_eh_o2'), os.path.join(HERE, 'obj_eh_o1')
     gen, obj, dll = os.path.join(HERE, 'gen_' + tag), os.path.join(HERE, 'obj_' + tag), os.path.join(HERE, 'ssbu_game_%s.dll' % tag)
     os.environ.pop('RECOMP_PATCHES', None)
+    import json
+    import jumptables
     import recomp
     import recomp_eh
+    jt = os.path.join(src_gen, 'jumptables.json')                   # the br dispatch the base set was lifted with
+    jumptables.LEVEL = json.load(open(jt))['level'] if os.path.exists(jt) else 0
     t0 = time.time()
     patches = recomp.load_patches(patch_file)
     env = recomp.Env()

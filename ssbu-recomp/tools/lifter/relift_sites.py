@@ -92,6 +92,7 @@ def parse_sites(path, recomp, what='main'):
     hook table) is a `noinline` site; `data` lines (writes outside code) are skipped"""
     s = Sites()
     s.other = collections.Counter()
+    s.data_writes = []       # (addr, bytes) written outside .text: a jump table among them keeps its full dispatch
     lo, hi = recomp.BASE, recomp.BASE + recomp.TEXT_SIZE
     with open(path) as f:
         for n, line in enumerate(f, 1):
@@ -101,6 +102,8 @@ def parse_sites(path, recomp, what='main'):
             kind = t[0].lower()
             if kind == 'data':
                 s.other['data'] += 1
+                if len(t) >= 3:                                    # data <addr> <bytes>: a write outside code
+                    s.data_writes.append((int(t[1], 16), int(t[2], 0)))
                 continue
             if kind == 'hook':
                 kind = 'noinline'
@@ -112,6 +115,8 @@ def parse_sites(path, recomp, what='main'):
             addr = int(t[1], 16)
             if not lo <= addr < hi:
                 s.other[kind] += 1
+                if kind == 'patch':
+                    s.data_writes.append((addr, 4))
                 continue
             if addr & 3:
                 raise ValueError('%s:%d: %x is not an instruction address of %s' % (path, n, addr, what))
@@ -177,6 +182,7 @@ class Relifter:
             flags_local.check_helpers()
             self.transform = flags_local.transform
         self.module = module
+        self.jt, self.jt_tables = None, []
         if module:
             nro, base, name, _ = module_info(module)
             os.environ['RECOMP_NRO'], os.environ['RECOMP_NRO_BASE'], os.environ['RECOMP_NRO_MODULE'] = os.path.abspath(nro), base, name
@@ -189,9 +195,17 @@ class Relifter:
         else:
             import recomp
             import recomp_eh
+            import jumptables
             self._lift = lambda env, e: recomp_eh.lift_function(env, e)[0]
             self.generator = 'recomp_eh.py'
             self.table_sym = 'fn_table'
+            # the br dispatch of the base set (recomp_eh.py writes jumptables.json with RECOMP_JT >= 1): the same here,
+            # whatever the environment says, or the re-lift without sites could not reproduce the base files
+            jt = os.path.join(base_gen, 'jumptables.json')
+            info = json.load(open(jt)) if os.path.exists(jt) else {'level': 0, 'tables': []}
+            jumptables.LEVEL = info['level']
+            self.jt = jumptables
+            self.jt_tables = info['tables']
         self.recomp = recomp
         self.base_gen = base_gen
         env = recomp.Env()
@@ -208,6 +222,7 @@ class Relifter:
         self.all_funcs = sorted(int(m, 16) for m in re.findall(r'^void f_([0-9a-f]+)\(Ctx \*c\);', self.funcs_h, re.M))
         self.func_set = set(self.all_funcs)
         self._sorted = None
+        self.jt_only = set()                       # jtable sites re-lifted only to give their function the full switch
 
     def bucket_of(self, a):
         return (a - self.recomp.BASE) // self.recomp.BUCKET
@@ -258,8 +273,9 @@ class Relifter:
 
 
 # ---------------------------------------------------------------------------------------------------- jump tables
-def check_jtable(rl, a):
-    """Report on a `br` dispatching through a .rodata table; returns (ok, text)."""
+def check_jtable(rl, a, forced=False):
+    """Report on a `br` dispatching through a .rodata table; returns (ok, text). forced: the base set lifts its function
+    with the proven targets only (jumptables.py); the re-lift gives it the full switch again (FORCE_FULL)."""
     recomp = rl.recomp
     bits, sext, word = recomp.bits, recomp.sext, recomp.word
     w = word(a)
@@ -267,9 +283,16 @@ def check_jtable(rl, a):
         return False, 'not a br (%08x)' % w
     rn = bits(w, 9, 5)
     notes = []
-    for e in rl.entries_holding(a):
-        if 'L_%x: { jt = c->x[%d]; goto L_dispatch; }' % (a, rn) not in rl.lift_entry(e, None):
-            return False, 'f_%x does not lift the br as a dispatch on jt' % e
+    saved = rl.jt.FORCE_FULL if rl.jt else None
+    if forced:
+        rl.jt.FORCE_FULL = {a}
+    try:
+        for e in rl.entries_holding(a):
+            if 'L_%x: { jt = c->x[%d]; goto L_dispatch; }' % (a, rn) not in rl.lift_entry(e, None):
+                return False, 'f_%x does not lift the br as a dispatch on jt' % e
+    finally:
+        if rl.jt:
+            rl.jt.FORCE_FULL = saved
     owner = rl.env.starts[bisect.bisect_right(rl.env.starts, a) - 1]
     end = rl.env.extent(owner)
     # add xT, xT, xBase ; ldrsw xT, [xBase, xI, lsl #2] ; add xBase, xBase, #lo ; adrp xBase, page ; cmp wI, #N ; b.hi
@@ -768,7 +791,10 @@ def plan_sites(rl, sites):
         plan.setdefault(a, ([], None, False))
         table.append((a, 1, w))
     for a in sorted(sites.jtable):
-        ok, text = check_jtable(rl, a)
+        if rl.jt and rl.jt.LEVEL:                 # the base set lists only the binary's targets: the full switch here
+            plan.setdefault(a, ([], None, False))
+            rl.jt_only.add(a)
+        ok, text = check_jtable(rl, a, forced=rl.jt and rl.jt.LEVEL)
         (notes if ok else refused).append(('jtable %x: %s' % (a, text)) if ok else ('jtable', a, text))
         if ok:
             table.append((a, 5, 0))
@@ -816,7 +842,16 @@ def main():
            len(sites.noinline), len(rl.env.starts), time.time() - t0))
     if sites.other:
         log('  lines for other modules / data, skipped: ' + ', '.join('%s %d' % kv for kv in sorted(sites.other.items())))
+    if rl.jt and rl.jt.LEVEL and sites.data_writes:
+        # a write into a jump table the base set's dispatch was built from: that br gets the full switch (a jtable site)
+        for e, br, base, size in rl.jt_tables:
+            if any(d < base + size and base < d + n for d, n in sites.data_writes) and br not in sites.jtable:
+                log('  note: the site list writes into the jump table %x of the br at %x (f_%x): it gets the full dispatch' % (base, br, e))
+                sites.jtable.add(br)
     plan, notes, refused, table = plan_sites(rl, sites)
+    # lifted copies whose dispatch is the full switch with the sites compiled in (jumptables.FORCE_FULL): a callout or a
+    # run-time immediate can change what the binary alone proves, and the jtable sites (a table changed at run time)
+    force = set(a for a in plan if a in sites.inline or a in sites.midhook or a in sites.dynimm or a in rl.jt_only) if rl.jt else set()
     for n in notes:
         log('  note: ' + n)
     for kind, a, why in refused:
@@ -858,11 +893,15 @@ def main():
         buckets = sorted(set(pairs) | set(noinline_by_bucket) | set(rl.bucket_of(a) for a in new))
         # lift with the sites to collect targets that are no entry yet
         recomp.PATCHES = patches
+        if rl.jt:
+            rl.jt.FORCE_FULL = force
         rl.env.wanted = collections.OrderedDict()
         for b in buckets:
             for e in sorted(x for x in rl.func_set if rl.bucket_of(x) == b):
                 rl.lift_entry(e, plan)
         recomp.PATCHES = {}
+        if rl.jt:
+            rl.jt.FORCE_FULL = set()
         extra = [w for w in rl.env.wanted if w not in rl.func_set and recomp.BASE <= w < recomp.BASE + recomp.TEXT_SIZE]
         if not extra:
             break
@@ -910,36 +949,58 @@ def main():
                     bad += 1
                     continue
         recomp.PATCHES = patches
+        if rl.jt:
+            rl.jt.FORCE_FULL = force
         text = rl.transform(rl.bucket_text(b, by_bucket[b], plan, noinline_by_bucket.get(b)))
         recomp.PATCHES = {}
+        if rl.jt:
+            rl.jt.FORCE_FULL = set()
         a_lines, b_lines = collections.Counter(plain.split('\n')), collections.Counter(text.split('\n'))
         removed, added = sum((a_lines - b_lines).values()), sum((b_lines - a_lines).values())
         # expected: per (lifted copy, site address) the line `L_<a>: <stmt>` goes, 1 + callout/check lines come;
         # + `goto L_<a>_m;` in f_<midhook>; + every line of a new function and its blank separator; + noinline declarations
         exp_removed = len(pairs[b])
         exp_added = sum(1 + len(plan[a][0]) for _, a in pairs[b])
+        same = sum(1 for _, a in pairs[b] if a in rl.jt_only and a not in patches)   # a jtable site's own line stays
+        exp_removed -= same
+        exp_added -= same
         exp_added += sum(1 for e, a in pairs[b] if e == a and plan[a][2])
         exp_added += len(noinline_by_bucket.get(b, ()))
         newb = [e for e in by_bucket[b] if e not in base_entries]
         for e in newb:                                               # a new function: all its lines (+ a blank separator), not per site
             recomp.PATCHES = patches
+            if rl.jt:
+                rl.jt.FORCE_FULL = force
             exp_added += len(rl.transform(rl.lift_entry(e, plan)).split('\n')) + 1
             recomp.PATCHES = {}
+            if rl.jt:
+                rl.jt.FORCE_FULL = set()
             exp_added -= sum(1 + len(plan[a][0]) + (1 if e == a and plan[a][2] else 0) for ee, a in pairs[b] if ee == e)
             exp_removed -= sum(1 for ee, a in pairs[b] if ee == e)
+            exp_added += sum(1 for ee, a in pairs[b] if ee == e and a in rl.jt_only and a not in patches)
+            exp_removed += sum(1 for ee, a in pairs[b] if ee == e and a in rl.jt_only and a not in patches)
         # a patch can change the shape of a lifted copy: a new `br` adds `uint64_t jt` and the L_dispatch switch (a line
-        # per instruction + 2), a new / removed terminator at the end changes the fall-through line
+        # per instruction + 2, or per jump-table target with jumptables.py), a site can force the full switch, a patched
+        # table bound changes the cases; a new / removed terminator at the end changes the fall-through line
+        def dispatch_lines(x):
+            ls = x.split('\n')
+            out = [l for l in ls if l == '  uint64_t jt = 0;']
+            if 'L_dispatch: switch (jt) {' in ls:
+                k = ls.index('L_dispatch: switch (jt) {')
+                out += ls[k:next(m for m in range(k, len(ls)) if ls[m].startswith('  default:')) + 1]
+            return collections.Counter(out)
         for e in sorted(set(e for e, _ in pairs[b]) - set(newb)):
             p0 = rl.lift_entry(e, None)
             recomp.PATCHES = patches
+            if rl.jt:
+                rl.jt.FORCE_FULL = force
             p1 = rl.lift_entry(e, None)
             recomp.PATCHES = {}
-            n_ins = sum(1 for l in p0.split('\n') if l.startswith('L_') and not l.startswith('L_dispatch'))
-            j0, j1 = '  uint64_t jt = 0;' in p0, '  uint64_t jt = 0;' in p1
-            if j1 and not j0:
-                exp_added += n_ins + 3
-            elif j0 and not j1:
-                exp_removed += n_ins + 3
+            if rl.jt:
+                rl.jt.FORCE_FULL = set()
+            d0, d1 = dispatch_lines(p0), dispatch_lines(p1)
+            exp_added += sum((d1 - d0).values())
+            exp_removed += sum((d0 - d1).values())
             def tail(x):                                             # the line behind the last instruction
                 ls = x.split('\n')
                 end = next(i for i, l in enumerate(ls) if l == '}' or l.startswith('L_dispatch:'))
