@@ -54,6 +54,7 @@ def addr(rd, rn, rm): return 0x8b000000 | (rm << 16) | (rn << 5) | rd
 def movw(rd, rm): return 0x2a0003e0 | (rm << 16) | rd
 def ldrx(rt, rn, off): return 0xf9400000 | ((off // 8) << 10) | (rn << 5) | rt
 def br(rn): return 0xd61f0000 | (rn << 5)
+def fcvtzs_fix(rd, rn, fbits): return 0x9e580000 | ((64 - fbits) << 10) | (rn << 5) | rd     # fcvtzs xd, dn, #fbits
 RET, NOP, ADDS = 0xd65f03c0, 0xd503201f, 0xb1000421            # adds x1, x1, #1
 
 
@@ -159,6 +160,9 @@ def synthetic():
         if w == ('bl',):
             code[o] = bl(o, 0x8000)
     check(run(code, tables, e, end)[0][0] == sorted(cases + [e]), 'base x19 and index x20 (callee-saved) across a bl: proven')
+
+    code, tables, e, end, _ = switch_fn(between_base=[fcvtzs_fix(9, 0, 4)])
+    check(run(code, tables, e, end)[0][0] is None, 'the base overwritten by fcvtzs x9, d0, #4 (fixed-point to a GPR): full switch')
 
     code, tables, e, end, cases = switch_fn(pre=[NOP, NOP])
     ld = next(o for o in sorted(code) if (code[o] & 0xffe0fc00) == 0xb8a07800)

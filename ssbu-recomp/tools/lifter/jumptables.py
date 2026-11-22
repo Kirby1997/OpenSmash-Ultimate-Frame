@@ -358,9 +358,10 @@ class Proof:
                 return
             self.forget(None)                                      # svc / hvc / brk ...
             return
-        if op0 in (7, 15):                                         # FP / SIMD: only two groups write a GPR (at bits 4..0)
-            if (w & 0x7f20fc00) == 0x1e200000 or (w & 0x9fe08400) == 0x0e000400:
-                self.put(rd, None)                                 # FP <-> integer conversions / fmov; umov / smov / dup / ins
+        if op0 in (7, 15):                                         # FP / SIMD: only three groups write a GPR (at bits 4..0)
+            if (w & 0x7f20fc00) == 0x1e200000 or (w & 0x7f200000) == 0x1e000000 or (w & 0x9fe08400) == 0x0e000400:
+                self.put(rd, None)                                 # FP <-> integer conversions / fmov; FP <-> fixed-point
+                                                                   # (fcvtzs / fcvtzu xd, dn, #fbits); umov / smov / dup / ins
             return
         self.forget(None)                                          # SVE, SME, unallocated
 
