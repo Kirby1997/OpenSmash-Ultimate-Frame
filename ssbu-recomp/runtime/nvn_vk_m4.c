@@ -2371,6 +2371,7 @@ static DWORD WINAPI prep_main(void *arg) {
             printf("nvn_vk_store: STALE: the container store in %s was made from another data.arc (%.60s now: %.60s): its files and the preparation's marker are removed, the store is built again\n", dir, was, stamp);
             if (prep_list(dir)) for (int i = 0; i < g_prep_nfiles; i++) { snprintf(path, sizeof path, "%s/%s", dir, g_prep_file[i].name); DeleteFileA(path); }
             DeleteFileA(g_prep_marker); g_prep_marked = ps_marked_after_store_check(g_prep_marked, 1);
+            if (stale) { g_prep_loadall = 0; g_prep_keep = getenv("SSBU_VK_PREP_KEEP") ? atoi(getenv("SSBU_VK_PREP_KEEP")) : 0; }      /* a first run, not a marked start: prep_start set loadall = 1 and keep = 1024 for the marker just removed (stages would stay in RAM, workers at normal priority) */
             DeleteFileA(spath);
         }
     }
