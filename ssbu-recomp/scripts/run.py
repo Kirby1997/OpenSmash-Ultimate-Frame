@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -214,11 +215,36 @@ def main():
     cmd = [exe, os.path.join(a.build, 'binaries', state.get('game_version', '13.0.4'), 'main.elf'), str(a.seconds)]
     t0 = time.time()
     out = open(a.log, 'wb') if a.log else None
-    p = subprocess.run(cmd, cwd=work, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    p = run_game(cmd, work, env, out, a.linux)
     print('game exited with code %d after %.0f s' % (p.returncode, time.time() - t0))
     if mods_ok and mods_env and env.get('SSBU_SKYLINE') != '0':
         mods.after_run(a.build, t0)                   # this run's site list, for the next start (a plugin hooking something new)
     return p.returncode
+
+def run_game(cmd, cwd, env, out, forward):
+    """Run the game and return its CompletedProcess-like result. With `forward` (the Linux builds) SIGTERM, SIGINT and
+    SIGHUP sent to this launcher go on to the game: Steam's "Exit game" signals the launcher, and the game's own
+    clean-close handler (display.c) must get the signal. Other platforms: subprocess.run, as before."""
+    if not forward:
+        return subprocess.run(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    child = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
+    def relay(signum, _frame):
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+    old = {s: signal.signal(s, relay) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        while True:
+            try:
+                child.wait()
+                break
+            except InterruptedError:
+                continue
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+    return child
 
 
 if __name__ == '__main__':

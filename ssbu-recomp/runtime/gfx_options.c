@@ -120,7 +120,7 @@ static const char *const k_default_ini =
 ";               and builds every shader of the game before the title: several minutes, once. Closing the window stops it\r\n"
 ";               cleanly; the next start goes on from there. Later starts go straight to the game.\r\n"
 ";   background: the game starts at once and the same work runs behind it (first-seen things can make a frame late until it is done).\r\n"
-";   off:        nothing is prepared ahead; shaders are built when the game first needs them.\r\n"
+";   off:        no screen and no hold, as background; the preparation still runs behind the game (only SSBU_VK_PREP=0 stops it).\r\n"
 "shader_prepare = first_run\r\n"
 "\r\n"
 "; shader_load = start | loading      (Vulkan, on a PC where the preparation above is done)\r\n"
