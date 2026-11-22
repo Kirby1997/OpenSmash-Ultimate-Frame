@@ -607,7 +607,8 @@ def dump_checks(cx, a):
 
 LINUX_PKGS = (('sdl3', 'SDL3'), ('freetype2', 'FreeType'), ('openssl', 'OpenSSL'), ('libavformat', 'FFmpeg'), ('libavcodec', 'FFmpeg'),
               ('libswscale', 'FFmpeg'), ('libswresample', 'FFmpeg'), ('libavutil', 'FFmpeg'))
-GLSLANG_LIBS = (['-lglslang', '-lglslang-default-resource-limits'],          # shared glslang (Arch, Fedora)
+GLSLANG_LIBS = (['-lglslang', '-lglslang-default-resource-limits'],          # shared glslang 15 and later (Arch, Fedora; SteamOS beta)
+                ['-lglslang', '-lglslang-default-resource-limits', '-lSPIRV'],          # shared glslang 14 and older: SPIR-V generation in libSPIRV (SteamOS stable, 2026-10)
                 ['-lglslang', '-lglslang-default-resource-limits', '-lSPIRV', '-lMachineIndependent', '-lGenericCodeGen',
                  '-lOSDependent', '-lSPIRV-Tools-opt', '-lSPIRV-Tools', '-lstdc++', '-lpthread'])      # static glslang (Debian)
 LINUX_HINT = '\n(scripts/linux/install_deps.sh installs everything the Linux build needs; see BUILDING_LINUX.md)'
@@ -692,7 +693,7 @@ def deps_linux(cx):
         f.write('#include <stdio.h>\n#include <SDL3/SDL.h>\n#include <ft2build.h>\n#include FT_FREETYPE_H\n#include <openssl/evp.h>\n'
                 '#include <libavcodec/avcodec.h>\n#include <glslang/Include/glslang_c_interface.h>\n#include <GL/gl.h>\n'
                 'int main(void) {\n    FT_Library ft;\n    if (FT_Init_FreeType(&ft)) return 1;\n'
-                '    printf("%d %p %p %p\\n", SDL_GetVersion(), (void *)EVP_sha256, (void *)glslang_initialize_process, (void *)glGetString);\n'
+                '    printf("%d %p %p %p %p\\n", SDL_GetVersion(), (void *)EVP_sha256, (void *)glslang_initialize_process, (void *)glslang_program_SPIRV_generate, (void *)glGetString);\n'
                 '    if (!avcodec_find_decoder(AV_CODEC_ID_VP9)) { puts("noVP9"); return 0; }\n'
                 '    if (!avcodec_find_decoder(AV_CODEC_ID_VORBIS)) { puts("noVorbis"); return 0; }\n'
                 '    puts("ok");\n    return 0;\n}\n')
@@ -1184,7 +1185,8 @@ def step_link(cx):
 
 
 def link_linux(cx):
-    cx.run('link', [cx.tools['clang']] + cx.target_flags + ['-O2', '-shared', '-fPIC', 'vk_glslang_shim.c', '-o', 'ssbu_glslang.so'] + cx.tools.get('glslang_libs', GLSLANG_LIBS[0]))
+    # --no-undefined: a glslang function no library given defines fails here, not when the game loads the shim at its start
+    cx.run('link', [cx.tools['clang']] + cx.target_flags + ['-O2', '-shared', '-fPIC', 'vk_glslang_shim.c', '-o', 'ssbu_glslang.so', '-Wl,--no-undefined'] + cx.tools.get('glslang_libs', GLSLANG_LIBS[0]))
     cx.run('link', [sys.executable, 'build.py', 'link'], env=cx.env(**{k: v for k, v in build_env(cx).items() if k != 'RECOMP_NRO_SUFFIX'}, RECOMP_EXE=LINUX_EXE))
     for f in (LINUX_EXE, 'ssbu_glslang.so', game_lib(cx)):
         if not os.path.exists(os.path.join(cx.work, f)):
