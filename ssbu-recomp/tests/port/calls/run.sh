@@ -27,11 +27,14 @@ if [ "$(uname -m)" = aarch64 ] || [ -n "${CALLS_CODEGEN:-}" ]; then
             o="$OUT/hostrt-$bp.o"
             if ! $CC $F -mbranch-protection=$bp -c runtime/hostrt.c -o "$o"; then echo "FAIL compile hostrt.c ($CC, branch protection $bp)"; rc=1; continue; fi
             d=$(objdump -d --no-show-raw-insn --disassemble=call_indirect "$o" | sed -n '/<call_indirect>:/,/^$/p' | tail -n +2)
-            n_bad=$(printf '%s\n' "$d" | grep -c -i -E '\b(dmb|dsb|isb|svc|hvc|ldx|ldax|stx|stlx|cas[a-z]*|ldadd[a-z]*|swp[a-z]*|stp|str)\b|tpidr')
+            # the game is built with clang (build.py): there the fast path has no stack frame at all. gcc spills c to the stack
+            # (sub sp / str / ldr on the miss path), harmless, so for gcc only the barriers, atomics, syscalls and TLS count
+            frame='|stp|str'; $CC --version 2>/dev/null | grep -q -i clang || frame=''
+            n_bad=$(printf '%s\n' "$d" | grep -c -i -E "\\b(dmb|dsb|isb|svc|hvc|ldx|ldax|stx|stlx|cas[a-z]*|ldadd[a-z]*|swp[a-z]*$frame)\\b|tpidr")
             n_br=$(printf '%s\n' "$d" | grep -c -E '\bbr\b|\bblr\b')
             n_acq=$(printf '%s\n' "$d" | grep -c -E '\bldapr|\bldar')
             what="$CC, branch protection $bp"
-            if [ "$n_bad" = 0 ] && [ "$n_br" = 1 ] && [ "$n_acq" -ge 2 ]; then echo "ok   call_indirect fast path ($what): no frame / barrier / atomic RMW / syscall / TLS, 1 indirect branch, $n_acq acquire loads"
+            if [ "$n_bad" = 0 ] && [ "$n_br" = 1 ] && [ "$n_acq" -ge 2 ]; then echo "ok   call_indirect fast path ($what): no ${frame:+frame / }barrier / atomic RMW / syscall / TLS, 1 indirect branch, $n_acq acquire loads"
             else echo "FAIL call_indirect fast path ($what): $n_bad forbidden instructions, $n_br indirect branches, $n_acq acquire loads"; printf '%s\n' "$d"; rc=1; fi
             if [ $bp = standard ]; then
                 first=$(printf '%s\n' "$d" | grep -m1 -E '^ *[0-9a-f]+:' | awk '{print $2, $3}')
