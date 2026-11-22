@@ -23,7 +23,7 @@ One-click installer, Vulkan renderer, in-game settings, fighters as readable C++
 > This folder is the fork's work, on branch `frame` of [Kirby1997/OpenSmash-Ultimate-Frame](https://github.com/Kirby1997/OpenSmash-Ultimate-Frame)
 > (`setup.py --target linux-arm64`), a fork of [OpenSmash-Ultimate/OpenSmash-Ultimate](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate)
 > (see the note in the [root README](../README.md)). It builds on upstream's Linux layer and adds what an ARM host needs.
-> **Status: in progress, not yet run on the device; the game does not boot on the Frame yet.**
+> **Status: the game boots and plays on the Frame, in Game Mode with Steam's controllers ([docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)).**
 >
 > | | Steam Frame (as measured on the device) |
 > |---|---|

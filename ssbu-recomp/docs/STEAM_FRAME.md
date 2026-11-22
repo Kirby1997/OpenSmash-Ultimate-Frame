@@ -36,8 +36,9 @@ window. It names the problem and lets you choose the folder:
 The keyboard and mouse work too. In Desktop Mode the system folder dialog is offered first (never under Game Mode's
 gamescope). The folder is checked and saved as `data=`.
 
-To change it later, start once with the picker: in Steam's launch options `%command% --pick-data` or
-`SSBU_PICK_DATA=1 %command%`. Scripted runs, `SSBU_SHOW=0` and runs without a display print the reason and exit with code 9
+To change it later, start once with the picker: in Steam's launch options `%command% --env SSBU_PICK_DATA=1` (the menu
+entry starts `scripts/run.py`, which takes no `--pick-data` and passes on only the `SSBU_` variables given with `--env`;
+`ssbu_native --pick-data` started directly works too). Scripted runs, `SSBU_SHOW=0` and runs without a display print the reason and exit with code 9
 instead.
 
 ## Playing in Game Mode
@@ -46,7 +47,7 @@ The Frame's own controllers reach the game only through Steam. Steam Input turns
 ("Steam Frame Controllers") and feeds that pad only to apps Steam started. A game started from a terminal or over ssh
 sees no controller. Keep Steam Input switched on.
 
-Put the game in the Steam library once, from Desktop Mode:
+Put the game in the Steam library once, from Desktop Mode (run `scripts/linux/install_desktop.sh` first):
 
 1. Application menu → Games → "Super Smash Bros. Ultimate (recomp)". `scripts/linux/install_desktop.sh` makes this
    entry; on a Frame it picks `build-linux-arm64`.
@@ -59,7 +60,8 @@ Steam's Exit closes the game cleanly: it sends SIGTERM, and the game treats that
 ### The Frame's buttons
 
 `layout = auto` is the default in `build-linux-arm64/config/controllers.ini` (written on the first start). On the
-Frame's own pads it follows the printed letters: the A button acts as A. Other pads (an Xbox pad, say) stay positional:
+Frame's own pads it follows the printed letters: the A button acts as A. So do Valve's other pads and GameCube
+controllers. Other pads (an Xbox pad, say) stay positional:
 the button in Nintendo's A position acts as A, whatever is printed on it. To force one way for every pad, set this:
 
 ```ini
@@ -68,7 +70,8 @@ layout = labels
 ```
 
 The values are `labels`, `positional` and `auto`. The file is read again within a second of being saved, so this can
-be changed while a game runs. `build-linux-arm64/work/ssbu_native --pad-test` prints what a pad sends.
+be changed while a game runs. `build-linux-arm64/work/ssbu_native --pad-test` prints what a pad sends (started from a terminal it does
+not see the Frame's own pads: see above).
 
 The grip button toggles the Frame's system laser pointer. While it is on, the game gets no controller input. If the pad
 stops answering in the middle of a match, check the grip first.
@@ -80,7 +83,8 @@ The first start prepares every shader of the game for this GPU, driver and game 
 The result is kept in `build-linux-arm64/cache`, about 3 GB. Later starts draw in about a minute.
 
 Measured on a Frame: 60 fps in menus, 53 to 60 fps in a four-player fight. `shader_prepare = background` in
-`graphics.ini` skips the hold and prepares behind the running game instead. `off` skips the preparation altogether.
+`graphics.ini` skips the hold and prepares behind the running game instead. `off` skips the screen as well; the
+preparation itself still runs behind the game (only `SSBU_VK_PREP=0` turns it off).
 
 ### Saves, settings and what to back up
 
@@ -99,7 +103,8 @@ Back up the first three together. The launcher made by `install_desktop.sh` writ
 The game needs the console's shared fonts. Without them in the dump (`sysdata/fonts`), the open fonts staged beside the
 executable are used. They have no Chinese, Japanese or Korean glyphs. `tools/extract/fw_fonts.py <firmware_dir>
 <output_dir>` extracts the fonts from a firmware dump you own; put them in the dump's `sysdata/fonts`, or point the game
-at them with `--fonts`.
+at them: `%command% --env SSBU_FONTS=<folder>` in Steam's launch options (`--fonts <folder>` when `ssbu_native` is
+started directly).
 
 ### Known Frame issue: volume buttons
 
