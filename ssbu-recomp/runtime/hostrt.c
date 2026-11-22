@@ -11,6 +11,9 @@
 #ifndef _WIN32
 #include "plat_crash.h"
 #endif
+#ifdef __linux__
+#include <sys/mman.h>                               /* ci_table_build: the fast table in huge pages */
+#endif
 
 #define FILE_OFF 0x1000ULL
 #define IMAGE_SIZE 0x7500000ULL          /* the whole image with bss: 13.0.4 and 13.0.5 both end below it */
@@ -335,7 +338,9 @@ static int g_icall_mode = -1;
 static ULONGLONG g_icall_start, g_icall_end;
 static unsigned long long g_poke_fn, g_poke_off;
 static unsigned g_poke_val;
-static void icall_record(Ctx *c, uint64_t addr) {
+/* reads SSBU_ICALLS / SSBU_EXPERIMENT_POKE once: runtime_init (before the fast path is published: with either set, every
+ * call takes the slow path, which records) or the first indirect call before it */
+static void icall_mode_init(void) {
     if (g_icall_mode < 0) {
         int s = 0, d = 0;
         const char *e = getenv("SSBU_ICALLS");
@@ -348,6 +353,9 @@ static void icall_record(Ctx *c, uint64_t addr) {
         if (e && sscanf(e, "%llx:%llx=%x", &g_poke_fn, &g_poke_off, &g_poke_val) == 3) { if (!g_icall_mode) g_icall_mode = 2; }
         else g_poke_fn = 0;
     }
+}
+static __attribute__((noinline)) void icall_record(Ctx *c, uint64_t addr) {
+    icall_mode_init();
     if (g_poke_fn && addr == g_poke_fn && rd8(c->x[0] + g_poke_off) != (uint8_t)g_poke_val) {
         printf("[poke] f_%llx: byte at x0+0x%llx (%llx) %02x -> %02x\n", g_poke_fn, g_poke_off, (unsigned long long)(c->x[0] + g_poke_off),
                rd8(c->x[0] + g_poke_off), g_poke_val);
@@ -383,7 +391,33 @@ void icall_dump(FILE *out, uint64_t main_ctx) {
                     (unsigned long long)g_icall[i].x0, (unsigned long long)g_icall[i].x1, (unsigned long long)g_icall[i].x2);
 }
 
-void call_indirect(Ctx *c, uint64_t addr) {
+/* ---------------------------------------------------------------- call_indirect
+ * Every indirect call and branch of the lifted code (blr / br to a computed address) comes here. The fast path is the
+ * direct-mapped table over main's code (ci_direct.inc, built by ci_table_build in runtime_init): one load, then a tail
+ * call, no stack frame. Everything else - main's few functions that are not 16-byte aligned, the host functions, the
+ * import placeholders, the run-time modules, the SDK code, the SSBU_ICALLS / SSBU_EXPERIMENT_POKE debug modes (no table
+ * then), and every call before runtime_init - takes call_indirect_slow, the dispatch as it was before the table. */
+#include "ci_direct.inc"
+static CiDirect g_ci;
+
+/* not inlined: hot for the NVN functions (handed out through nvnBootstrapLoader), a separate symbol in a profile */
+static __attribute__((noinline)) void call_hostfn(Ctx *c, int i) {
+    HostFn *h = &g_hostfn[i];
+    if (InterlockedIncrement64(&h->calls) == 1) {
+        h->first = InterlockedIncrement64(&g_hostfn_seq);
+        if (audit_path_hostfn(h->name)) audit_path_hit("run-time host function", h->name, c->x[30] - 4);
+    }
+    t_hostfn = i;
+    const char *saved_name = c->in_import;
+    uint64_t saved_from = c->import_from;
+    c->in_import = h->name;                          /* so thread dumps can name the host function */
+    c->import_from = c->x[30] - 4;
+    if (h->fnu) h->fnu(c, h->user); else h->fn(c);
+    c->in_import = saved_name;
+    c->import_from = saved_from;
+}
+
+static __attribute__((noinline)) void call_indirect_slow(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
     if (addr - GUEST_BASE < IMAGE_SIZE) {            /* P3: the common case first (a function of main); the ranges tested below do not overlap it */
         void (*fn)(Ctx *) = lookup_guest(addr);
@@ -392,19 +426,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
         return;
     }
     if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16) {
-        int i = (int)((addr - HOSTFN_BASE) / 16);
-        if (InterlockedIncrement64(&g_hostfn[i].calls) == 1) {
-            g_hostfn[i].first = InterlockedIncrement64(&g_hostfn_seq);
-            if (audit_path_hostfn(g_hostfn[i].name)) audit_path_hit("run-time host function", g_hostfn[i].name, c->x[30] - 4);
-        }
-        t_hostfn = i;
-        const char *saved_name = c->in_import;
-        uint64_t saved_from = c->import_from;
-        c->in_import = g_hostfn[i].name;             /* so thread dumps can name the host function */
-        c->import_from = c->x[30] - 4;
-        if (g_hostfn[i].fnu) g_hostfn[i].fnu(c, g_hostfn[i].user); else g_hostfn[i].fn(c);
-        c->in_import = saved_name;
-        c->import_from = saved_from;
+        call_hostfn(c, (int)((addr - HOSTFN_BASE) / 16));
         return;
     }
     if (addr >= IMPORT_BASE && addr < IMPORT_BASE + (uint64_t)dyn_sym_count * IMPORT_SLOT) {
@@ -416,6 +438,39 @@ void call_indirect(Ctx *c, uint64_t addr) {
     void (*fn)(Ctx *) = lookup_guest(addr);
     if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
     fn(c);
+}
+
+void call_indirect(Ctx *c, uint64_t addr) {
+    uint32_t e = ci_direct_slot(&g_ci, addr);
+    if (__builtin_expect(e != 0, 1)) { ci_direct_fn(&g_ci, e)(c); return; }
+    call_indirect_slow(c, addr);
+}
+
+/* runtime_init: the fast path's table, unless a debug mode needs every call to go through the slow path */
+static void ci_table_build(void) {
+    icall_mode_init();
+    if (g_icall_mode) { printf("call_indirect: SSBU_ICALLS / SSBU_EXPERIMENT_POKE set: no fast table, every call is looked up\n"); return; }
+    uint64_t slots = ci_direct_slots(fn_table, fn_table_count, IMAGE_SIZE);
+    if (!slots) return;
+    size_t bytes = (size_t)slots * sizeof(uint32_t);
+    uint32_t *dir;
+#ifdef __linux__
+    /* 2 MB aligned, with transparent huge pages where the kernel offers them (madvise mode): the table is read at random
+     * by every indirect call, eight TLB entries instead of thousands */
+    size_t huge = (size_t)2 << 20, len = (bytes + huge - 1) & ~(huge - 1);
+    uint8_t *raw = mmap(NULL, len + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) { printf("call_indirect: no memory for the fast table (%zu bytes): every call is looked up\n", bytes); return; }
+    uint8_t *al = (uint8_t *)(((uintptr_t)raw + huge - 1) & ~(uintptr_t)(huge - 1));
+    if (al > raw) munmap(raw, (size_t)(al - raw));
+    if (al + len < raw + len + huge) munmap(al + len, (size_t)(raw + len + huge - (al + len)));
+    madvise(al, len, MADV_HUGEPAGE);                 /* advice only: without THP the table is in 4 KB pages */
+    dir = (uint32_t *)al;
+#else
+    dir = VirtualAlloc(NULL, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!dir) { printf("call_indirect: no memory for the fast table (%zu bytes): every call is looked up\n", bytes); return; }
+#endif
+    int placed = ci_direct_build(&g_ci, dir, slots, fn_table, fn_table_count);
+    printf("call_indirect: fast table %llu slots (%.1f MB), %d of %d functions\n", (unsigned long long)slots, bytes / 1048576.0, placed, fn_table_count);
 }
 
 /* Register context of the guest code running on this host thread, for crash reports. */
@@ -1260,6 +1315,7 @@ void runtime_init(const char *elf, const char *trace_path) {
     memcpy(g_by_host, fn_table, (size_t)fn_table_count * sizeof *g_by_host);
     qsort(g_by_host, (size_t)fn_table_count, sizeof *g_by_host, cmp_host);
     fn_hash_build();
+    ci_table_build();
     {   const char *e = getenv("SSBU_IMPORT_COUNTS"), *a = getenv("SSBU_AUDIT_COUNTS");
         g_import_count_all = (e && e[0] && e[0] != '0') || (a && a[0]); }
     {   /* sanity: host code addresses must be strictly increasing after the sort */
