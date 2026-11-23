@@ -635,8 +635,15 @@ int nnro_selftest(Ctx *c) {
                                     0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
     uint8_t h[32], info[0x20];
     uint64_t lr = c->x[30], nrr = ((uint64_t)(uintptr_t)page + 0xfff) & ~(uint64_t)0xfff;
+    /* the 112-byte message of FIPS 180-2 (two whole blocks): the block path, not only the tail, is checked against a known answer */
+    static const char m112[] = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    static const uint8_t d112[32] = {0xcf, 0x5b, 0x16, 0xa7, 0x78, 0xaf, 0x83, 0x80, 0x03, 0x6c, 0xe5, 0x9e, 0x7b, 0x04, 0x92, 0x37,
+                                     0x0b, 0x24, 0x9b, 0x11, 0xe8, 0xf0, 0x7a, 0x51, 0xaf, 0xac, 0x45, 0x03, 0x7a, 0xfe, 0xe9, 0xd1};
     int ok = sha256("abc", 3, h) && !memcmp(h, abc, 32), ok2 = 1;
     printf("  ro: SHA-256 of \"abc\" (FIPS 180 example): %s\n", ok ? "ok" : "FAILED");
+    int ok3 = sizeof m112 - 1 == 112 && sha256(m112, 112, h) && !memcmp(h, d112, 32);
+    printf("  ro: SHA-256 of the 112-byte FIPS 180 message (two blocks): %s\n", ok3 ? "ok" : "FAILED");
+    ok &= ok3;
     memset(nro, 0x5a, sizeof nro); wr32((uint64_t)(uintptr_t)nro + 0x18, 0x800);
     ok2 &= nro_hash_registered((uint64_t)(uintptr_t)nro, h) == 0;                         /* nothing registered: refused */
     memset((void *)(uintptr_t)nrr, 0, 0x1000);

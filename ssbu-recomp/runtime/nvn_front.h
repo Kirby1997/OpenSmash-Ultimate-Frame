@@ -119,6 +119,8 @@ typedef struct RBackend {
 extern const RBackend rb_gl, rb_vk;
 extern const RBackend *g_rb;
 void nvn_vk_memory_retire(void *arg);        /* PR #41: Range, render thread: drain compute copies before guest storage is freed or reused */
+void nvn_vk_cb_publish(void);                /* render thread, after every job: the CB ranges for nvn_vk_cb_may_overlap */
+int nvn_vk_cb_may_overlap(uint64_t addr, uint64_t size);       /* any thread: 1 unless no CB (as of the last job) meets the range */
 void nvn_vk_container_seen(uint64_t control, uint64_t prog);      /* Vulkan, GUEST thread, from nvnProgramSetShaders: the "BNSH" container around this control section / variation program is scanned when new (nvn_vk_m4.c) */
 /* Session 8: where one nvnProgramSetShaders call spent its time, in performance-counter ticks, per calling thread:
  * 0 gl_barrier, 1 container_seen (all), 2 container search, 3 container copy / walk, 4 program_set (all), 5 hashing + job copy,

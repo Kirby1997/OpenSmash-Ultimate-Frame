@@ -2237,6 +2237,44 @@ static void cb_batch_end(void) {
  * (it never goes down): entries above it have state 0, so stopping there finds exactly what the walk over all 256 found,
  * in the same order. SSBU_VK_CBSCAN=0 = the walk over all 256 as before. */
 static int g_cb_hi, g_cb_scan = -1, g_cb_bound = -1;
+/* What a guest thread may know about the CBs without a round trip through the render thread: the address ranges of every
+ * CB that is not free (states 1..4), copied by the render thread after each job (nvn_vk_cb_publish, from render_loop) under
+ * a sequence count. nvn_front_memory_retire (nvn_front.c) reads it: a finalized pool or buffer that meets none of them, with no
+ * job of the queue outstanding, needs nothing of nvn_vk_memory_retire. Measured on the Steam Frame: tearing a fight down
+ * finalizes 8,000-10,000 buffers, each a round trip of about 17 us through the render thread (up to 140 ms in one frame). */
+static struct { uint64_t addr, size; } g_cbpub[256];
+static int g_cbpub_n;
+static unsigned g_cbpub_seq;
+void nvn_vk_cb_publish(void) {                      /* render thread, after a job */
+    unsigned seq = g_cbpub_seq;
+    __atomic_store_n(&g_cbpub_seq, seq + 1, __ATOMIC_RELAXED);     /* odd: being written */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    static int hi;                                  /* slots at or above g_cb_hi are free (it only grows); the max keeps the scan whole if that ever changed */
+    if (g_cb_hi > hi) hi = g_cb_hi;
+    int n = 0;
+    for (int i = 0; i < hi; i++) {
+        if (!g_cb[i].state || !g_cb[i].size) continue;
+        __atomic_store_n(&g_cbpub[n].addr, g_cb[i].addr, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_cbpub[n].size, g_cb[i].size, __ATOMIC_RELAXED);
+        n++;
+    }
+    __atomic_store_n(&g_cbpub_n, n, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_cbpub_seq, seq + 2, __ATOMIC_RELEASE);
+}
+int nvn_vk_cb_may_overlap(uint64_t addr, uint64_t size) {     /* any thread: 1 = a CB of the last copy meets the range, or no stable copy */
+    for (int tries = 0; tries < 8; tries++) {
+        unsigned s1 = __atomic_load_n(&g_cbpub_seq, __ATOMIC_ACQUIRE);
+        if (s1 & 1) continue;
+        int hit = 0, n = __atomic_load_n(&g_cbpub_n, __ATOMIC_RELAXED);
+        for (int i = 0; i < n && !hit; i++) {
+            uint64_t a = __atomic_load_n(&g_cbpub[i].addr, __ATOMIC_RELAXED), z = __atomic_load_n(&g_cbpub[i].size, __ATOMIC_RELAXED);
+            hit = a >= addr ? a - addr < size : addr - a < z;         /* cb_in_range */
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_cbpub_seq, __ATOMIC_RELAXED) == s1) return hit;
+    }
+    return 1;
+}
 static CB *cb_inside(uint64_t addr, uint64_t size) {
     int n = g_cb_scan ? g_cb_hi : 256;
     for (int i = 0; i < n; i++) if (g_cb[i].state == 1 && addr >= g_cb[i].addr && addr + size <= g_cb[i].addr + g_cb[i].size) return &g_cb[i];

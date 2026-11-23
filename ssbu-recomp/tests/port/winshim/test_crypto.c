@@ -1,5 +1,5 @@
 /* test_crypto.c - the hashes the runtime asks the platform for, against the published vectors:
- *   - BCryptHash(SHA-256) of "bcrypt.dll" (plat_posix.c's own SHA-256, no library): what nnro.c checks an NRR's module hashes
+ *   - BCryptHash(SHA-256) of "bcrypt.dll" (plat_posix.c: OpenSSL's libcrypto, its own C rounds should that fail): what nnro.c checks an NRR's module hashes
  *     with (nn::ro::LoadModule refuses a module whose hash is not registered, 0x1216) and nnmisc.c's nn::crypto SHA-256
  *     (FIPS 180-4 examples, every length 0..300 against a reference computed with Python's hashlib);
  *   - CryptCreateHash / CryptHashData / CryptGetHashParam with CALG_SHA1 and CALG_MD5 (nn::crypto::GenerateSha1Hash and the

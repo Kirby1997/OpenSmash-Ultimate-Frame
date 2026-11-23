@@ -34,7 +34,8 @@ esac
 $CC $F ${PLAT_CFLAGS_EXTRA:-} -c runtime/plat_posix.c -o "$OUT/plat_posix.o"
 $CC $F -c runtime/os_threads.c -o "$OUT/os_threads.o"
 { echo 'int dprintf(int, const char *, ...); void abort(void);'
-  nm -u "$OUT/plat_posix.o" | sed -E -n "s/^ *(U +)?$P((SDL|EVP)_[A-Za-z0-9_]+)\$/void \\2(void) { dprintf(2, \"stub called: \\2\\\\n\"); abort(); }/p"
+  nm -u "$OUT/plat_posix.o" | sed -E -n "s/^ *(U +)?$P((SDL|EVP)_[A-Za-z0-9_]+)\$/void \\2(void) { dprintf(2, \"stub called: \\2\\\\n\"); abort(); }/p" \
+    | sed -E 's/^void (EVP_Digest|EVP_sha256)\(void\) .*/long \1(void) { return 0; }             \/* the SHA-256 fails over to its C rounds *\//'
   echo 'void SDL_GetVersion(void) { abort(); }'                # gaps.c takes its address
 } > "$OUT/libstubs.c"
 $CC $F -c "$OUT/libstubs.c" -o "$OUT/libstubs.o"
