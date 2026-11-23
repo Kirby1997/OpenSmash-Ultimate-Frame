@@ -38,8 +38,12 @@ static void SDLCALL dialog_cb(void *ud, const char *const *list, int filter) {
     pthread_mutex_unlock(&g_dlg_mu);
 }
 
-/* ---- pads: the game's default layout (nnpad_sdl.c "auto"): the Nintendo positions (right = A, bottom = B, top = X,
- * left = Y), GameCube controllers by their printed letters */
+/* ---- pads: the game's default layout (nnpad_sdl.c "auto", eff_layout): printed letters on Xbox, PlayStation (Cross = A,
+ * Circle = B, Square = X, Triangle = Y) and GameCube controllers and on Valve's own pads with A at the bottom; the Nintendo
+ * positions (right = A, bottom = B, top = X, left = Y) on Switch and other pads. SSBU_PAD_LAYOUT (labels | positional | auto)
+ * counts here as in the game; controllers.ini is not read (the picker runs before nnpad_init, and tests/port/picker links it
+ * without nnpad_sdl.c): a layout set there counts from the game on. The kinds of pad and the Valve test are a copy of
+ * nnpad_sdl.c's eff_layout / dev_add (valve_abxy) and label_letter / def_map: change them together. */
 #define MAX_PADS 8
 static SDL_Gamepad *g_pad[MAX_PADS];
 static signed char g_stick[MAX_PADS][2];                  /* left stick, -1 / 0 / +1 per axis, with hysteresis */
@@ -47,18 +51,34 @@ static int pad_slot(SDL_JoystickID id) {
     for (int i = 0; i < MAX_PADS; i++) if (g_pad[i] && SDL_GetGamepadID(g_pad[i]) == id) return i;
     return -1;
 }
+static int label_letter(SDL_GamepadButtonLabel l) {      /* 0 A / Cross, 1 B / Circle, 2 X / Square, 3 Y / Triangle, -1 none */
+    switch (l) {
+    case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return 0;
+    case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return 1;
+    case SDL_GAMEPAD_BUTTON_LABEL_X: case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return 2;
+    case SDL_GAMEPAD_BUTTON_LABEL_Y: case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return 3;
+    default: return -1;
+    }
+}
+static int pad_letter(SDL_Gamepad *g, int b) {            /* face button b (south, east, west, north): 0 A, 1 B, 2 X, 3 Y */
+    static const int pos[4] = {1, 0, 3, 2};               /* south B, east A, west Y, north X */
+    const char *e = getenv("SSBU_PAD_LAYOUT");             /* as nnpad_sdl.c cfg_load */
+    int mode = e && e[0] ? (!strcasecmp(e, "labels") || !strcasecmp(e, "label") ? 1 : !strcasecmp(e, "auto") ? 2 : 0) : 2;
+    if (g && mode) {
+        SDL_GamepadType t = SDL_GetGamepadType(g);
+        int labels = mode == 1 || t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE || t == SDL_GAMEPAD_TYPE_PS3 || t == SDL_GAMEPAD_TYPE_PS4
+                  || t == SDL_GAMEPAD_TYPE_PS5 || t == SDL_GAMEPAD_TYPE_GAMECUBE
+                  || (SDL_GetGamepadVendor(g) == 0x28DE && SDL_GetGamepadButtonLabel(g, SDL_GAMEPAD_BUTTON_SOUTH) == SDL_GAMEPAD_BUTTON_LABEL_A);
+        for (int i = 0; i < 4 && labels; i++)             /* a face SDL does not fully label: by position (as def_map) */
+            if (label_letter(SDL_GetGamepadButtonLabel(g, (SDL_GamepadButton)i)) < 0) labels = 0;
+        if (labels) return label_letter(SDL_GetGamepadButtonLabel(g, (SDL_GamepadButton)b));
+    }
+    return pos[b];
+}
 static dpk_action pad_action(SDL_Gamepad *g, int b) {
-    int letter = -1;                                      /* 0 A, 1 B, 2 X, 3 Y */
     if (b <= SDL_GAMEPAD_BUTTON_NORTH) {
-        static const int pos[4] = {1, 0, 3, 2};           /* south B, east A, west Y, north X */
-        letter = pos[b];
-        if (g && SDL_GetGamepadType(g) == SDL_GAMEPAD_TYPE_GAMECUBE) {
-            SDL_GamepadButtonLabel l = SDL_GetGamepadButtonLabel(g, (SDL_GamepadButton)b);
-            letter = l == SDL_GAMEPAD_BUTTON_LABEL_A ? 0 : l == SDL_GAMEPAD_BUTTON_LABEL_B ? 1 : l == SDL_GAMEPAD_BUTTON_LABEL_X ? 2
-                   : l == SDL_GAMEPAD_BUTTON_LABEL_Y ? 3 : letter;
-        }
         static const dpk_action act[4] = {DPK_CONFIRM, DPK_BACK, DPK_USE_HERE, DPK_PLACES};
-        return act[letter];
+        return act[pad_letter(g, b)];
     }
     switch (b) {
     case SDL_GAMEPAD_BUTTON_DPAD_UP: return DPK_UP;
@@ -132,6 +152,7 @@ static void event(dpk_state *s, SDL_Renderer *ren, SDL_Event *ev) {
         int i = pad_slot(ev->gbutton.which);
         dpk_action a = pad_action(i >= 0 ? g_pad[i] : NULL, ev->gbutton.button);
         if (a == DPK_NONE) break;
+        s->pad_south_a = pad_letter(i >= 0 ? g_pad[i] : NULL, SDL_GAMEPAD_BUTTON_SOUTH) == 0;   /* the hints show this pad's face */
         if (ev->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) dpk_press(s, a, now); else dpk_release(s, a);
         break;
     }

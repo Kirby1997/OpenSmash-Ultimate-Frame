@@ -96,11 +96,12 @@ static void picture(const char *name, SDL_Renderer *ren, const uint32_t *px, int
 
 /* ---- input as a player gives it */
 static SDL_Joystick *g_vj;
+static Uint16 g_vj_vid = 0x1209, g_vj_pid = 0x5b5b;          /* a pad of no known kind: the Nintendo positions */
 static void pad_attach(void) {
     SDL_VirtualJoystickDesc d;
     SDL_INIT_INTERFACE(&d);
     d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
-    d.vendor_id = 0x1209; d.product_id = 0x5b5b;
+    d.vendor_id = g_vj_vid; d.product_id = g_vj_pid;
     d.naxes = SDL_GAMEPAD_AXIS_COUNT; d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
     d.name = "Picker test pad";
     SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
@@ -211,6 +212,22 @@ static void run2(void *ctx, void *window, void *renderer, dpk_state *s, const ui
         break;
     case 2: pad_button(SDL_GAMEPAD_BUTTON_SOUTH, 0); CHECK(!s->result && s->screen == DPK_SCR_STATUS); g_wait = 2; g_step++; break;
     case 3: pad_button(SDL_GAMEPAD_BUTTON_START, 1); g_step++; break;      /* + confirms too */
+    }
+}
+/* ---- run 2b: the same with a DualSense (054c:0ce6): printed letters, Circle (right) = B does nothing, Cross (bottom) = A starts */
+static void run2b(void *ctx, void *window, void *renderer, dpk_state *s, const uint32_t *px, int w, int h, int frame) {
+    (void)ctx; (void)window; (void)renderer; (void)px; (void)w; (void)h;
+    if (frame > 2000) { SDL_Event q; SDL_zero(q); q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); CHECK(0); return; }
+    if (g_wait > 0) { g_wait--; return; }
+    switch (g_step) {
+    case 0: pad_attach(); g_wait = 5; g_step++; break;
+    case 1: pad_button(SDL_GAMEPAD_BUTTON_EAST, 1); g_wait = 2; g_step++; break;
+    case 2:
+        pad_button(SDL_GAMEPAD_BUTTON_EAST, 0);
+        CHECK(!s->result && s->screen == DPK_SCR_STATUS && s->device == DPK_DEV_PAD && s->pad_south_a);
+        g_wait = 2; g_step++;
+        break;
+    case 3: pad_button(SDL_GAMEPAD_BUTTON_SOUTH, 1); g_step++; break;
     }
 }
 /* ---- run 3: fonts missing: pictured, then the window's close button */
@@ -347,6 +364,13 @@ int main(int argc, char **argv) {
     dpk_sdl_test t2 = {run2, NULL};
     rc = datapicker_sdl_run(&r, 1, &t2);
     CHECK(rc == 0);
+    SECTION("SDL run 2b: the same with a DualSense: Circle (right) = B nothing, Cross (bottom) = A = start -> 0");
+    g_step = g_wait = 0;
+    g_vj = NULL; g_vj_vid = 0x054c; g_vj_pid = 0x0ce6;
+    dpk_sdl_test t2b = {run2b, NULL};
+    rc = datapicker_sdl_run(&r, 1, &t2b);
+    CHECKF(rc == 0, "run 2b returned %d at step %d", rc, g_step);
+    g_vj_vid = 0x1209; g_vj_pid = 0x5b5b;
     SECTION("SDL run 3 and 4: fonts missing pictured; the window closed / SDL_EVENT_QUIT -> -1 (the player quit)");
     setenv("SSBU_DATA", P("home/Games/dump_nofonts"), 1);
     dp_check("13.0.4", &r);
