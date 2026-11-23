@@ -13,6 +13,8 @@ import struct
 import sys
 import collections
 
+import jumptables
+
 # Relative to the current directory, as before (was the Windows-only literal r'..\binaries\13.0.4\main.elf').
 # RECOMP_ELF overrides it; RECOMP_BIN (scripts/setup.py) names the folder that holds main.elf.
 ELF = os.environ.get('RECOMP_ELF') or (os.path.join(os.environ['RECOMP_BIN'], 'main.elf') if os.environ.get('RECOMP_BIN') else os.path.join('..', 'binaries', '13.0.4', 'main.elf'))
@@ -1047,9 +1049,7 @@ def lift_function(env, entry):
         out.append('L_%x: %s' % (pc, stmt))
     out.append('  f_%x(c); return;' % end if end < BASE + TEXT_SIZE and not lines[-1][1].startswith(('return;', 'goto', '{ jt', '{ f_', '{ imp_', '{ h_')) else '  return;')
     if fn.has_br:
-        out.append('L_dispatch: switch (jt) {')
-        out.extend('  case 0x%xULL: goto L_%x;' % (pc, pc) for pc, _ in lines)
-        out.append('  default: call_indirect(c, jt); return; }')
+        out.extend(jumptables.dispatch(sys.modules[__name__], entry, end, lines))     # the full switch unless RECOMP_JT=1
     out.append('}')
     if lines and not lines[-1][1].startswith(('return;', 'goto', '{ jt', '{ f_', '{ imp_', '{ h_')) and end < BASE + TEXT_SIZE:
         env.wanted.setdefault(end, None)

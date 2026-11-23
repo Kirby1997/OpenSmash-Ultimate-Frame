@@ -1048,7 +1048,10 @@ def step_tables(cx):
 
 
 def step_lift(cx):
-    out = cx.run('lift', [sys.executable, 'recomp_eh.py', 'gen_eh_o2', str(cx.lift_jobs)])
+    # the br dispatch (tools/lifter/jumptables.py): 0 every instruction a case (as always), 1 the proven jump-table
+    # targets only, 2 also tail calls through a loaded pointer; kept in state.json (--jumptables)
+    jt = cx.state.get('jumptables', 0)
+    out = cx.run('lift', [sys.executable, 'recomp_eh.py', 'gen_eh_o2', str(cx.lift_jobs)], env=cx.env(RECOMP_JT=str(jt)))
     n = len([f for f in os.listdir(os.path.join(cx.work, 'gen_eh_o2')) if f.endswith('.c')])
     say('  main lifted into gen_eh_o2: %d C files (%.0f MB)' % (n, disk_mb(os.path.join(cx.work, 'gen_eh_o2'))))
 
@@ -1357,6 +1360,9 @@ def main():
                                       'and neither MSVC, the Windows SDK, SDL3, Vulkan-Headers, glslang nor suyu is needed')
     ap.add_argument('--runtime-any-tree', action='store_true', help='use a runtime package made from another version of the sources')
     ap.add_argument('--nocrt', action='store_true', help='build the game libraries with LLVM alone (the exe is still built here)')
+    ap.add_argument('--jumptables', type=int, choices=(0, 1, 2), help='the br dispatch of the lifted game '
+                    '(tools/lifter/jumptables.py): 0 a case per instruction (default, as before), 1 only the proven '
+                    'jump-table targets, 2 also tail calls through a loaded pointer; remembered by the build folder')
     ap.add_argument('--redo', help='repeat this step')
     ap.add_argument('--from', dest='from_step', help='repeat this step and all after it')
     ap.add_argument('--rollback', action='store_true', help='not needed any more (kept so older command lines still work): online '
@@ -1407,6 +1413,12 @@ def main():
                 'Protection history): it is made again' % (', '.join(gone), cx.work))
             for s in ('compile', 'link', 'check'):
                 done.pop(s, None)
+    if a.jumptables is not None and cx.state.get('jumptables', 0) != a.jumptables:
+        say('--jumptables %d (the build folder had %d): the lift and every step after it run again (only the C files '
+            'that change are compiled again)' % (a.jumptables, cx.state.get('jumptables', 0)))
+        cx.state['jumptables'] = a.jumptables
+        for s in STEPS[STEPS.index('lift'):]:
+            done.pop(s, None)
     if getattr(a, 'rollback', False):
         say('--rollback: not needed any more: online rollback runs on the normal build (no second game DLL, no second set of '
             'script modules); the option is ignored')
