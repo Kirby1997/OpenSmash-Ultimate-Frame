@@ -153,6 +153,21 @@ void display_perf_thread(void) {
     if (g_pc_on && g_pc_n > 0) SetThreadSelectedCpuSets(GetCurrentThread(), g_pc_ids, (ULONG)g_pc_n);
 #endif
 }
+#if defined(__linux__)
+/* Linux: sleep with clock_nanosleep to SSBU_VSYNC_SPIN_US (200 us) before the target, spin only that (vsync_wait.h; the
+ * old way spun the last 0.5 ms plus the sleep's lateness, 6 % of the game's CPU samples on the Frame). */
+#include <sys/prctl.h>
+#include "vsync_wait.h"
+static long long g_vw_spin = -1;                     /* ns; read once (the vsync thread's start, or the first lat_release) */
+static VwStats g_vw;                                 /* the vsync thread's own waits only */
+static void vw_wait_qpc(LONGLONG target, VwStats *st) {
+    if (g_vw_spin < 0) g_vw_spin = vw_spin_ns_from(getenv("SSBU_VSYNC_SPIN_US"));
+    vw_wait_until_ns(vw_qpc_to_ns(target, g_freq.QuadPart), g_vw_spin, st);
+}
+static void precise_wait_until(LONGLONG target, HANDLE timer) { (void)timer; vw_wait_qpc(target, NULL); }
+#define VSYNC_WAIT(target, timer) (vw_wait_qpc((target), &g_vw), (void)(timer))
+#else
+#define VSYNC_WAIT(target, timer) precise_wait_until((target), (timer))
 static void precise_wait_until(LONGLONG target, HANDLE timer) {
     LARGE_INTEGER now, due;
     QueryPerformanceCounter(&now);
@@ -162,6 +177,7 @@ static void precise_wait_until(LONGLONG target, HANDLE timer) {
     if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
     for (QueryPerformanceCounter(&now); now.QuadPart < target; QueryPerformanceCounter(&now)) YieldProcessor();
 }
+#endif
 #ifndef _WIN32
 /* Linux build: no vblank source yet (D3DKMT is Windows); vsync = auto / display then run on our own 60 Hz clock, as on a
  * Windows PC without one */
@@ -733,6 +749,15 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         LONG64 vb_last = 0;
         pace_options();
         display_perf_thread();
+#if defined(__linux__)
+        {   long slack = vw_slack_ns_from(getenv("SSBU_VSYNC_SLACK_NS"));
+            int ok = !slack || prctl(PR_SET_TIMERSLACK, (unsigned long)slack, 0, 0, 0) == 0;
+            if (g_vw_spin < 0) g_vw_spin = vw_spin_ns_from(getenv("SSBU_VSYNC_SPIN_US"));
+            printf("display: vsync thread sleeps to %lld us before each tick, then spins (SSBU_VSYNC_SPIN_US); timer slack %ld ns%s%c",
+                   g_vw_spin / 1000, slack ? slack : (long)prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0), slack ? (ok ? " (SSBU_VSYNC_SLACK_NS)" : " NOT SET (prctl failed)") : " (the system's)", 10);
+        }
+        VwStats vw_last = g_vw;
+#endif
         for (;;) {
             if (g_pace_want && !lock_tried && g_vb_state == 2) {                  /* session 14: the refresh is measured: lock to it or not */
                 lock_tried = 1;
@@ -757,14 +782,14 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 }
                 LONG64 extra = (vc - vb_target) / k;                               /* whole game frames this thread slept through */
                 vb_last = vb_target + extra * k;
-                precise_wait_until(vq - (LONGLONG)((double)(vc - vb_last) * period) + (LONGLONG)(period * g_lock_phase), timer);
+                VSYNC_WAIT(vq - (LONGLONG)((double)(vc - vb_last) * period) + (LONGLONG)(period * g_lock_phase), timer);
                 if (extra) InterlockedExchangeAdd64(&g_vsync_late, extra);
                 n += 1 + extra;
                 t0.QuadPart = 0;
             } else {
             if (!t0.QuadPart) { QueryPerformanceCounter(&now); t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / 60; }
             LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / 60;       /* no accumulated rounding */
-            precise_wait_until(target, timer);
+            VSYNC_WAIT(target, timer);
             QueryPerformanceCounter(&now);
             LONG64 passed = (now.QuadPart - t0.QuadPart) * 60 / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
             if (passed < n + 1) passed = n + 1;
@@ -779,6 +804,15 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
             { LONG64 dt = g_defer_target; if (dt && n >= dt) nvn_front_post_present_flush(); }      /* session 14: the frame kept for this tick goes to the window now */
             WakeAllConditionVariable(&g_vsync_cv);
             vsync_test_key();
+#if defined(__linux__)
+            if (g_vw.waits - vw_last.waits >= 3600) {        /* once a minute: how the waits went (vsync_wait.h) */
+                long long w = g_vw.waits - vw_last.waits, s = g_vw.sleeps - vw_last.sleeps, l = g_vw.late - vw_last.late;
+                printf("display: vsync wait (last %lld ticks): %lld slept, %lld woke after the tick (%.2f %%, the latest %.0f us; budget %lld us), spin %.0f us a tick on average%c",
+                       w, s, l, s ? 100.0 * (double)l / (double)s : 0.0, (double)g_vw.late_max_ns / 1000.0, g_vw_spin / 1000, (double)(g_vw.spin_ns - vw_last.spin_ns) / 1000.0 / (double)w, 10);
+                g_vw.late_max_ns = 0;
+                vw_last = g_vw;
+            }
+#endif
         }
     }
     for (;;) {
@@ -1320,6 +1354,10 @@ void display_pace(void) {
 void display_report(FILE *out) {
     fprintf(out, "\ndisplay: %lld frames presented\n", (long long)g_frames);
     fprintf(out, "display: %s; %lld vsync signals, %lld refreshes slept through by the vsync thread\n", old_pacing() ? "old pacing (SSBU_OLD_PACING=1: two clocks)" : "one refresh clock", (long long)g_vsync_signals, (long long)g_vsync_late);
+#if defined(__linux__)
+    if (g_vw.waits) fprintf(out, "display: vsync waits %lld, %lld slept, %lld woke after the tick (budget %lld us, SSBU_VSYNC_SPIN_US), spin %.0f us a tick on average\n",
+                            g_vw.waits, g_vw.sleeps, g_vw.late, g_vw_spin / 1000, (double)g_vw.spin_ns / 1000.0 / (double)g_vw.waits);
+#endif
     if (g_pc_n > 0) fprintf(out, "display: the game's thread was on an EFFICIENCY core at %lld of %lld presents (%s)\n", (long long)g_pc_frames_slow, (long long)g_pc_frames, g_pc_on ? "performance cores asked for" : "SSBU_PCORES=0: left to the system");
     if (g_vb_state == 2) {
         fprintf(out, "display: refresh %.3f Hz measured; %s; presents held for their tick %lld, late frames presented at once %lld\n", (double)g_freq.QuadPart / g_vb_period,
