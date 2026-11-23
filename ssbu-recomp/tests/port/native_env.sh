@@ -28,7 +28,7 @@ nat_stubs() {
     {
         echo 'int dprintf(int, const char *, ...); void abort(void);'
         if [ -n "$_pat" ]; then
-            nm -u "$@" | sed -E -n "s/^ *(U +)?${NAT_SYM_PREFIX:-}(($_pat)_[A-Za-z0-9_]+)\$/void \\2(void) { dprintf(2, \"stub called: \\2\\\\n\"); abort(); }/p" | sort -u
+            nm -u "$@" | sed -E -n "s/^ *(U +)?${NAT_SYM_PREFIX:-}(($_pat)_[A-Za-z0-9_]+)\$/void \\2(void) { dprintf(2, \"stub called: \\2\\\\n\"); abort(); }/p" | sed -E 's/^void (EVP_Digest|EVP_sha256)\(void\) .*/long \1(void) { return 0; }             \/* the SHA-256 fails over to its C rounds *\//' | sort -u
         fi
     } > "$_out"
 }

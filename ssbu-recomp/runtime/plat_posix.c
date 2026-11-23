@@ -33,6 +33,7 @@
 #endif
 #include <sys/ioctl.h>
 #include <SDL3/SDL.h>
+#include <openssl/evp.h>                        /* the CryptoAPI subset and the bcrypt shim's SHA-256 */
 #include <sys/random.h>
 #include <signal.h>
 #include <pwd.h>
@@ -2597,7 +2598,7 @@ BOOL FindNextFileA(HANDLE h, WIN32_FIND_DATAA *fd) { return find_next(h, fd); }
 BOOL FindClose(HANDLE h) { if (!is_obj(h)) return FALSE; obj_release(h); return TRUE; }
 
 /* ================================================================ modules */
-/* bcrypt.dll: nnro.c asks it for SHA-256; this is the one Windows DLL with no Linux library behind it. */
+/* bcrypt.dll: nnro.c asks it for SHA-256; OpenSSL's libcrypto (sha256 below), with C rounds of its own as the fallback. */
 typedef struct { uint32_t h[8]; uint64_t n; uint8_t buf[64]; } Sha256;
 static const uint32_t K256[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -2622,7 +2623,7 @@ static void sha_block(Sha256 *s, const uint8_t *p) {
     }
     s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
 }
-static void sha256(const uint8_t *p, size_t n, uint8_t out[32]) {
+static void sha256_c(const uint8_t *p, size_t n, uint8_t out[32]) {
     Sha256 s = {{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}, 0, {0}};
     size_t i = 0;
     for (; i + 64 <= n; i += 64) sha_block(&s, p + i);
@@ -2636,6 +2637,14 @@ static void sha256(const uint8_t *p, size_t n, uint8_t out[32]) {
     sha_block(&s, t);
     if (tl == 128) sha_block(&s, t + 64);
     for (int k = 0; k < 8; k++) { out[k * 4] = (uint8_t)(s.h[k] >> 24); out[k * 4 + 1] = (uint8_t)(s.h[k] >> 16); out[k * 4 + 2] = (uint8_t)(s.h[k] >> 8); out[k * 4 + 3] = (uint8_t)s.h[k]; }
+}
+/* OpenSSL picks the CPU's SHA-256 instructions at run time (Armv8 SHA2 on the Steam Frame, SHA-NI on x86-64, Apple silicon): several
+ * times the C rounds above. nn::ro::LoadModule (nnro.c) hashes every module image on the game's main thread, 1.2-3.3 MB per fighter
+ * and four to six fighters when a fight is set up. The C rounds stay as the fallback should OpenSSL fail. */
+static void sha256(const uint8_t *p, size_t n, uint8_t out[32]) {
+    unsigned int len = 0;
+    if (EVP_Digest(p, n, out, &len, EVP_sha256(), NULL) == 1 && len == 32) return;
+    sha256_c(p, n, out);
 }
 static LONG bc_open(void **alg, LPCWSTR id, LPCWSTR impl, ULONG flags) { (void)id; (void)impl; (void)flags; *alg = (void *)1; return 0; }
 static LONG bc_hash(void *alg, uint8_t *secret, ULONG ns, const uint8_t *in, ULONG n, uint8_t *out, ULONG nout) {
@@ -3052,7 +3061,6 @@ int GetUserDefaultLocaleName(LPWSTR out, int n) { char tag[64]; locale_tag(tag, 
 
 /* ================================================================ CryptoAPI subset (plat/wincrypt.h) on OpenSSL */
 #include "plat/wincrypt.h"
-#include <openssl/evp.h>
 BOOL CryptAcquireContextA(HCRYPTPROV *prov, LPCSTR container, LPCSTR provider, DWORD type, DWORD flags) { (void)container; (void)provider; (void)type; (void)flags; *prov = 1; return TRUE; }
 BOOL CryptReleaseContext(HCRYPTPROV prov, DWORD flags) { (void)prov; (void)flags; return TRUE; }
 BOOL CryptGenRandom(HCRYPTPROV prov, DWORD n, BYTE *buf) { (void)prov; return SystemFunction036(buf, n); }

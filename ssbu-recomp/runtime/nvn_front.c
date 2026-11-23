@@ -662,6 +662,7 @@ static void render_loop(void) {
             if (g_rb->idle) g_rb->idle();
             g_hitch_rt = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? "submitted commands (outside the named scopes)" : j->fn == g_rb->present ? "present (blit)" : j->fn == g_rb->sync_wait ? "SyncWait job" : "other job (texel read/write, finish, barrier, ...)";
             j->fn(j->arg);                       /* a member of g_rb (seam step S2), or a job of the front end / of the back end itself */
+            if (g_rb == &rb_vk) nvn_vk_cb_publish();     /* before the job counts as done (nvn_front_memory_retire reads it) */
             g_hitch_rt = "idle";
             if (done) SetEvent(done); else { free(j); InterlockedDecrement(&g_async_pending); }      /* gl_post: nobody waits */
         }
@@ -2149,7 +2150,15 @@ void nvn_render_run(void (*fn)(void *), void *arg) { gl_run(fn, arg); }
  * alone is not enough on Vulkan: kept compute buffers and asynchronous landings outlive the jobs that used them. */
 void nvn_front_memory_retire(uint64_t addr, uint64_t size) {
     if (!addr || !size || !g_render_tid) return;
-    if (g_rb == &rb_vk) { Range range = {addr, size}; gl_run(nvn_vk_memory_retire, &range); }
+    if (g_rb == &rb_vk) {
+        /* Nothing to drain when no posted job is outstanding (every job issued before this call, by this thread or by one the
+         * game ordered before it, has run and published its CBs) and no CB meets the range: nvn_vk_memory_retire would find
+         * nothing. Submits are posted only with gl_async_on; SSBU_VK_RETIRE_SYNC=1 always takes the round trip. */
+        static int sync = -1;
+        if (sync < 0) sync = getenv("SSBU_VK_RETIRE_SYNC") && atoi(getenv("SSBU_VK_RETIRE_SYNC"));
+        if (!sync && gl_async_on() && GetCurrentThreadId() != g_render_tid && !__atomic_load_n(&g_async_pending, __ATOMIC_ACQUIRE) && !nvn_vk_cb_may_overlap(addr, size)) return;
+        Range range = {addr, size}; gl_run(nvn_vk_memory_retire, &range);
+    }
     else gl_barrier();
 }
 
