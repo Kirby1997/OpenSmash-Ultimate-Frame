@@ -60,8 +60,8 @@ Steam's Exit closes the game cleanly: it sends SIGTERM, and the game treats that
 ### The Frame's buttons
 
 `layout = auto` is the default in `build-linux-arm64/config/controllers.ini` (written on the first start). On the
-Frame's own pads it follows the printed letters: the A button acts as A. So do Valve's other pads and GameCube
-controllers. Other pads (an Xbox pad, say) stay positional:
+Frame's own pads it follows the printed letters: the A button acts as A. So do Valve's other pads, Xbox pads, GameCube
+controllers and PlayStation pads (Cross = A, Circle = B, Square = X, Triangle = Y). Switch and other pads stay positional:
 the button in Nintendo's A position acts as A, whatever is printed on it. To force one way for every pad, set this:
 
 ```ini

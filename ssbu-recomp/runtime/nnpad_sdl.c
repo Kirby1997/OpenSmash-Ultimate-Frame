@@ -142,8 +142,9 @@ static const char *const g_default_ini =
 "\r\n"
 "[general]\r\n"
 "; Face buttons. positional = the button in Nintendo's A position (right) acts as A: right = A, bottom = B, top = X, left = Y.\r\n"
-";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers and for Valve's own\r\n"
-";   pads (Steam Frame controllers, Steam Deck, Steam Controller; also through Steam Input), positional otherwise (Xbox pads too).\r\n"
+";   labels = the printed letter decides (an Xbox pad's A is Pro A; PlayStation: Cross = A, Circle = B, Square = X, Triangle = Y).\r\n"
+";   auto = labels for Xbox, PlayStation and GameCube controllers and for Valve's own pads (Steam Frame controllers, Steam Deck,\r\n"
+";   Steam Controller; also through Steam Input), positional otherwise (Switch and other pads).\r\n"
 "layout = auto\r\n"
 "; Radial dead zone and outer zone of the sticks (fractions of full travel): inside the dead zone nothing, beyond the outer\r\n"
 "; zone full deflection; the stick is rescaled in between and its length is limited to 1 (circular gate).\r\n"
@@ -389,13 +390,17 @@ static float eff_f(const Dev *d, size_t off, float def) {
 static int eff_layout(const Dev *d) {
     const DevCfg *c = dev_cfg(d), *t = type_cfg(d);
     int l = c && c->layout >= 0 ? c->layout : t->layout >= 0 ? t->layout : g_cfg.def.layout;
-    /* auto: positional keeps a Switch player's hands where they are used to (an Xbox pad's B, at the right, is Pro A), except on
-     * GameCube controllers and on Valve's own pads whose bottom button is labelled A (valve_abxy, set in dev_add): the Steam
-     * Frame's controllers, Steam Deck, Steam Controller. Those are the device's own controls, where SteamOS and every other game
-     * confirm with the A at the bottom. Through Steam Input (a game Steam starts sees each pad as Steam's virtual pad 28de:11ff)
-     * SDL reports the real pad's vendor from Steam's virtualgamepadinfo: the Frame's are 28de:11e0 "Steam Frame Controllers",
-     * type unknown to SDL; an Xbox pad through Steam stays Microsoft's and positional, a PlayStation or Switch pad stays positional. */
-    if (l == 2) l = d->gtype == SDL_GAMEPAD_TYPE_GAMECUBE || d->valve_abxy;
+    /* auto: the printed letters on pads whose confirm button is at the bottom everywhere else on a PC (SteamOS, Steam, other
+     * games): Xbox pads, PlayStation pads (label_letter: Cross = A, Circle = B, Square = X, Triangle = Y), GameCube controllers
+     * and Valve's own pads whose bottom button is labelled A (valve_abxy, set in dev_add: the Steam Frame's controllers, Steam
+     * Deck, Steam Controller). Switch pads (Pro Controller, Joy-Con) and any other pad stay positional: a Switch pad's letters
+     * are in the Nintendo positions anyway, and what SDL reports for an unknown pad is a guess. This is a choice: the default
+     * used to keep a Switch player's hands where they are used to on Xbox and PlayStation pads too (the button at the right is
+     * Pro A); layout = positional in [general], [type xbox|playstation] or [device GUID] brings that back. Through Steam Input
+     * (a game Steam starts sees each pad as Steam's virtual pad 28de:11ff) SDL reports the real pad's vendor and type from
+     * Steam's virtualgamepadinfo: the Frame's are 28de:11e0 "Steam Frame Controllers", type unknown to SDL; an Xbox,
+     * PlayStation or Switch pad through Steam keeps its own type. */
+    if (l == 2) { int t = dev_type(d); l = t == 0 || t == 1 || t == 3 || d->valve_abxy; }
     return l;
 }
 static int eff_rumble(const Dev *d) { const DevCfg *c = dev_cfg(d), *t = type_cfg(d); return c && c->rumble >= 0 ? c->rumble : t->rumble >= 0 ? t->rumble : g_cfg.def.rumble; }
@@ -470,7 +475,7 @@ static void dev_add(SDL_JoystickID id) {
     d->slot = assign_slot(d);
     if (d->slot >= 0) { remember(d->guid, d->slot); apply_player_index(d); }
     say("nn::pad: connected \"%s\" (%s, %s%s%s) GUID %s -> %s", d->name, d->gp ? "gamepad" : "joystick WITHOUT mapping (guessed layout)", d->gp ? type_name(d->gtype) : "raw",
-        d->has_gyro ? ", gyro" : "", d->valve_abxy ? ", Valve pad: layout auto = labels" : "", d->guid, d->slot >= 0 ? "player " : "no free slot\n");
+        d->has_gyro ? ", gyro" : "", d->gp && eff_layout(d) == 1 ? ", face buttons by printed label" : "", d->guid, d->slot >= 0 ? "player " : "no free slot\n");
     if (d->slot >= 0) say("%d\n", d->slot + 1);
 }
 static void dev_remove(Dev *d) {
@@ -572,17 +577,27 @@ static float src_val(const Dev *d, Src s) {
     return 0;
 }
 static Src mk(int kind, int idx, int raw) { Src s; s.kind = (unsigned char)kind; s.raw = (unsigned char)raw; s.idx = (short)idx; return s; }
+/* the Pro face button (0 A, 1 B, 2 X, 3 Y) a printed label stands for, -1 none. PlayStation symbols count as the Xbox letters
+ * in the same place, as Steam Input and PC games read them: Cross = A, Circle = B, Square = X, Triangle = Y */
+static int label_letter(SDL_GamepadButtonLabel l) {
+    switch (l) {
+    case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return 0;
+    case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return 1;
+    case SDL_GAMEPAD_BUTTON_LABEL_X: case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return 2;
+    case SDL_GAMEPAD_BUTTON_LABEL_Y: case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return 3;
+    default: return -1;
+    }
+}
 static int def_map(const Dev *d, int labels, int b, Src *o) {          /* the built-in default sources of a Pro button */
     int n = 0;
     if (d->gp) {
         static const int face[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
         static const int pos[4] = {1, 0, 3, 2};                         /* south -> B, east -> A, west -> Y, north -> X */
+        for (int i = 0; i < 4 && labels; i++)                           /* a face SDL does not fully label: by position, so no letter is doubled */
+            if (label_letter(SDL_GetGamepadButtonLabel(d->gp, (SDL_GamepadButton)face[i])) < 0) labels = 0;
         for (int i = 0; i < 4; i++) {
             int target = d->gca ? i : pos[i];                           /* the adapter's pads: south A, east B, west X, north Y (nnpad_gca.c), whatever SDL labels say */
-            if (labels && !d->gca) {
-                SDL_GamepadButtonLabel l = SDL_GetGamepadButtonLabel(d->gp, (SDL_GamepadButton)face[i]);
-                target = l == SDL_GAMEPAD_BUTTON_LABEL_A ? 0 : l == SDL_GAMEPAD_BUTTON_LABEL_B ? 1 : l == SDL_GAMEPAD_BUTTON_LABEL_X ? 2 : l == SDL_GAMEPAD_BUTTON_LABEL_Y ? 3 : pos[i];
-            }
+            if (labels && !d->gca) target = label_letter(SDL_GetGamepadButtonLabel(d->gp, (SDL_GamepadButton)face[i]));
             if (target == b) o[n++] = mk(SK_BTN, face[i], 0);
         }
         switch (b) {
@@ -924,8 +939,9 @@ static void print_devices(void) {
         const Dev *d = &g_dev[i];
         if (!d->used) continue;
         if (d->ignored) { printf("  (ignored) \"%s\" GUID %s\n", d->name, d->guid); continue; }
-        printf("  player %d: \"%s\"\n    GUID %s   type %s   SDL mapping: %s   buttons %d axes %d hats %d   %s%s%s\n", d->slot + 1, d->name, d->guid,
-               d->gp ? type_name(d->gtype) : "raw joystick", d->gp ? "yes" : "NO (guessed layout; use --pad-map)", d->nbtn, d->naxes, d->nhats,
+        printf("  player %d: \"%s\"\n    GUID %s   type %s   SDL mapping: %s   face buttons: %s   buttons %d axes %d hats %d   %s%s%s\n", d->slot + 1, d->name, d->guid,
+               d->gp ? type_name(d->gtype) : "raw joystick", d->gp ? "yes" : "NO (guessed layout; use --pad-map)", !d->gp ? "guessed" : eff_layout(d) == 1 ? "labels" : "positional",
+               d->nbtn, d->naxes, d->nhats,
                d->wireless ? "wireless" : "wired/unknown", d->has_gyro ? "   gyro+accel" : "", d->gp && SDL_GetBooleanProperty(SDL_GetGamepadProperties(d->gp), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ? "   rumble" : "");
     }
 }
@@ -1221,9 +1237,9 @@ int nnpad_selftest(const NnHidHooks *h) {
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
     }
 
-    /* ---- layout auto by kind of pad (default controllers.ini): Valve's own pads with A at the bottom take the printed letters,
-     * everything else keeps positions. The real Steam Frame controllers under Steam: 28de:11e0 "Steam Frame Controllers", type
-     * unknown, Xbox face (SDL labels south A) */
+    /* ---- layout auto by kind of pad (default controllers.ini): Xbox, PlayStation and Valve's own pads with A at the bottom take
+     * the printed letters (PlayStation: Cross = A, Circle = B, Square = X, Triangle = Y), Switch and other pads keep positions.
+     * The real Steam Frame controllers under Steam: 28de:11e0 "Steam Frame Controllers", type unknown, Xbox face (SDL labels south A) */
     {
         static const struct { Uint16 vid, pid; const char *name, *type_hint; int labels; SDL_GamepadButtonLabel south; const char *what; } k[] = {
             {0x28DE, 0x11E0, "Steam Frame Controllers", NULL, 1, SDL_GAMEPAD_BUTTON_LABEL_A,
@@ -1232,8 +1248,12 @@ int nnpad_selftest(const NnHidHooks *h) {
              "layout auto, Steam Deck controls (Valve 28de:1205): printed letters"},
             {0x28DE, 0x11FF, "Selftest Valve pad, Nintendo face", "0x28de/0x11ff=SwitchPro", 0, SDL_GAMEPAD_BUTTON_LABEL_B,
              "layout auto, a Valve vendor id with a Nintendo face (SDL labels south B): stays positional"},
-            {0x045E, 0x028E, "Xbox 360 Controller", NULL, 0, SDL_GAMEPAD_BUTTON_LABEL_A,
-             "layout auto, Xbox 360 pad (Microsoft 045e:028e, south labelled A): stays positional as before, east = A, south = B"},
+            {0x045E, 0x028E, "Xbox 360 Controller", NULL, 1, SDL_GAMEPAD_BUTTON_LABEL_A,
+             "layout auto, Xbox 360 pad (Microsoft 045e:028e, south labelled A): printed letters (positional before), south = A, east = B"},
+            {0x054C, 0x0CE6, "DualSense Wireless Controller", NULL, 1, SDL_GAMEPAD_BUTTON_LABEL_CROSS,
+             "layout auto, DualSense (Sony 054c:0ce6, south labelled Cross): Cross = A, Circle = B, Square = X, Triangle = Y"},
+            {0x054C, 0x09CC, "DualShock 4", NULL, 1, SDL_GAMEPAD_BUTTON_LABEL_CROSS,
+             "layout auto, DualShock 4 (Sony 054c:09cc): Cross = A, Circle = B, Square = X, Triangle = Y"},
             {0x057E, 0x2009, "Pro Controller", NULL, 0, SDL_GAMEPAD_BUTTON_LABEL_B,
              "layout auto, Switch Pro Controller (057e:2009): positional, east = A (labels would give the same)"},
         };
@@ -1278,6 +1298,17 @@ int nnpad_selftest(const NnHidHooks *h) {
                 vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
                 SDL_SetJoystickVirtualButton(vjs, SDL_GAMEPAD_BUTTON_SOUTH, true); settle(); h->state((uint32_t)p, &btn, st, &attr);
                 check(btn == 1ull << 0, "default controllers.ini written back: layout auto, south = A on the Steam Frame controllers again");
+            }
+            if (k[i].pid == 0x0CE6 && p > 0) {      /* the way back to positions on a PlayStation pad: layout = positional in [type playstation] */
+                char text[256];
+                snprintf(text, sizeof text, "[general]\r\nlayout = auto\r\n[keyboard]\r\nplayer = none\r\n[type playstation]\r\nlayout = positional\r\n");
+                Sleep(1100); write_text(path, text); Sleep(1100); nnpad_poll(1);
+                vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
+                SDL_SetJoystickVirtualButton(vjs, SDL_GAMEPAD_BUTTON_SOUTH, true); settle(); h->state((uint32_t)p, &btn, st, &attr); ok = btn == 1ull << 1;
+                vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
+                SDL_SetJoystickVirtualButton(vjs, SDL_GAMEPAD_BUTTON_EAST, true); settle(); h->state((uint32_t)p, &btn, st, &attr);
+                check(ok && btn == 1ull << 0, "layout = positional in [type playstation] wins over auto on a DualSense: Cross = B, Circle = A");
+                Sleep(1100); write_text(path, g_default_ini); Sleep(1100); nnpad_poll(1);
             }
             vj_clear(vjs, SDL_GAMEPAD_BUTTON_COUNT, 6);
             SDL_CloseJoystick(vjs);

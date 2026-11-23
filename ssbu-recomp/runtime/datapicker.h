@@ -11,7 +11,9 @@
  * the canvas; the tests (tests/port/picker) drive the same calls with synthetic input and read the canvas back.
  *
  * Controls follow the in-game settings menu (Dear ImGui navigation, upstream menu.cpp) and the game's own pad layout
- * (nnpad_sdl.c "positional": the button in the Nintendo A position, on the right, confirms; the bottom one, B, goes back):
+ * (nnpad_sdl.c "auto": on Switch and other pads the button in the Nintendo A position, on the right, confirms and the bottom
+ * one, B, goes back; on Xbox, PlayStation and Valve pads the printed letters count, A / Cross at the bottom
+ * confirms; the positions below are the Nintendo ones):
  *   confirm  A (right face button) / Enter / Space / left click        back   B (bottom) / Esc / Backspace / right click
  *   move     d-pad / left stick / arrows / mouse                       page   L / R / Page Up / Page Down / wheel
  *   use this folder  X (top) / Ctrl+Enter     places  Y (left) / Tab   hidden files  - (Minus, View) / Ctrl+H
@@ -72,6 +74,7 @@ typedef struct dpk_state {
     uint32_t note_rgb;
     /* input */
     dpk_device device;
+    int pad_south_a;                /* the last pad used confirms with its bottom button (letters as printed, A at the bottom): the hints show that */
     dpk_action held;
     uint64_t next_repeat;
     char typed[32];

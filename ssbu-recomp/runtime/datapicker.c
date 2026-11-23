@@ -172,11 +172,12 @@ static void text_tail(const canvas *c, int x, int y, uint32_t rgb, const char *s
     text(c, x + 3 * DPK_CELL_W, y, 1, rgb, s, cols - 3);
 }
 /* the face buttons as a diamond, the one meant filled: 0 right (A), 1 bottom (B), 2 top (X), 3 left (Y) - Nintendo letters */
-static void face_icon(const canvas *c, int x, int y, int which, uint32_t on, uint32_t off) {
-    static const int pos[4][2] = {{8, 4}, {4, 8}, {4, 0}, {0, 4}};
+static void face_icon(const canvas *c, int x, int y, int which, int south_a, uint32_t on, uint32_t off) {
+    static const int pos[2][4][2] = {{{8, 4}, {4, 8}, {4, 0}, {0, 4}},        /* A right, B bottom, X top, Y left (Nintendo) */
+                                     {{4, 8}, {8, 4}, {0, 4}, {4, 0}}};       /* A bottom, B right, X left, Y top (Xbox, PlayStation) */
     for (int i = 0; i < 4; i++) {
-        if (i == which) fill(c, x + pos[i][0], y + pos[i][1], 3, 3, on);
-        else frame_rect(c, x + pos[i][0], y + pos[i][1], 3, 3, off);
+        if (i == which) fill(c, x + pos[south_a][i][0], y + pos[south_a][i][1], 3, 3, on);
+        else frame_rect(c, x + pos[south_a][i][0], y + pos[south_a][i][1], 3, 3, off);
     }
 }
 /* a key or button name in a box; returns its width */
@@ -760,7 +761,7 @@ typedef struct { int icon; const char *key, *what; } hint;      /* icon: 0-3 a f
 static void hints(dpk_state *s, const canvas *c, int y, const hint *h, int n) {
     int x = 12;
     for (int i = 0; i < n && x < c->w; i++) {
-        if (s->device == DPK_DEV_PAD && h[i].icon >= 0) { face_icon(c, x, y - 1, h[i].icon, C_TEXT, C_DIM); x += 15; }
+        if (s->device == DPK_DEV_PAD && h[i].icon >= 0) { face_icon(c, x, y - 1, h[i].icon, s->pad_south_a != 0, C_TEXT, C_DIM); x += 15; }
         else x += keycap(c, x, y, h[i].key, C_TEXT, C_SEP) + 4;
         x += text(c, x, y, 1, C_DIM, h[i].what, 0) * DPK_CELL_W + 14;
     }
