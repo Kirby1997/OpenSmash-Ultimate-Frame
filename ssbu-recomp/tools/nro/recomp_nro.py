@@ -177,8 +177,8 @@ def extended(n, option, shift):
 # The RT_* macros are defined per host in runtime.h (on x86-64 they keep the code this lifter produced before: nothing).
 def barrier(w):
     crm, op2 = bits(w, 11, 8), bits(w, 7, 5)
-    if op2 == 2:                                     # clrex: a later STXR must fail
-        return 'c->ex_addr = ~0ull;'
+    if op2 == 2:                                     # clrex: a later STXR must fail (RT_CLREX: runtime.h)
+        return 'RT_CLREX(c);'
     if op2 == 6:                                     # isb: no memory effect for the guest
         return 'RT_COMPILER_BARRIER();'
     if op2 == 4:                                     # dsb (any option): full barrier

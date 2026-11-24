@@ -21,7 +21,7 @@ uint32_t t_stx32(Ctx *c, uint64_t a, uint32_t v) { return stx32(c, a, v); }
 uint32_t t_stlx32(Ctx *c, uint64_t a, uint32_t v) { return stlx32(c, a, v); }
 uint32_t t_stxp64(Ctx *c, uint64_t a, uint64_t lo, uint64_t hi) { return stxp64(c, a, lo, hi); }
 uint32_t t_stlxp64(Ctx *c, uint64_t a, uint64_t lo, uint64_t hi) { return stlxp64(c, a, lo, hi); }
-void t_clrex(Ctx *c) { c->ex_addr = ~0ull; }
+void t_clrex(Ctx *c) { RT_CLREX(c); }
 /* the plain accessors stay single plain LDR / STR (single-copy atomic when aligned) */
 uint64_t t_rd64(uint64_t a) { return rd64(a); }
 void t_wr64(uint64_t a, uint64_t v) { wr64(a, v); }

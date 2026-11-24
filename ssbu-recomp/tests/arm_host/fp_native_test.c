@@ -6,6 +6,8 @@
  *
  * Checked, each as software version (= what an x86 host runs) and as the routed version (= what an ARM host runs):
  *   FRECPS / FRSQRTS (s, d, and the 4s vector form through neon.h v_f3v)   special x special pairs + random pairs
+ *     (exception: an x86 host does not run fp_step*_soft yet; neon.h keeps its fma of before there, so x86 results do
+ *     not change. The soft versions are checked here so that a later change can switch x86 to them.)
  *   FRECPE / FRSQRTE (s, d)                                              specials + random (+ all 2^32 floats)
  *   FCVT single/double -> half, half -> single/double                    all 65536 halves, specials + random
  *   FMAX / FMIN / FMAXNM / FMINNM (s, d)                                 special x special + random pairs
@@ -20,8 +22,25 @@
 #include <stdlib.h>
 #include <pthread.h>
 
-#if !defined(__aarch64__) && !defined(SOFT_ONLY)
+#if !RECOMP_A64_NATIVE
+/* runtime.h: without RECOMP_A64_NATIVE the software versions are the helpers themselves (RT_SOFT) */
+#define f2s32_soft f2s32
+#define f2u32_soft f2u32
+#define f2s64_soft f2s64
+#define f2u64_soft f2u64
+#define recpe_f_soft recpe_f
+#define recpe_d_soft recpe_d
+#define rsqrte_f_soft rsqrte_f
+#define rsqrte_d_soft rsqrte_d
+#define f32_to_half_soft f32_to_half
+#define f64_to_half_soft f64_to_half
+#define half_to_f32_soft half_to_f32
+#define half_to_f64_soft half_to_f64
+#define fp_maxmin32_soft fp_maxmin32
+#define fp_maxmin64_soft fp_maxmin64
+#ifndef SOFT_ONLY
 #define SOFT_ONLY 1
+#endif
 #endif
 
 static uint64_t rng = 0x9e3779b97f4a7c15ull;
@@ -253,15 +272,17 @@ static void one_d(uint64_t a)
     CHECK("fcvtzu x routed", a, 0, f2u64(t), i_cvt(t, 3));
 #endif
 }
-/* the vector path of neon.h: v_f3v(F_RECPS / F_RSQRTS) on 4 lanes against FRECPS / FRSQRTS Vd.4S */
+/* the vector path of neon.h: v_f3v(F_RECPS / F_RSQRTS) on 4 lanes against FRECPS / FRSQRTS Vd.4S. The hash takes the
+ * software versions lane by lane (the same on every host); v_f3v itself is checked on AArch64 only (on x86-64 it is the
+ * fma of before, see fpexact.h). */
 static void vec_s(const uint32_t *a, const uint32_t *b)
 {
+    for (int i = 0; i < 4; i++) { H(fb(fp_step32_soft(bf(a[i]), bf(b[i]), 0))); H(fb(fp_step32_soft(bf(a[i]), bf(b[i]), 1))); }
+#ifndef SOFT_ONLY
     V128 n, m, d, r0, r1;
     memcpy(n.w, a, 16); memcpy(m.w, b, 16);
     d = n; v_f3v(&d, &n, &m, F_RECPS, 0, 4); r0 = d;
     d = n; v_f3v(&d, &n, &m, F_RSQRTS, 0, 4); r1 = d;
-    for (int i = 0; i < 4; i++) { H(r0.w[i]); H(r1.w[i]); }
-#ifndef SOFT_ONLY
     float32x4_t vn, vm, x0, x1;
     memcpy(&vn, a, 16); memcpy(&vm, b, 16);
     __asm__ volatile("frecps %0.4s, %1.4s, %2.4s" : "=w"(x0) : "w"(vn), "w"(vm));

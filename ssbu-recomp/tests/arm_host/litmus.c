@@ -1,5 +1,5 @@
 /* Multi-threaded litmus tests of the code recomp.py emits for guest LDAR / STLR / LDXR / LDAXR / STXR / STLXR /
- * DMB / DSB / CLREX, run on an AArch64 host (PORT_AUDIT Phase 2). The guest programs are in test_lifter_atomics.py;
+ * DMB / DSB / CLREX, run on an AArch64 host. The guest programs are in test_lifter_atomics.py;
  * litmus_gen.h is their lifted C (python3 test_lifter_atomics.py --gen litmus_gen.h).
  *
  *   cc -O1 -fno-strict-aliasing -ffp-contract=off -I../../runtime -I. litmus.c -o litmus -lpthread
@@ -17,7 +17,10 @@
  *                           ldxp/stxp (both doublewords counted exactly)
  *   clrex                   a STXR after CLREX fails, the next LDXR/STXR pair succeeds
  * Controls (plain str/ldr, no barrier): the number of reorderings seen is printed for information only; a non-zero
- * SB count shows the harness is able to observe reordering on this machine. */
+ * SB count shows the harness is able to observe reordering on this machine.
+ * Meant for an AArch64 host. On x86-64 runtime.h keeps the lifted code of before (empty barriers, plain LDAR / STLR,
+ * empty CLREX): the SB tests can fail there by design, and the CLREX check is skipped; -DRECOMP_X86_STRICT_FENCES=1
+ * makes them exact. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <pthread.h>
@@ -191,6 +194,10 @@ static void run_counter(const char *name, GFn f, int width32) { run_counter_pair
 
 static void run_clrex(void)
 {
+#if !RT_ORDERED_ATOMIC
+    puts("skip clrex: RT_CLREX is empty on this host (x86-64 without RECOMP_X86_STRICT_FENCES, as before)");
+    return;
+#endif
     Ctx c;
     uint64_t word = 0x1234;
     memset(&c, 0, sizeof c);
