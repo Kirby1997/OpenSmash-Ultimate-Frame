@@ -1,23 +1,26 @@
 #!/bin/sh
-# x86-64 code generation must not change (other than the intended CLREX fix): lift the litmus guest programs of
-# test_lifter_atomics.py with the lifter of a base revision and with the working tree, compile each with its own
-# runtime headers for x86-64 (-O1 -fno-strict-aliasing -ffp-contract=off) and compare the disassembly function by
-# function. FP helpers that were moved behind #ifdef __aarch64__ are compared too.
-#   tests/arm_host/x86_codegen_same.sh [base revision = merge-base of HEAD and origin/main] [compilers = "clang-15 gcc-12"]
+# The code generated for x86-64 must not change: lift the litmus guest programs of test_lifter_atomics.py with the
+# lifter of a base revision and with the working tree, compile each with its own runtime headers for this host
+# (-fno-strict-aliasing -ffp-contract=off, at each level of OPTS) and compare the disassembly function by function.
+# The FP and NEON helpers that have native versions behind RECOMP_A64_NATIVE are compared too (FRECPS / FRSQRTS
+# included). Meant for x86-64; on any host without RECOMP_A64_NATIVE (macOS on Apple Silicon too) it must also pass.
+#   tests/arm_host/x86_codegen_same.sh [base revision = merge-base of HEAD and origin/main] [compilers = "clang-19 gcc"]
+#   OPTS="-O0 -O1 -O2" by default (the game library is built at -O1, a few large files at -O0; build_opt.py -O1 / -O2).
 # Reads git objects only (git show); no game files.
 set -e
 HERE0=$(cd "$(dirname "$0")" && pwd)
 BASE=${1:-$(git -C "$HERE0" merge-base HEAD origin/main)}
-CCS=${2:-"clang-15 gcc-12"}
+CCS=${2:-"clang-19 gcc"}
+OPTS=${OPTS:-"-O0 -O1 -O2"}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 W=$(mktemp -d)
 [ -n "$KEEP" ] && echo "work dir: $W" || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/old/tools/lifter" "$W/old/tools/nro" "$W/old/runtime" "$W/old/tests/arm_host"
 # the old lifter reads main.elf (and its layout) at import: drop those lines in the temporary copy
-git -C "$ROOT" show "$BASE:tools/lifter/recomp.py" | sed "s/^IMG = open(ELF, 'rb').read()/IMG = None/; s/^\(TEXT_SIZE, .*\) = _layout(IMG)\$/\1 = (0,) * 7/" > "$W/old/tools/lifter/recomp.py"
-git -C "$ROOT" show "$BASE:tools/nro/recomp_nro.py" > "$W/old/tools/nro/recomp_nro.py"
-for f in runtime.h fpexact.h neon.h; do git -C "$ROOT" show "$BASE:runtime/$f" > "$W/old/runtime/$f"; done
+git -C "$ROOT" show "$BASE:./tools/lifter/recomp.py" | sed "s/^IMG = open(ELF, 'rb').read()/IMG = None/; s/^\(TEXT_SIZE, .*\) = _layout(IMG)\$/\1 = (0,) * 7/" > "$W/old/tools/lifter/recomp.py"
+git -C "$ROOT" show "$BASE:./tools/nro/recomp_nro.py" > "$W/old/tools/nro/recomp_nro.py"
+for f in runtime.h fpexact.h neon.h; do git -C "$ROOT" show "$BASE:./runtime/$f" > "$W/old/runtime/$f"; done
 cp "$HERE/test_lifter_atomics.py" "$W/old/tests/arm_host/"
 python3 "$W/old/tests/arm_host/test_lifter_atomics.py" --gen "$W/old_gen.h" > /dev/null
 python3 "$HERE/test_lifter_atomics.py" --gen "$W/new_gen.h" > /dev/null
@@ -57,20 +60,18 @@ void u_shiftx(V128 *d, const V128 *n) { v_shiftx(d, n, 3, 2, SX_SRSRA, 4); }
 EOF
 status=0
 for CC in $CCS; do
+  for OPT in $OPTS; do
     for v in old new; do
         inc="$W/old/runtime"; [ $v = new ] && inc="$ROOT/runtime"
         pairs=""; grep -q 'stxp64' "$W/old/runtime/runtime.h" && pairs=-DHAVE_PAIRS
-        "$CC" -O1 -fno-strict-aliasing -ffp-contract=off -w -c $pairs -I"$inc" -DGEN="\"$W/${v}_gen.h\"" "$W/cmp.c" -o "$W/$v.o"
+        "$CC" $OPT -fno-strict-aliasing -ffp-contract=off -w -c $pairs -I"$inc" -DGEN="\"$W/${v}_gen.h\"" "$W/cmp.c" -o "$W/$v.o"
         # one line per instruction, prefixed by its function; no addresses
         objdump -d --no-show-raw-insn "$W/$v.o" | grep -v 'file format' |
             sed -E 's/^ *[0-9a-f]+:\t//; s/[0-9a-f]+ <([a-z_0-9]+)\+0x[0-9a-f]+>/<\1+X>/; s/(call|jmp) +[0-9a-f]+ <[^>]*>/\1/' |
             awk '/^[0-9a-f]+ <.*>:$/ {f = $2; next} {print f " " $0}' > "$W/$v.dis"
     done
-    # Per function: identical, or the same instructions in another block order (GCC lays out __atomic_compare_exchange_n
-    # and __sync_bool_compare_and_swap differently), or new and equal to an old function (stlxp64 = stxp64 on x86).
-    # Intended changes: g_clrex_check (CLREX clears the reservation), u_recps / u_rsqrts (FRECPS / FRSQRTS: 0 x inf =
-    # 2.0 / 1.5 and Arm NaN rules, fpexact.h fp_step*_soft, instead of fma + fnan: different x86 results for those inputs).
-    python3 - "$W/old.dis" "$W/new.dis" "$CC" <<'PY' || status=1
+    # Every function must be identical, instruction for instruction (addresses and call targets left out).
+    python3 - "$W/old.dis" "$W/new.dis" "$CC $OPT" <<'PY' || status=1
 import collections, sys
 def load(p):
     d = collections.OrderedDict()
@@ -79,30 +80,12 @@ def load(p):
         d.setdefault(f, []).append(ins.replace(f[1:-2], 'SELF'))
     return d
 old, new, cc = load(sys.argv[1]), load(sys.argv[2]), sys.argv[3]
-same, layout, bad = 0, [], []
-for f, ins in new.items():
-    if f in ('<g_clrex_check>:', '<u_recps>:', '<u_rsqrts>:'):
-        continue
-    o = old.get(f)
-    if o is None:
-        twin = {'<stlxp64>:': '<stxp64>:'}.get(f)
-        o = old.get(twin)
-        if o is not None and sorted(o) == sorted(ins):
-            layout.append('%s(= old %s)' % (f[1:-2], twin[1:-2]))
-        else:
-            bad.append(f[1:-2] + '(new)')
-    elif o == ins:
-        same += 1
-    elif sorted(o) == sorted(ins):
-        layout.append(f[1:-2])
-    else:
-        bad.append(f[1:-2])
-bad += [f[1:-2] + '(gone)' for f in old if f not in new]
+bad = [f[1:-2] + ('' if f in old else '(new)') for f in new if old.get(f) != new[f]] + [f[1:-2] + '(gone)' for f in old if f not in new]
 if bad:
     print('FAIL %s: functions with different x86 code: %s' % (cc, ' '.join(bad)))
     sys.exit(1)
-print('ok   %s: %d functions identical, %d same instructions in another block order%s; intended x86 changes: g_clrex_check (CLREX '
-      'now clears the reservation), u_recps / u_rsqrts (FRECPS / FRSQRTS special cases)' % (cc, same, len(layout), (' (' + ' '.join(layout) + ')') if layout else ''))
+print('ok   %s: %d functions, all identical' % (cc, len(new)))
 PY
+  done
 done
 exit $status

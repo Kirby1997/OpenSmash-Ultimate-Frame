@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lifter checks for memory ordering on an ARM host (PORT_AUDIT Phase 2). No game binary is used or needed.
+"""Lifter checks for memory ordering on an ARM host. No game binary is used or needed.
 
     python3 test_lifter_atomics.py                 decoder test: synthetic instruction words -> expected C,
                                                    for tools/lifter/recomp.py and tools/nro/recomp_nro.py
@@ -43,7 +43,7 @@ CASES = [
     ('dsb sy',              0xd5033f9f, 'RT_FENCE_FULL();'),
     ('dsb ishst',           0xd5033a9f, 'RT_FENCE_FULL();'),
     ('isb',                 0xd5033fdf, 'RT_COMPILER_BARRIER();'),
-    ('clrex',               0xd5033f5f, 'c->ex_addr = ~0ull;'),
+    ('clrex',               0xd5033f5f, 'RT_CLREX(c);'),
     ('ldar x0, [x1]',       0xc8dffc20, 'c->x[0] = (uint64_t)(rdacq64(c->x[1]));'),
     ('ldar w0, [x1]',       0x88dffc20, 'c->x[0] = (uint64_t)(rdacq32(c->x[1]));'),
     ('ldarb w0, [x1]',      0x08dffc20, 'c->x[0] = (uint64_t)(rdacq8(c->x[1]));'),

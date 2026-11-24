@@ -4,18 +4,18 @@
 #ifndef RECOMP_FPEXACT_H
 #define RECOMP_FPEXACT_H
 
-#if defined(__aarch64__)
+#if RECOMP_A64_NATIVE
 #include <arm_neon.h>
 #endif
 
 /* x86 produces a negative quiet NaN for invalid operations, AArch64 a positive one.
- * On an AArch64 host the lifted arithmetic already runs on the guest's own instructions (FPCR = 0: no FZ, no DN, round to
- * nearest), so its NaNs are the guest's and fnan is the identity.
+ * On an AArch64 host (RECOMP_A64_NATIVE, runtime.h) the lifted arithmetic already runs on the guest's own instructions
+ * (FPCR = 0: no FZ, no DN, round to nearest), so its NaNs are the guest's and fnan is the identity.
  * Known limit of the x86 version (not fixed here: it needs the operands): a NaN that is PROPAGATED from an input, not
  * generated, and happens to be 0xffc00000 / 0xfff8000000000000 is wrongly made positive too (e.g. FNEG / FABS / FMOV /
  * FCSEL of such a NaN, or x + y with that NaN as an operand); x86 also orders two NaN operands differently from
  * FPProcessNaNs (Arm picks a signalling NaN before a quiet one, first operand first). */
-#if defined(__aarch64__)
+#if RECOMP_A64_NATIVE
 static inline float fnan32(float r) { return r; }
 static inline double fnan64(double r) { return r; }
 #else
@@ -99,15 +99,19 @@ static inline uint64_t fp_rsqrte_bits(uint64_t bits, int dbl) {
     return ((uint64_t)rexp << fbits) | (est << (fbits - 8));
 }
 
-static inline float recpe_f_soft(float x) { uint32_t b; memcpy(&b, &x, 4); b = (uint32_t)fp_recpe_bits(b, 0); memcpy(&x, &b, 4); return x; }
-static inline double recpe_d_soft(double x) { uint64_t b; memcpy(&b, &x, 8); b = fp_recpe_bits(b, 1); memcpy(&x, &b, 8); return x; }
-static inline float rsqrte_f_soft(float x) { uint32_t b; memcpy(&b, &x, 4); b = (uint32_t)fp_rsqrte_bits(b, 0); memcpy(&x, &b, 4); return x; }
-static inline double rsqrte_d_soft(double x) { uint64_t b; memcpy(&b, &x, 8); b = fp_rsqrte_bits(b, 1); memcpy(&x, &b, 8); return x; }
+static inline float RT_SOFT(recpe_f)(float x) { uint32_t b; memcpy(&b, &x, 4); b = (uint32_t)fp_recpe_bits(b, 0); memcpy(&x, &b, 4); return x; }
+static inline double RT_SOFT(recpe_d)(double x) { uint64_t b; memcpy(&b, &x, 8); b = fp_recpe_bits(b, 1); memcpy(&x, &b, 8); return x; }
+static inline float RT_SOFT(rsqrte_f)(float x) { uint32_t b; memcpy(&b, &x, 4); b = (uint32_t)fp_rsqrte_bits(b, 0); memcpy(&x, &b, 4); return x; }
+static inline double RT_SOFT(rsqrte_d)(double x) { uint64_t b; memcpy(&b, &x, 8); b = fp_rsqrte_bits(b, 1); memcpy(&x, &b, 8); return x; }
 
 /* FRECPS / FRSQRTS (FPRecipStepFused / FPRSqrtStepFused of the Arm manual, FPCR = 0): 2 - a*b and (3 - a*b) / 2 with one
  * rounding, except that infinity times zero gives exactly 2.0 / 1.5 (fma would give NaN). The first operand is negated
  * BEFORE NaN processing, so a NaN coming from it changes sign. NaN choice as FPProcessNaNs: a signalling NaN first
- * (first operand first), returned quiet; then a quiet NaN (first operand first). */
+ * (first operand first), returned quiet; then a quiet NaN (first operand first).
+ * fp_recps* / fp_rsqrts* (the instructions) exist with RECOMP_A64_NATIVE only; every other host keeps the fma of
+ * before in neon.h, so its results do not change here. fp_step*_soft are what such a host would run to give Arm's
+ * results for 0 x inf, NaN operands and an overflowing FRSQRTS sum: tests/arm_host/fp_native_test.c checks them against
+ * the instructions bit for bit, ready for a separate change of the other hosts. */
 static inline int fp_nan2_32(uint32_t a, uint32_t b, uint32_t *r) {
     int na = (a & 0x7fffffffu) > 0x7f800000u, nb = (b & 0x7fffffffu) > 0x7f800000u;
     if (!(na | nb)) return 0;
@@ -158,7 +162,7 @@ static inline double fp_step64_soft(double a, double b, int step) {
     return t * 0.5;
 }
 
-#if defined(__aarch64__)
+#if RECOMP_A64_NATIVE
 /* AArch64 host: the guest's own instructions (bit-exact with FPCR = 0; tests/arm_host/fp_native_test.c checks the
  * software versions against them). */
 static inline float recpe_f(float x) { return vrecpes_f32(x); }
@@ -169,15 +173,6 @@ static inline float fp_recps32(float a, float b) { return vrecpss_f32(a, b); }
 static inline double fp_recps64(double a, double b) { return vrecpsd_f64(a, b); }
 static inline float fp_rsqrts32(float a, float b) { return vrsqrtss_f32(a, b); }
 static inline double fp_rsqrts64(double a, double b) { return vrsqrtsd_f64(a, b); }
-#else
-static inline float recpe_f(float x) { return recpe_f_soft(x); }
-static inline double recpe_d(double x) { return recpe_d_soft(x); }
-static inline float rsqrte_f(float x) { return rsqrte_f_soft(x); }
-static inline double rsqrte_d(double x) { return rsqrte_d_soft(x); }
-static inline float fp_recps32(float a, float b) { return fp_step32_soft(a, b, 0); }
-static inline double fp_recps64(double a, double b) { return fp_step64_soft(a, b, 0); }
-static inline float fp_rsqrts32(float a, float b) { return fp_step32_soft(a, b, 1); }
-static inline double fp_rsqrts64(double a, double b) { return fp_step64_soft(a, b, 1); }
 #endif
 
 /* FCVT between half precision (IEEE binary16, FPCR.AHP = 0) and single / double: FPConvert of the Arm manual with
@@ -223,22 +218,17 @@ static inline uint64_t fp_from_half_bits(uint16_t h, int dbl) {
     } else e = exp - 15;
     return sign | ((uint64_t)(e + bias) << fbits) | (frac << (fbits - 10));
 }
-static inline uint16_t f32_to_half_soft(float x) { uint32_t b; memcpy(&b, &x, 4); return fp_to_half_bits(b, 0); }
-static inline uint16_t f64_to_half_soft(double x) { uint64_t b; memcpy(&b, &x, 8); return fp_to_half_bits(b, 1); }
-static inline float half_to_f32_soft(uint16_t h) { uint32_t b = (uint32_t)fp_from_half_bits(h, 0); float x; memcpy(&x, &b, 4); return x; }
-static inline double half_to_f64_soft(uint16_t h) { uint64_t b = fp_from_half_bits(h, 1); double x; memcpy(&x, &b, 8); return x; }
-#if defined(__aarch64__)
+static inline uint16_t RT_SOFT(f32_to_half)(float x) { uint32_t b; memcpy(&b, &x, 4); return fp_to_half_bits(b, 0); }
+static inline uint16_t RT_SOFT(f64_to_half)(double x) { uint64_t b; memcpy(&b, &x, 8); return fp_to_half_bits(b, 1); }
+static inline float RT_SOFT(half_to_f32)(uint16_t h) { uint32_t b = (uint32_t)fp_from_half_bits(h, 0); float x; memcpy(&x, &b, 4); return x; }
+static inline double RT_SOFT(half_to_f64)(uint16_t h) { uint64_t b = fp_from_half_bits(h, 1); double x; memcpy(&x, &b, 8); return x; }
+#if RECOMP_A64_NATIVE
 /* FCVT Hd, Sn / Dn and back (base ARMv8.0 instructions; one rounding, FPCR = 0). The half value travels in the low 16
  * bits of an S register so no FP16 arithmetic type is needed. */
 static inline uint16_t f32_to_half(float x) { float h; __asm__("fcvt %h0, %s1" : "=w"(h) : "w"(x)); uint32_t b; memcpy(&b, &h, 4); return (uint16_t)b; }
 static inline uint16_t f64_to_half(double x) { float h; __asm__("fcvt %h0, %d1" : "=w"(h) : "w"(x)); uint32_t b; memcpy(&b, &h, 4); return (uint16_t)b; }
 static inline float half_to_f32(uint16_t v) { uint32_t b = v; float h, r; memcpy(&h, &b, 4); __asm__("fcvt %s0, %h1" : "=w"(r) : "w"(h)); return r; }
 static inline double half_to_f64(uint16_t v) { uint32_t b = v; float h; double r; memcpy(&h, &b, 4); __asm__("fcvt %d0, %h1" : "=w"(r) : "w"(h)); return r; }
-#else
-static inline uint16_t f32_to_half(float x) { return f32_to_half_soft(x); }
-static inline uint16_t f64_to_half(double x) { return f64_to_half_soft(x); }
-static inline float half_to_f32(uint16_t h) { return half_to_f32_soft(h); }
-static inline double half_to_f64(uint16_t h) { return half_to_f64_soft(h); }
 #endif
 
 /* FMAX / FMIN / FMAXNM / FMINNM (FPMax, FPMin, FPMaxNum, FPMinNum of the Arm manual, FPCR.DN = 0), on bit patterns.
@@ -269,21 +259,21 @@ static inline uint64_t fp_maxmin64_bits(uint64_t a, uint64_t b, int is_min, int 
     memcpy(&fa, &a, 8); memcpy(&fb, &b, 8);
     return (is_min ? fa < fb : fa > fb) ? a : b;
 }
-static inline float fp_maxmin32_soft(float x, float y, int is_min, int num) {
+static inline float RT_SOFT(fp_maxmin32)(float x, float y, int is_min, int num) {
     uint32_t a, b;
     memcpy(&a, &x, 4); memcpy(&b, &y, 4);
     a = fp_maxmin32_bits(a, b, is_min, num);
     memcpy(&x, &a, 4);
     return x;
 }
-static inline double fp_maxmin64_soft(double x, double y, int is_min, int num) {
+static inline double RT_SOFT(fp_maxmin64)(double x, double y, int is_min, int num) {
     uint64_t a, b;
     memcpy(&a, &x, 8); memcpy(&b, &y, 8);
     a = fp_maxmin64_bits(a, b, is_min, num);
     memcpy(&x, &a, 8);
     return x;
 }
-#if defined(__aarch64__)
+#if RECOMP_A64_NATIVE
 /* The guest instructions themselves (is_min / num are constants at every lifted call site, the switch folds away). */
 static inline float fp_maxmin32(float x, float y, int is_min, int num) {
     float r;
@@ -305,9 +295,6 @@ static inline double fp_maxmin64(double x, double y, int is_min, int num) {
     }
     return r;
 }
-#else
-static inline float fp_maxmin32(float x, float y, int is_min, int num) { return fp_maxmin32_soft(x, y, is_min, num); }
-static inline double fp_maxmin64(double x, double y, int is_min, int num) { return fp_maxmin64_soft(x, y, is_min, num); }
 #endif
 
 #endif
