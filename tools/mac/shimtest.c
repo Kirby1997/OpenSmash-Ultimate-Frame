@@ -903,6 +903,25 @@ static void test_files(void) {
     memset(buf, 0, sizeof buf);
     CHECK(h != INVALID_HANDLE_VALUE && ReadFile(h, buf, sizeof buf, &n, NULL) && n == 3 && !memcmp(buf, "new", 3), "the moved file replaced the other");
     CloseHandle(h);
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);   /* without MOVEFILE_REPLACE_EXISTING, as Windows: nothing replaced */
+    CHECK(h != INVALID_HANDLE_VALUE && WriteFile(h, "third", 5, &n, NULL), "a third file");
+    CloseHandle(h);
+    CHECK(!MoveFileExA(path, win, 0) && GetLastError() == ERROR_ALREADY_EXISTS, "MoveFileExA onto a file, not replacing: %u", GetLastError());
+    CHECK(!MoveFileExA(path, win, MOVEFILE_WRITE_THROUGH) && GetLastError() == ERROR_ALREADY_EXISTS, "the same, written through");
+    h = CreateFileA(win, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    memset(buf, 0, sizeof buf);
+    CHECK(h != INVALID_HANDLE_VALUE && ReadFile(h, buf, sizeof buf, &n, NULL) && n == 3 && !memcmp(buf, "new", 3) &&
+          GetFileAttributesA(path) == FILE_ATTRIBUTE_NORMAL, "a refused move changed either file");
+    CloseHandle(h);
+    char other2[256];
+    snprintf(other, sizeof other, "%s\\e1", dir);
+    snprintf(other2, sizeof other2, "%s\\e2", dir);
+    CHECK(CreateDirectoryA(other, NULL) && CreateDirectoryA(other2, NULL) && !MoveFileExA(other, other2, 0) && GetLastError() == ERROR_ALREADY_EXISTS &&
+          GetFileAttributesA(other) == FILE_ATTRIBUTE_DIRECTORY && RemoveDirectoryA(other) && RemoveDirectoryA(other2), "MoveFileExA of a folder onto an empty folder");
+    snprintf(other, sizeof other, "%s\\A.txt", dir);
+    CHECK(MoveFileExA(path, other, 0) && GetFileAttributesA(other) == FILE_ATTRIBUTE_NORMAL, "MoveFileExA to another case of the same name");
+    CHECK(MoveFileExA(other, path, 0) && DeleteFileA(path), "and back");
+    snprintf(other, sizeof other, "%s\\sub", dir);
     for (int i = 0; i < 3; i++) {
         snprintf(path, sizeof path, "%s/sub/%c.dat", dir, 'x' + i);
         HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
@@ -924,6 +943,34 @@ static void test_files(void) {
     found = 0;
     if (s != INVALID_HANDLE_VALUE) { do found++; while (FindNextFileA(s, &fd)); FindClose(s); }
     CHECK(found == 6, "*.* lists . and .. too: %d", found);
+    {   /* NTFS's order (the names in upper case: "_" after the letters), and Windows' matching, ignoring case */
+        static const char *const made[] = {"b.dll", "_c.dll", "z.txt", "A.DLL", "-d.dll", "[e].dll",
+                                           "\xEF\xBC\xA1.txt", "\xF0\x9F\x98\x80.txt"};   /* (U+FF21; U+1F600, a surrogate pair: before it in UTF-16) */
+        char sub2[300], list[512];
+        snprintf(sub2, sizeof sub2, "%s/order", dir);
+        CHECK(CreateDirectoryA(sub2, NULL), "a folder for the order");
+        for (int i = 0; i < 8; i++) {
+            snprintf(path, sizeof path, "%s/%s", sub2, made[i]);
+            CloseHandle(CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL));
+        }
+        static const char *const want[][2] = {{"*.dll", "-d.dll A.DLL b.dll [e].dll _c.dll"}, {"*", ". .. -d.dll A.DLL b.dll z.txt [e].dll _c.dll \xF0\x9F\x98\x80.txt \xEF\xBC\xA1.txt"},
+                                             {"?.dll", "A.DLL b.dll"}, {"*.DLL", "-d.dll A.DLL b.dll [e].dll _c.dll"}, {"[e]*", "[e].dll"},
+                                             {"*c*", "_c.dll"}, {"*.d?l", "-d.dll A.DLL b.dll [e].dll _c.dll"}};
+        for (int k = 0; k < 7; k++) {
+            snprintf(path, sizeof path, "%s\\%s", sub2, want[k][0]);
+            list[0] = 0;
+            s = FindFirstFileA(path, &fd);
+            if (s != INVALID_HANDLE_VALUE) {
+                do snprintf(list + strlen(list), sizeof list - strlen(list), "%s%s", list[0] ? " " : "", fd.cFileName); while (FindNextFileA(s, &fd));
+                FindClose(s);
+            }
+            CHECK(!strcmp(list, want[k][1]), "FindFirstFileA %s: %s", want[k][0], list);
+        }
+        snprintf(path, sizeof path, "%s\\*.none", sub2);
+        CHECK(FindFirstFileA(path, &fd) == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND, "a search that matches nothing");
+        for (int i = 0; i < 8; i++) { snprintf(path, sizeof path, "%s/%s", sub2, made[i]); DeleteFileA(path); }
+        RemoveDirectoryA(sub2);
+    }
     snprintf(path, sizeof path, "%s/none/*", dir);
     CHECK(FindFirstFileA(path, &fd) == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND, "a search in no folder: %lu", (unsigned long)GetLastError());
     CHECK(!RemoveDirectoryA(other) && GetLastError() == ERROR_DIR_NOT_EMPTY, "removing a full folder");
@@ -1525,10 +1572,10 @@ static void test_host(void) {
     CHECK(strstr(out, "main+0x600"), "an abort's guest backtrace (want main+0x600):\n%s", out);
 
     /* started as `open` starts the app: from /, output to SSBU_LOG, no directory given - the
-     * tree's modules (<tree>/build-mac/WindowSmash.app/Contents/MacOS/ssbu), the root (the
+     * tree's modules (<tree>/build-mac/OpenSmash.app/Contents/MacOS/ssbu), the root (the
      * nearest folder up with tools/recomp.py) the working folder */
     char app[700], exe[800], cmd[2000];
-    snprintf(app, sizeof app, "%s/root/v13/build-mac/WindowSmash.app/Contents/MacOS", dir);
+    snprintf(app, sizeof app, "%s/root/v13/build-mac/OpenSmash.app/Contents/MacOS", dir);
     snprintf(cmd, sizeof cmd, "mkdir -p '%s' '%s/root/tools' && cp '%s' '%s/ssbu' && touch '%s/root/tools/recomp.py'", app, dir, rt_exe_path(), app, dir);
     CHECK(!system(cmd), "an app to start: %s", cmd);
     snprintf(path, sizeof path, "%s/root/v13/dump", dir);
@@ -1541,7 +1588,7 @@ static void test_host(void) {
     status = spawn_game(exe, app_args, "/", "crash", path, 1, NULL, out, sizeof out);
     char root[600], want[1200];
     snprintf(root, sizeof root, "%s/root", dir);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 5 && strstr(out, "loaded 3 modules") && strstr(out, "/root/v13/build-mac/WindowSmash.app/Contents/MacOS/ssbu, built"),
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 5 && strstr(out, "loaded 3 modules") && strstr(out, "/root/v13/build-mac/OpenSmash.app/Contents/MacOS/ssbu, built"),
           "the app, started from / (status %#x), its SSBU_LOG:\n%s", status, out);
     CHECK(newest_report(root, want, sizeof want), "the app's crash report not in the root's reports/: %s", root);
     /* SSBU_CWD: the working folder given (and SSBU_FIXED_SEED: the kernel's entropy the seed's) */

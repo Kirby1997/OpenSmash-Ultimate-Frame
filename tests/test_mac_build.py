@@ -120,7 +120,7 @@ class ToolchainTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as e:
                     real_toolchain()
         text = str(e.exception)
-        self.assertIn(f'the macOS SDK is 14.4 ({tmp}), and WindowSmash needs the macOS 15 SDK or newer', text)
+        self.assertIn(f'the macOS SDK is 14.4 ({tmp}), and OpenSmash needs the macOS 15 SDK or newer', text)
         self.assertIn('System Settings > General > Software Update', text)
         self.assertIn('SDKROOT names this SDK', text)
         sdks = Path(self.tc.SDK).parent
@@ -193,7 +193,7 @@ class BuildMacTests(unittest.TestCase):
     def test_paths(self):
         out = self.tree / 'build-mac'
         self.assertEqual(self.ns['OUT'], str(out))
-        self.assertEqual(self.ns['EXE'], str(out / 'WindowSmash.app' / 'Contents' / 'MacOS' / 'ssbu'))
+        self.assertEqual(self.ns['EXE'], str(out / 'OpenSmash.app' / 'Contents' / 'MacOS' / 'ssbu'))
         inc = self.ns['RUNTIME_INCLUDES']
         self.assertEqual(inc, ['-I', str(ROOT / 'runtime' / 'macos' / 'include'), '-I', str(ROOT / 'runtime' / 'linux' / 'include'),
                                '-I', str(ROOT / 'runtime'), '-I', str(out / 'gen'), '-F', str(ROOT / 'deps' / 'SDL3'),
@@ -251,7 +251,7 @@ class BuildMacTests(unittest.TestCase):
 
     def test_older_c_of_another_module(self):
         """The C of another build of the module put in its place, older than the objects (as an
-        earlier WindowSmash's sharing between folders did: hard links keep the other folder's times):
+        earlier OpenSmash's sharing between folders did: hard links keep the other folder's times):
         every file it changed is compiled again, though none is newer than its object."""
         self.compile(self.ns['game_jobs']())
         main = self.tree / 'build' / 'main'
@@ -354,8 +354,8 @@ class BuildMacTests(unittest.TestCase):
         p = plistlib.loads(plistlib.dumps(self.ns['info_plist']('13.0.5')))
         self.assertEqual(p['CFBundleExecutable'], 'ssbu')
         self.assertEqual(p['CFBundleIdentifier'], 'io.github.sno2207.windowsmash')
-        self.assertEqual((p['CFBundleName'], p['CFBundleDisplayName']), ('WindowSmash', 'WindowSmash'))
-        self.assertEqual(p['CFBundleIconFile'], 'windowsmash')
+        self.assertEqual((p['CFBundleName'], p['CFBundleDisplayName']), ('OpenSmash', 'OpenSmash'))
+        self.assertEqual(p['CFBundleIconFile'], 'opensmash')
         self.assertEqual(p['CFBundlePackageType'], 'APPL')
         self.assertEqual(p['LSMinimumSystemVersion'], '14.0')
         self.assertIs(p['NSHighResolutionCapable'], True)
@@ -370,10 +370,10 @@ class BuildMacTests(unittest.TestCase):
         self.assertIsNone(self.ns['tree_version']())
 
     def test_icon_picture(self):
-        png = self.ns['ico_png'](str(ROOT / 'docs' / 'assets' / 'windowsmash.ico'))
+        png = self.ns['ico_png'](str(ROOT / 'docs' / 'assets' / 'opensmash.ico'))
         self.assertTrue(png.startswith(b'\x89PNG\r\n\x1a\n'))
         self.assertEqual(struct.unpack('>II', png[16:24]), (256, 256))   # (its IHDR)
-        self.assertIsNone(self.ns['ico_png'](str(ROOT / 'docs' / 'assets' / 'windowsmash.ico'), 512))
+        self.assertIsNone(self.ns['ico_png'](str(ROOT / 'docs' / 'assets' / 'opensmash.ico'), 512))
 
     def test_use_tree(self):
         out = Path(self.ns['OUT'])
@@ -382,7 +382,7 @@ class BuildMacTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.ns['use_tree']()
         self.assertEqual((out / 'port.txt').read_text().strip(), str(self.tree))
-        copied_from = self.top / 'WindowSmash-before'   # (this tree a copy of one that is still there: still its own build-mac)
+        copied_from = self.top / 'OpenSmash-before'   # (this tree a copy of one that is still there: still its own build-mac)
         (copied_from / 'build').mkdir(parents=True)
         write(out / 'port.txt', f'{copied_from}\n')
         with contextlib.redirect_stdout(io.StringIO()) as said:
@@ -402,7 +402,7 @@ class BuildMacTests(unittest.TestCase):
         """--replace starts this tree's own build over too (not with --link-only)."""
         out = Path(self.ns['OUT'])
         for p in ('obj/main/g0000.o', 'obj/nro/fighter/g0000.o', 'obj/rt/host.o', 'obj/game_sources.tsv', 'ssbu.syms',
-                  'WindowSmash.app/Contents/MacOS/ssbu'):
+                  'OpenSmash.app/Contents/MacOS/ssbu'):
             write(out / p)
         write(out / 'port.txt', f'{self.tree}\n')
         saved = sys.argv
@@ -415,7 +415,7 @@ class BuildMacTests(unittest.TestCase):
                 self.ns['use_tree']()
         finally:
             sys.argv = saved
-        for p in ('obj/main', 'obj/nro', 'obj/game_sources.tsv', 'ssbu.syms', 'WindowSmash.app'):
+        for p in ('obj/main', 'obj/nro', 'obj/game_sources.tsv', 'ssbu.syms', 'OpenSmash.app'):
             self.assertFalse((out / p).exists(), p)
         self.assertTrue((out / 'obj' / 'rt' / 'host.o').exists())   # (the runtime has its own flags stamp)
 
@@ -562,7 +562,7 @@ class BuildMacOnMacTests(unittest.TestCase):
         plist = plistlib.loads((app / 'Contents' / 'Info.plist').read_bytes())
         self.assertEqual(plist['CFBundleExecutable'], 'ssbu')
         self.assertTrue((app / 'Contents' / 'Frameworks' / 'SDL3.framework' / 'Versions' / 'Current').is_symlink())
-        self.assertTrue((app / 'Contents' / 'Resources' / 'windowsmash.icns').is_file())
+        self.assertTrue((app / 'Contents' / 'Resources' / 'opensmash.icns').is_file())
         r = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         r = subprocess.run(['codesign', '-dv', str(app)], capture_output=True, text=True)
@@ -818,7 +818,7 @@ class BuildOnMacTests(unittest.TestCase):
         self.ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_mac')['build'].__globals__
         fake_subprocess = types.SimpleNamespace(**{k: getattr(subprocess, k) for k in dir(subprocess) if not k.startswith('_')})
         fake_subprocess.Popen = lambda args, **kw: self.popens.append(args)
-        self.exe = self.port / 'build-mac' / 'WindowSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
+        self.exe = self.port / 'build-mac' / 'OpenSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
         self.ns.update(
             HOST='macos', LINUX=False, MACOS=True, ROOT=str(self.port), TOOLS=str(self.port / 'tools'), DUMP=str(dump),
             EXEFS=str(dump / 'exefs'), FONTS=str(dump / 'fonts'), MODULES=str(dump / 'modules'),
@@ -845,7 +845,7 @@ class BuildOnMacTests(unittest.TestCase):
         self.assertEqual(Path(mac[1]).relative_to('tools'), Path('mac', 'build_mac.py'))
         self.assertEqual(self.popens, [['caffeinate', '-i', '-w', str(os.getpid())]])   # (kept awake while it builds)
         text = '\n'.join(self.logged)
-        self.assertIn(f"[9/9] Build the game ({os.path.join('build-mac', 'WindowSmash.app')})", text)
+        self.assertIn(f"[9/9] Build the game ({os.path.join('build-mac', 'OpenSmash.app')})", text)
         self.assertIn('Play SSBU.command', text)
         self.assertNotIn('.bat', text)
 
@@ -991,6 +991,8 @@ class BuildGameMacTests(unittest.TestCase):
             sys.path[:] = saved[2]
         jobs, extra = seen[0]
         self.assertEqual(extra, ('-fsyntax-only',))
+        flags = jobs[0][3]   # (#488: the check's own overlay_font.h before build-mac/gen's, which may be a stale one)
+        self.assertEqual(flags[:2], ['-I', tmp])
         sources = {os.path.relpath(j[0], ROOT / 'runtime') for j in jobs}
         self.assertIn(os.path.join('macos', 'gpu_metal.m'), sources)
         self.assertIn('host.c', sources)

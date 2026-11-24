@@ -2,7 +2,7 @@
 silicon), macOS 14 or newer.
 
 Everything comes with the Command Line Tools (xcode-select --install; Install
-WindowSmash.command does it): clang, the macOS SDK, ar, nm and codesign. xcrun finds them, so a
+OpenSmash.command does it): clang, the macOS SDK, ar, nm and codesign. xcrun finds them, so a
 selected Xcode works too (xcode-select, DEVELOPER_DIR). SSBU_CLANG names another clang, SDKROOT
 another SDK. The SDK must be macOS 15's or newer (MIN_SDK): an older one lacks what the runtime
 uses (runtime/macos), which @available cannot leave out when it is compiled.
@@ -24,7 +24,7 @@ MIN_SDK = (15, 0)
 SDL3_DIR = os.environ.get("SSBU_SDL3_DIR") or os.path.join(REPO, "deps", "SDL3")
 SDL3_FRAMEWORK = os.path.join(SDL3_DIR, "SDL3.framework")
 MISSING_CLT = ("the Command Line Tools for Xcode are not installed: run  xcode-select --install  (Install "
-               "WindowSmash.command does), or name a clang in SSBU_CLANG")
+               "OpenSmash.command does), or name a clang in SSBU_CLANG")
 LICENCE = ("Xcode's licence has not been accepted: run  sudo xcodebuild -license accept  in Terminal, or use the "
            "Command Line Tools instead:  sudo xcode-select -s /Library/Developer/CommandLineTools")
 
@@ -66,7 +66,7 @@ def sdk_version(sdk):
 
 def old_sdk(version, sdk):
     """What to do about an SDK older than MIN_SDK."""
-    return (f"the macOS SDK is {version[0]}.{version[1]} ({sdk}), and WindowSmash needs the macOS {MIN_SDK[0]} SDK or newer: "
+    return (f"the macOS SDK is {version[0]}.{version[1]} ({sdk}), and OpenSmash needs the macOS {MIN_SDK[0]} SDK or newer: "
             "update the Command Line Tools in System Settings > General > Software Update (on macOS 14, update macOS to "
             "14.5 or newer first), or install Command Line Tools for Xcode 16 or newer from "
             "https://developer.apple.com/download/all/"

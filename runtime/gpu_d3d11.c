@@ -1173,7 +1173,7 @@ static int create_noted(struct Compiler *me, Shader *s, const void *code, size_t
 }
 
 /* ---- prewarm: the disk cache made ready while the game starts --------------------------
- * Every DXBC file of this SHADER_CACHE_VERSION the game has used before (gpu_shader_cache.h),
+ * Every DXBC file of this SHADER_CACHE_DXBC_VERSION the game has used before (gpu_shader_cache.h),
  * newest first, is created on the rendering device by the compiler threads (queue 2, below the
  * game's own shaders) into a table by the cache's key. (The compile device is for a full compile
  * on a compiler thread; a warmed cache's object is all the prewarm needs.)
@@ -1584,14 +1584,14 @@ static int newest_first(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* The disk cache's files of this SHADER_CACHE_VERSION that the game has used (not the ahead-of-time
+/* The disk cache's files of this SHADER_CACHE_DXBC_VERSION that the game has used (not the ahead-of-time
  * compiler's it never asked for; with all, those too), newest first: the shaders of what was
  * played last, first, and the ahead-of-time compiler's (dated 2001) after every played one. */
 static u32 cache_files(const char *dir, Found **out, int all) {
     Found *found = NULL;
     u32 n = 0, cap = 0;
     char pattern[1100];
-    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", dir, SHADER_CACHE_VERSION);
+    snprintf(pattern, sizeof pattern, "%s/v%u_*.dxbc", dir, SHADER_CACHE_DXBC_VERSION);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     for (BOOL more = h != INVALID_HANDLE_VALUE; more; more = FindNextFileA(h, &fd)) {
@@ -1706,7 +1706,7 @@ static u32 prewarm_queue_named(const char *list, u32 total, Shader **head, Shade
         if (!m || line[0] == '#') continue;
         (*listed)++;
         if (*queued >= total) continue;
-        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_VERSION, line);
+        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_DXBC_VERSION, line);
         snprintf(file, sizeof file, "%s/%s", cache_dir(), fname);
         if (GetFileAttributesA(file) == INVALID_FILE_ATTRIBUTES) continue;   /* (not made by Prepare Shaders here) */
         if (*queued == *cap) {
@@ -2382,7 +2382,7 @@ static u32 warm_order_listed(Found *files, u32 n) {
             if (!more) break;
             names = more;
         }
-        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_VERSION, line);
+        snprintf(fname, sizeof fname, "v%u_%s.dxbc", SHADER_CACHE_DXBC_VERSION, line);
         names[count++] = name_hash(fname);
     }
     fclose(f);
@@ -2838,7 +2838,7 @@ int gfx_warm_shaders_main(const char *dir, const char *arg) {
     if (rewarm) fprintf(stderr, "[warm] rewarm: drawing every shader again\n");
     else if (before) fprintf(stderr, "[warm] %u shaders drawn by an earlier run\n", before);
     if (!r.n) {
-        fprintf(stderr, "[warm] no v%u shaders in %s\n", SHADER_CACHE_VERSION, dir);
+        fprintf(stderr, "[warm] no v%u shaders in %s\n", SHADER_CACHE_DXBC_VERSION, dir);
         free(r.done);
         free(r.files);
         if (r.adapter) IDXGIAdapter1_Release(r.adapter);
@@ -3648,9 +3648,18 @@ static Wrote wrote_log[WROTE_LOG];
 static u64 wrote_seq;   /* writes logged so far (an entry is never changed once there: a check
                          * that has seen it must not miss what is added) */
 
+/* Return guest address g if [va, va + size) maps contiguously from g; skip the second walk inside one 4 KB page. */
+static inline u64 gpu_va_contig(u64 va, u64 size) {
+    if (!size) return 0;
+    u64 g = gpu_va_to_guest(va);
+    if (!g) return 0;
+    if ((va & 0xFFF) + size <= 0x1000) return g;
+    return gpu_va_to_guest(va + size - 1) == g + size - 1 ? g : 0;
+}
+
 static void guest_wrote(u64 va, u64 bytes) {   /* bytes == 0: anywhere */
-    u64 lo = 0, hi = ~0ull, g = bytes ? gpu_va_to_guest(va) : 0;
-    if (g && gpu_va_to_guest(va + bytes - 1) == g + bytes - 1) { lo = g; hi = g + bytes; }
+    u64 lo = 0, hi = ~0ull, g = bytes ? gpu_va_contig(va, bytes) : 0;
+    if (g) { lo = g; hi = g + bytes; }
     wrote_log[wrote_seq % WROTE_LOG] = (Wrote){lo, hi};
     wrote_seq++;
 }
@@ -3674,8 +3683,8 @@ static ID3D11ShaderResourceView *upload_gpu(int stage, u32 slot, u64 va, u32 siz
     u32 padded = (size + 15) & ~15u;
     if (!padded) padded = 16;
     LastUpload *lu = &last_upload[stage][slot];
-    u64 g = size && size <= REUSE_MAX ? gpu_va_to_guest(va) : 0;
-    const u8 *src = g && gpu_va_to_guest(va + size - 1) == g + size - 1 ? P(const u8, g) : NULL;   /* (one mapping) */
+    u64 g = size && size <= REUSE_MAX ? gpu_va_contig(va, size) : 0;
+    const u8 *src = g ? P(const u8, g) : NULL;   /* (one mapping) */
     int keep = src != NULL;   /* compared now, and a copy kept to compare with next time */
     if (lu->frame != gfx_stat_presented) {   /* a new frame: was the last one counted all misses? */
         if (lu->tries >= REUSE_TRIES && !lu->hits) lu->paused_to = gfx_stat_presented + REUSE_PAUSE;
@@ -3748,16 +3757,21 @@ static ID3D11ShaderResourceView *upload_raw(int stage, u32 slot, const void *dat
     if (size > u->cap) {
         if (u->srv) ID3D11ShaderResourceView_Release(u->srv);
         if (u->buf) ID3D11Buffer_Release(u->buf);
+        *u = (Upload){0};   /* a failed grow must leave no released object for the next draw */
         u32 cap = 1024;
         while (cap < size) cap *= 2;
         D3D11_BUFFER_DESC bd = {cap, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
                                 D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
-        if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &u->buf))) { u->cap = 0; u->buf = NULL; return NULL; }
+        if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &u->buf))) { u->buf = NULL; return NULL; }
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {DXGI_FORMAT_R32_TYPELESS, D3D11_SRV_DIMENSION_BUFFEREX};
         sd.BufferEx.FirstElement = 0;
         sd.BufferEx.NumElements = cap / 4;
         sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-        ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)u->buf, &sd, &u->srv);
+        if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)u->buf, &sd, &u->srv))) {
+            ID3D11Buffer_Release(u->buf);
+            *u = (Upload){0};
+            return NULL;
+        }
         u->cap = cap;
     }
     D3D11_MAPPED_SUBRESOURCE m;
@@ -3775,9 +3789,9 @@ static int params_known;
 
 /* Copy guest GPU memory [va, va + size) into dst (zeros where unmapped). */
 static void read_gpu(u64 va, u32 size, void *dst) {
-    u64 g = gpu_va_to_guest(va);
     if (!size) return;
-    if (g && gpu_va_to_guest(va + size - 1) == g + size - 1) { memcpy(dst, P(void, g), size); return; }
+    u64 g = gpu_va_contig(va, size);
+    if (g) { memcpy(dst, P(void, g), size); return; }
     /* not one contiguous mapping: page by page, zeros where unmapped */
     for (u32 done = 0; done < size;) {
         u32 n = 0x1000 - (u32)((va + done) & 0xFFF);
@@ -4593,6 +4607,7 @@ static ID3D11Texture2D *unpack_texture(ID3D11Texture2D *bc, const TextureDesc *d
     return out;
 }
 
+static int rt565_swapped_now;   /* get_texture's last: a B5G6R5 target read through a B5G6R5 header (gpu_texture.h) */
 static int draw_reads_wide;   /* (SSBU_ASPECT: the draw being bound samples a widened target) */
 static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, float *scale) {
     TextureDesc d;
@@ -4615,6 +4630,7 @@ static ID3D11ShaderResourceView *get_texture(const u32 *tic, u32 shader_type, fl
     if (rt && draw_logging) note_sampled(rt);
     if (rt && rt->wide > 1.0f) draw_reads_wide = 1;
     if (rt && rt->depth) depth_sampled_now = rt;
+    rt565_swapped_now = rt && !rt->depth && ok && rt565_read_swaps(rt->format, d.format);
     if (rt) { *scale = rt->sx; return surface_srv(rt, (int)d.srgb); }
     if (!ok || d.type == TIC_1D_BUFFER || d.bytes == 0) { warn_texture(&d); return NULL; }
     u32 layers = d.type == TIC_CUBE ? 6 : d.type == TIC_CUBE_ARRAY ? 6 * d.depth : d.type == TIC_2D_ARRAY || d.type == TIC_1D_ARRAY ? d.depth : 1;
@@ -5041,8 +5057,8 @@ static void kept_apply(u64 lo, u64 hi) {
         /* Only from the memory it was made from, still mapped there: the guest may have mapped
          * other memory at these addresses since (and unmapped the old: the driver would fault
          * reading it). Otherwise it is taken again, or made again, at its next use. */
-        u64 g = gpu_va_to_guest(a);
-        if (g != e->guest + (a - e->va) || gpu_va_to_guest(z - 1) != g + (z - 1 - a)) { e->stale = 1; continue; }
+        u64 g = gpu_va_contig(a, z - a);
+        if (g != e->guest + (a - e->va)) { e->stale = 1; continue; }
         D3D11_BOX box = {(UINT)(a - e->va), 0, 0, (UINT)(z - e->va), 1, 1};
         ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)e->buf, 0, &box, P(void, e->guest + (a - e->va)), 0, 0);
         if (e->shadow) memcpy(e->shadow + (a - e->va), P(void, e->guest + (a - e->va)), (size_t)(z - a));
@@ -5077,6 +5093,7 @@ void d3d11_stream_end(void) {
 
 /* How much of [va, va + size) maps to guest memory in one piece from g (at va). */
 static u32 kept_mapped(u64 va, u64 g, u32 size) {
+    if ((va & 0xFFF) + size <= 0x1000) return size;
     u32 mapped = 0x1000 - (u32)(va & 0xFFF);   /* (the 64 KB bound may run past what is mapped: that part reads as zeros) */
     while (mapped < size && gpu_va_to_guest(va + mapped) == g + mapped) mapped += 0x1000;
     return mapped > size ? size : mapped;
@@ -5312,16 +5329,32 @@ static u32 depth_green_red(u32 swz) {
 }
 static int depth_24bit(u32 zeta_format) { return zeta_format == 0x14 || zeta_format == 0x15 || zeta_format == 0x16; }
 
+int interp_probe_on(void);   /* (gpu_interp_probe.c, SSBU_INTERP_PROBE) */
+void interp_probe_cb(int kind, u64 program, const char *name, u32 bank, u64 va, u32 size, void (*read)(u64, u32, void *));
+void interp_probe_draw(u64 vs, u64 ps, u64 data, u32 count, u64 target);
+void interp_probe_dispatch(u64 program);
+static int interp_probing = -1;
+void motion_draw(u64 vs, u64 ps, u64 data, u32 count, u64 target);   /* (gpu_motion.c: display.ini's motion) */
+void motion_dispatch(u64 program);
+int motion_active(void);
+const void *motion_block(int compute, u32 bank, u32 tex_bank, u64 va, u32 size, void (*read)(u64, u32, void *));
+
 static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int stage, const Shader *s, DrawParams *params) {
     int mstage = stage == SHADER_VERTEX ? STAGE_VERTEX : STAGE_FRAGMENT;
     ID3D11ShaderResourceView *srv[18] = {0};
     static u8 data[0x10000];
     (void)regs;
+    if (interp_probing < 0) interp_probing = interp_probe_on() == 1;
     for (u32 b = 0; b < 18; b++) {
         if (!(s->info.cbuf_mask >> b & 1)) continue;
         u32 size = cb[mstage][b].size;
         if (size > 0x10000) size = 0x10000;
         if (size > s->info.cbuf_extent[b]) size = s->info.cbuf_extent[b];   /* only what the program can read */
+        if (interp_probing) interp_probe_cb(stage == SHADER_VERTEX ? 0 : 1, s->hash, s->name, b, cb[mstage][b].address, size, read_gpu);
+        if (stage == SHADER_VERTEX && motion_active()) {   /* (display.ini's motion: blended) */
+            const void *m = motion_block(0, b, regs[M_BINDLESS_TEXTURE] & 0x1F, cb[mstage][b].address, size, read_gpu);
+            if (m) { srv[b] = upload_raw(stage, b, m, size); continue; }
+        }
         if (cam_hunt_draw && stage == SHADER_VERTEX && cb[mstage][b].address && size >= 64) cam_hunt_cb(s, b, cb[mstage][b].address, size);
         if (size >= 0x1000 && cb[mstage][b].address && !draw_logging && (srv[b] = kept_cb(cb[mstage][b].address, size)))
             continue;   /* big ones stay on the GPU */
@@ -5416,11 +5449,13 @@ static void bind_resources(const u32 *regs, const CbBinding cb[STAGES][18], int 
         float scale;
         Surface *depth_before = depth_sampled_now;
         depth_sampled_now = NULL;
+        rt565_swapped_now = 0;
         tex[k] = get_texture(tic, s->info.tex[k].type, &scale);
         if (k < 16) smp[k] = get_sampler(tsc);
         params->swz[stage][k] = (tic[0] >> 19) & 0xFFF;
         if (depth_sampled_now && depth_24bit(depth_sampled_now->format)) params->swz[stage][k] = depth_green_red(params->swz[stage][k]);
         if (!depth_sampled_now) depth_sampled_now = depth_before;
+        if (rt565_swapped_now) params->swz[stage][k] = swz_swap_rb(params->swz[stage][k]);
         /* a render target's render scale, 4.12 fixed point in the top half (0: 1), for the few
          * programs that step in texels (gpu_shader.c: tsc_) */
         if (scale != 1.0f) params->swz[stage][k] |= (u32)(scale * 4096.0f + 0.5f) << 16;
@@ -5931,6 +5966,18 @@ void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed) {
 
     draw_reads_wide = 0;
     depth_sampled_now = NULL;
+    if (motion_active()) {   /* (gpu_motion.c: the draw, known by what it draws) */
+        u64 ib = ((u64)regs[M_INDEX_BUFFER] << 32 | regs[M_INDEX_BUFFER + 1]) + regs[M_INDEX_BUFFER + 5];
+        u64 vb = ((u64)regs[M_VERTEX_STREAM(0) + 1] << 32 | regs[M_VERTEX_STREAM(0) + 2]) + regs[M_VERTEX_ARRAY_START];
+        motion_draw(vs->hash, ps ? ps->hash : 0, indexed ? ib : vb, indexed ? regs[M_DRAW_INDEX_COUNT] : regs[M_VERTEX_ARRAY_COUNT],
+                    (u64)(uintptr_t)rts[0]);
+    }
+    if (interp_probing == 1) {   /* (the draw, known by what it draws: its programs, its index or vertex data and count, its target) */
+        u64 ib = ((u64)regs[M_INDEX_BUFFER] << 32 | regs[M_INDEX_BUFFER + 1]) + regs[M_INDEX_BUFFER + 5];
+        u64 vb = ((u64)regs[M_VERTEX_STREAM(0) + 1] << 32 | regs[M_VERTEX_STREAM(0) + 2]) + regs[M_VERTEX_ARRAY_START];
+        interp_probe_draw(vs->hash, ps ? ps->hash : 0, indexed ? ib : vb, indexed ? regs[M_DRAW_INDEX_COUNT] : regs[M_VERTEX_ARRAY_COUNT],
+                          (u64)(uintptr_t)rts[0]);
+    }
     if (ps) bind_resources(regs, cb, SHADER_PIXEL, ps, &params);   /* (first: whether it reads the scene decides the vertex stage's) */
     {   /* (SSBU_DEBUG_CAMERA_HUNT: 3D draws on a widened target, 300 of them every 10 s) */
         static int hunting = -1, budget;
@@ -6369,7 +6416,9 @@ static void present_hash(ID3D11Texture2D *tex) {
     char gs[16 * 9 * 2 + 1];
     u64 cell = (u64)(sw / 16) * (sh / 9) * 3;
     for (int i = 0; i < 16 * 9; i++) snprintf(gs + i * 2, 3, "%02x", (unsigned)(cell ? (grid[i] / cell > 255 ? 255 : grid[i] / cell) : 0));
-    fprintf(out, "%llu %lld %d %016llx %s\n", (unsigned long long)n++, test_fight_frame, hid, (unsigned long long)h, gs);
+    extern volatile u32 gpu_lat_shown_tick; extern volatile int gpu_lat_shown_known;   /* (SSBU_LAT_TRACE: the picture's logic frame) */
+    fprintf(out, "%llu %lld %d %016llx %s %u %d\n", (unsigned long long)n++, test_fight_frame, hid, (unsigned long long)h, gs,
+            gpu_lat_shown_tick, gpu_lat_shown_known);
     fflush(out);
 }
 
@@ -6560,10 +6609,17 @@ void d3d11_dispatch(const u32 *regs, const u32 *q) {
     /* constant buffers */
     ID3D11ShaderResourceView *srv[18] = {0};
     static u8 data[0x10000];
+    if (interp_probing < 0) interp_probing = interp_probe_on() == 1;
+    if (interp_probing) interp_probe_dispatch(cs->hash);
+    int blend = motion_active();
+    if (blend) motion_dispatch(cs->hash);
     for (u32 b = 0; b < 18; b++) {
         if (!(cs->info.cbuf_mask >> b & 1)) continue;
         u32 size = cb[b].size > 0x10000 ? 0x10000 : cb[b].size;
         if (size > cs->info.cbuf_extent[b]) size = cs->info.cbuf_extent[b];
+        if (interp_probing) interp_probe_cb(2, cs->hash, cs->name, b, cb[b].address, size, read_gpu);
+        const void *m = blend && cb[b].address && size ? motion_block(1, b, 0xFF, cb[b].address, size, read_gpu) : NULL;
+        if (m) { srv[b] = upload_raw(SHADER_COMPUTE, b, m, size); continue; }
         if (cb[b].address && size) read_gpu(cb[b].address, size, data);
         else { size = 16; memset(data, 0, 16); }
         srv[b] = upload_raw(SHADER_COMPUTE, b, data, size);
@@ -6867,6 +6923,7 @@ static volatile LONG presented_once;
 void d3d11_present(u64 guest, u32 width, u32 height) {
     (void)width; (void)height;
     if (!enter()) return;
+    { void gpu_lat_shown_note(u64 g); gpu_lat_shown_note(guest); }   /* (SSBU_LAT_TRACE: the picture's logic frame, gpu.c) */
     last_present_guest = guest;
     presented_once = 1;
     watchdog_present();

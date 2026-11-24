@@ -15,9 +15,9 @@
 #   join     the game joining a host's room (or an online lobby)
 #   unlock   tools/unlock_all.py on the game's save, with the game closed
 #   miis     tools/miis.py import: your own Miis into miis/ (launchers/Import Miis.command)
-#   build    tools/build_game.py with WindowSmash's Python (launchers\Build WindowSmash.bat)
+#   build    tools/build_game.py with OpenSmash's Python (as OpenSmash.exe builds on Windows)
 #
-# The game is build-mac/WindowSmash.app, started with open (so macOS treats it as the app it is: its
+# The game is build-mac/OpenSmash.app, started with open (so macOS treats it as the app it is: its
 # own Dock icon, privacy permissions and Game Mode) from this folder, with dump/modules; its log goes
 # to build/play.log, which the Terminal window shows as it goes. --gui (the Play SSBU app): questions
 # and messages in dialogs, and no log window. SSBU_TREE names another folder laid out like this one
@@ -31,7 +31,7 @@ gui=0
 # Something to say: in this window, or in a dialog (--gui)
 message() {
     if [ "$gui" = 1 ]; then
-        osascript - "${2:-WindowSmash}" "$1" >/dev/null 2>&1 <<'EOF'
+        osascript - "${2:-OpenSmash}" "$1" >/dev/null 2>&1 <<'EOF'
 on run argv
     activate
     display alert (item 1 of argv) message (item 2 of argv) buttons {"OK"} default button "OK"
@@ -56,7 +56,7 @@ ask() {
 on run argv
     activate
     try
-        set r to display dialog (item 1 of argv) default answer (item 2 of argv) with title "WindowSmash" buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"
+        set r to display dialog (item 1 of argv) default answer (item 2 of argv) with title "OpenSmash" buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"
         return "=" & text returned of r
     on error number -128
         return ""
@@ -78,7 +78,7 @@ choose_one() {
     answer=$(osascript - "$@" 2>/dev/null <<'EOF'
 on run argv
     activate
-    set r to choose from list (items 3 thru -1 of argv) with prompt (item 1 of argv) with title "WindowSmash" default items {item 2 of argv}
+    set r to choose from list (items 3 thru -1 of argv) with prompt (item 1 of argv) with title "OpenSmash" default items {item 2 of argv}
     if r is false then return ""
     return "=" & item 1 of r
 end run
@@ -111,15 +111,19 @@ clear_net() {
     unset SSBU_DATA_ROOT SSBU_INPUT SSBU_NET_HOST SSBU_NET_RELAY SSBU_NET_BIND "$@"
 }
 
-# The folder of the game to start ($tree: this one, or SSBU_TREE's), with the game built in it
+# The folder of the game to start ($tree: this one, or SSBU_TREE's), with the game built in it ($app; one built
+# before the rename has it as WindowSmash.app until the next build)
 game_folder() {
     case "${SSBU_TREE:-.}" in
         .) tree=$root ;;
         /*) tree=$SSBU_TREE ;;
         *) tree="$root/$SSBU_TREE" ;;
     esac
-    [ -x "$tree/build-mac/WindowSmash.app/Contents/MacOS/ssbu" ] ||
-        fail "The game isn't built here yet: double-click Install WindowSmash.command (in $root) to build it."
+    app="$tree/build-mac/OpenSmash.app"
+    [ -x "$app/Contents/MacOS/ssbu" ] || [ ! -x "$tree/build-mac/WindowSmash.app/Contents/MacOS/ssbu" ] ||
+        app="$tree/build-mac/WindowSmash.app"
+    [ -x "$app/Contents/MacOS/ssbu" ] ||
+        fail "The game isn't built here yet: double-click Install OpenSmash.command (in $root) to build it."
 }
 
 # The game to start ($tree), built and with its game data where its romfs.cfg says
@@ -127,14 +131,14 @@ pick_game() {
     local cfg path
     game_folder
     cfg="$tree/dump/modules/romfs.cfg"
-    [ -f "$cfg" ] || fail "The game is not set up yet ($cfg is missing): double-click Install WindowSmash.command."
+    [ -f "$cfg" ] || fail "The game is not set up yet ($cfg is missing): double-click Install OpenSmash.command."
     while IFS= read -r path || [ -n "$path" ]; do
         path=${path%$'\r'}
         [ -n "$path" ] && [ ! -f "$path" ] || continue
         if ls -d "$path" 2>&1 | grep -q "not permitted"; then
             fail "macOS does not let the launcher read the game data ($path). Allow it in System Settings > Privacy & Security > Files and Folders (or Full Disk Access), then start it again."
         fi
-        fail "The game data is not where it was when the game was built: $path. Make it reachable there again (a disk that is not connected?), or double-click Install WindowSmash.command to set it up again from where it is now."
+        fail "The game data is not where it was when the game was built: $path. Make it reachable there again (a disk that is not connected?), or double-click Install OpenSmash.command to set it up again from where it is now."
     done < <(if [ "$(head -n 1 "$cfg" | tr -d '\r')" = layered ]; then tail -n +2 "$cfg"; else head -n 1 "$cfg"; fi)
 }
 
@@ -212,7 +216,7 @@ go_online() {
 # SSBU_* variables go to the game (open passes those it is given), with where the port is (the game
 # starts in it: its settings, screenshots/ and reports/ are there) and where its log goes.
 launch() {
-    local app="$tree/build-mac/WindowSmash.app" name
+    local name
     local args
     log="$tree/build/play.log"
     opened="$tree/build/open.txt"
@@ -338,7 +342,7 @@ mode_join() {
     follow
 }
 
-# $py: WindowSmash's Python (deps/venv, which the installer makes: 3.10 or newer, as arm64), or a
+# $py: OpenSmash's Python (deps/venv, which the installer makes: 3.10 or newer, as arm64), or a
 # message saying how to get it
 tools_python() {
     py=deps/venv/bin/python
@@ -346,9 +350,9 @@ tools_python() {
         return 0
     fi
     if [ -x "$py" ]; then
-        fail "WindowSmash's Python (deps/venv) is one the tools cannot use (they need Python 3.10 or newer, as arm64): double-click Install WindowSmash.command, which makes it again."
+        fail "OpenSmash's Python (deps/venv) is one the tools cannot use (they need Python 3.10 or newer, as arm64): double-click Install OpenSmash.command, which makes it again."
     fi
-    fail "WindowSmash's Python (deps/venv) is not set up yet: double-click Install WindowSmash.command, which sets everything up."
+    fail "OpenSmash's Python (deps/venv) is not set up yet: double-click Install OpenSmash.command, which sets everything up."
 }
 
 mode_unlock() {

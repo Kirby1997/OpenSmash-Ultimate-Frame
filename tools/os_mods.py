@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What the OpenSmash launcher asks the WindowSmash mod manager to do.
+"""What the OpenSmash launcher asks the OpenSmash mod manager to do.
 
     os_mods.py status
     os_mods.py enable|disable|remove <folder>   (":code_patches": ARCropolis' code patches, enable/disable only)
@@ -138,7 +138,7 @@ def url_thumb(url, cache, name):
 
 
 def annotate(tree, m):
-    """The row details WindowSmash Mods shows: what the mod is, online safety, new costume slots,
+    """The row details OpenSmash Mods shows: what the mod is, online safety, new costume slots,
     and whether its code plugin is compiled into the game."""
     folder = os.path.join(tree.mods, m["name"])
     sys.path.insert(0, os.path.join(HERE, "modmanager"))
@@ -243,7 +243,8 @@ def status(tree):
         if g:
             m["group_title"] = g["title"]
             m["group_thumb"] = g["thumb"]
-    data["needs_build"] = skyline.game_link_reason(tree.root) or ""
+    with skyline.cached_inlining_only():   # (the page never waits on the compiler: the build asks it)
+        data["needs_build"] = skyline.game_link_reason(tree.root) or ""
     # (Play without mods asks only for this one: 30 mods turned on but not built don't hold up the plain game)
     data["needs_build_vanilla"] = data["needs_build"] and (skyline.game_link_reason(tree.root, mods=False) or "")
     data["needs_refresh"] = skyline.plugin_refresh_reason(tree.root) or ""
@@ -394,6 +395,7 @@ def main(argv):
         if cmd == "refresh":
             skyline.sync(tree.root, log, skyline.build_jobs())
             skyline.cache_mod_plugins(tree.root, skyline.build_jobs(), log)
+            skyline.probe_and_apply(tree.root, log)
             return result(True)
         if cmd == "build":
             if recomp_busy():

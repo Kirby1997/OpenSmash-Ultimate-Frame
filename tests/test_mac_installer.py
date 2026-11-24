@@ -1,4 +1,4 @@
-"""The macOS installer (Install WindowSmash.command, tools/mac/install_mac.py) and launchers
+"""The macOS installer (Install OpenSmash.command, tools/mac/install_mac.py) and launchers
 (Play SSBU.command, launchers/*.command, tools/mac/launch.sh, the Play SSBU app the
 installer makes). What decides is tested on any POSIX system with bash; what needs macOS (open,
 osacompile, hdiutil, sips, codesign) only on a Mac, where a stand-in game app records how it was
@@ -30,7 +30,7 @@ import install_mac as im  # noqa: E402
 
 BASH = '/bin/bash' if os.path.exists('/bin/bash') else shutil.which('bash')
 DARWIN = sys.platform == 'darwin'
-INSTALL = ROOT / 'Install WindowSmash.command'
+INSTALL = ROOT / 'Install OpenSmash.command'
 SCRIPTS = [ROOT / n for n in im.LAUNCHERS]
 
 
@@ -100,17 +100,17 @@ class CheckTests(unittest.TestCase):
     def test_location_warnings(self):
         home = '/Users/me'
         synced = {'/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Desktop'}
-        self.assertEqual(im.location_warnings('/Users/me/WindowSmash', home, synced.__contains__, 'apfs'), [])
-        self.assertEqual(im.location_warnings('/Users/me/Documents/WindowSmash', home, synced.__contains__, 'apfs'), [])
-        one = im.location_warnings('/Users/me/Desktop/WindowSmash', home, synced.__contains__, 'apfs')
+        self.assertEqual(im.location_warnings('/Users/me/OpenSmash', home, synced.__contains__, 'apfs'), [])
+        self.assertEqual(im.location_warnings('/Users/me/Documents/OpenSmash', home, synced.__contains__, 'apfs'), [])
+        one = im.location_warnings('/Users/me/Desktop/OpenSmash', home, synced.__contains__, 'apfs')
         self.assertEqual(len(one), 1)
         self.assertIn('iCloud Drive', one[0])
         self.assertIn('iCloud Drive', im.location_warnings('/Users/me/Library/Mobile Documents/com~apple~CloudDocs/WS', home,
                                                            lambda p: False)[0])
-        self.assertIn('Downloads', im.location_warnings('/Users/me/Downloads/WindowSmash-main', home, lambda p: False)[0])
-        self.assertIn('exfat', im.location_warnings('/Volumes/Games/WindowSmash', home, lambda p: False, 'exfat')[0])
-        self.assertEqual(im.location_warnings('/Volumes/Games/WindowSmash', home, lambda p: False, 'hfs'), [])
-        self.assertEqual(im.location_warnings('/Users/me/Desktops/WindowSmash', home, lambda p: True, None), [])
+        self.assertIn('Downloads', im.location_warnings('/Users/me/Downloads/OpenSmash-main', home, lambda p: False)[0])
+        self.assertIn('exfat', im.location_warnings('/Volumes/Games/OpenSmash', home, lambda p: False, 'exfat')[0])
+        self.assertEqual(im.location_warnings('/Volumes/Games/OpenSmash', home, lambda p: False, 'hfs'), [])
+        self.assertEqual(im.location_warnings('/Users/me/Desktops/OpenSmash', home, lambda p: True, None), [])
 
     def test_names(self):
         self.assertEqual(im.clean_name('  Mario   Bros \n'), 'Mario Bros')
@@ -135,7 +135,7 @@ class CheckTests(unittest.TestCase):
             im.il.step_update = real
         self.assertEqual(seen, [im.BRANCH])   # (this installer's branch)
         self.assertEqual((im.il.BRANCH, im.il.step), (linux_branch, im.step))   # (and install_linux as it was)
-        self.assertIn(f'[1/{im.STEPS}] Get the newest WindowSmash', out.getvalue())
+        self.assertIn(f'[1/{im.STEPS}] Get the newest OpenSmash', out.getvalue())
         self.assertIn('not checking (--no-update)', out.getvalue())
         self.assertNotIn('[1/8]', out.getvalue())   # (install_linux's own heading)
 
@@ -188,7 +188,7 @@ class StepTests(unittest.TestCase):
         with mock.patch.object(im, 'VENV', str(venv)), mock.patch.object(im.il, 'VENV', str(venv)), \
                 mock.patch.object(im.sys, 'executable', str(maker)):
             im.step_python(a)
-            self.assertTrue(any(m.startswith('WOULD make a Python of WindowSmash') for m in self.said), self.said)
+            self.assertTrue(any(m.startswith('WOULD make a Python of OpenSmash') for m in self.said), self.said)
             a.dry_run = False
             im.step_python(a)
             self.assertIsNone(im.python_problem(str(venv / 'bin' / 'python')))
@@ -408,7 +408,7 @@ class SdlTests(unittest.TestCase):
             r = subprocess.run(['codesign', '--verify', fw], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
         mounted = subprocess.run(['hdiutil', 'info'], capture_output=True, text=True).stdout
-        self.assertNotIn('windowsmash-sdl3-', mounted)
+        self.assertNotIn('opensmash-sdl3-', mounted)
 
 
 FAKE_OSASCRIPT = r'''#!/bin/bash
@@ -493,11 +493,11 @@ class OptionalFirmwareChecks(StubChecks):
 
 class DialogTests(unittest.TestCase):
     def test_arguments_never_in_the_script(self):
-        quoted = 'x" & (do shell script "touch /tmp/windowsmash-quoted") & "'
+        quoted = 'x" & (do shell script "touch /tmp/opensmash-quoted") & "'
         cmd, script = im.osascript_command(im.DIALOG, [quoted, 'Title', 7])
         self.assertEqual(cmd, ['osascript', '-', quoted, 'Title', '7'])
         self.assertEqual(script, im.DIALOG)
-        self.assertNotIn('windowsmash-quoted', script)
+        self.assertNotIn('opensmash-quoted', script)
         for name in ('DIALOG', 'ASK', 'CHOOSE', 'FOLDER', 'ALERT', 'ADMIN'):
             text = getattr(im, name)
             self.assertTrue(text.startswith('on run argv\n'), name)
@@ -748,7 +748,7 @@ class FirewallTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='firewall test ')
         self.addCleanup(self.temp.cleanup)
         top = Path(self.temp.name).resolve()
-        self.app = str(make_tree(top, '.', data=False) / 'build-mac' / 'WindowSmash.app')
+        self.app = str(make_tree(top, '.', data=False) / 'build-mac' / 'OpenSmash.app')
         self.assertEqual(subprocess.run(['codesign', '--force', '--sign', '-', self.app], capture_output=True).returncode, 0)
         self.tool = write(top / 'socketfilterfw', f'#!/bin/bash\n[ "$1" = --listapps ] && cat "{top}/listed.txt" 2>/dev/null\n'
                                                   'exit 0\n', 0o755)
@@ -771,7 +771,7 @@ class FirewallTests(unittest.TestCase):
         self.assertIn('hosting a private room needs that turned off', self.step('all')[0])
         self.assertIn('no rule wanted', self.step('on', wanted=False)[0])
         said, calls = self.step('on', dry=True)
-        self.assertIn('(dry run) would let build-mac/WindowSmash.app through the firewall', said)
+        self.assertIn('(dry run) would let build-mac/OpenSmash.app through the firewall', said)
         self.assertEqual(calls, [])
 
     def test_rule(self):
@@ -797,7 +797,7 @@ class LauncherAppTests(unittest.TestCase):
         info = im.launcher_info()
         self.assertEqual(info['CFBundleExecutable'], 'play')
         self.assertEqual(info['CFBundleIdentifier'], 'io.github.sno2207.windowsmash.play')
-        self.assertEqual(info['CFBundleIconFile'], 'windowsmash')
+        self.assertEqual(info['CFBundleIconFile'], 'opensmash')
         self.assertEqual(info['CFBundlePackageType'], 'APPL')
         self.assertEqual(info['LSMinimumSystemVersion'], '14.0')
         self.assertIs(info['LSUIElement'], True)   # (no Dock icon of its own: the game has one)
@@ -822,7 +822,7 @@ class LauncherAppTests(unittest.TestCase):
                                capture_output=True, text=True, env={**os.environ, **fake.env})
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             argv = fake.calls[0][0]
-            self.assertEqual(argv[0], 'WindowSmash is not where it was')
+            self.assertEqual(argv[0], 'OpenSmash is not where it was')
             self.assertIn(f'starts the game from {root}, which is not there any more.', argv[1])
             os.makedirs(os.path.join(tmp, 'tools', 'mac'))
             write(os.path.join(tmp, 'tools', 'mac', 'launch.sh'), 'echo "LAUNCH $*"\n')
@@ -831,7 +831,7 @@ class LauncherAppTests(unittest.TestCase):
             self.assertEqual(r.stdout, 'LAUNCH --gui play\n')
 
     def test_ico_png(self):
-        png = im.ico_png((ROOT / 'docs' / 'assets' / 'windowsmash.ico').read_bytes())
+        png = im.ico_png((ROOT / 'docs' / 'assets' / 'opensmash.ico').read_bytes())
         self.assertTrue(png.startswith(b'\x89PNG\r\n\x1a\n'))
         self.assertEqual(int.from_bytes(png[16:20], 'big'), 256)   # (the IHDR's width)
         self.assertIsNone(im.ico_png(b''))
@@ -851,8 +851,8 @@ class LauncherAppTests(unittest.TestCase):
             self.assertEqual(subprocess.run(['plutil', '-lint', plist], capture_output=True).returncode, 0)
             with open(plist, 'rb') as f:
                 self.assertEqual(plistlib.load(f)['CFBundleIdentifier'], 'io.github.sno2207.windowsmash.test-launcher')
-            icns = Path(app, 'Contents', 'Resources', 'windowsmash.icns').read_bytes()
-            self.assertEqual(icns[:4], b'icns')   # (the game's, or made from docs/assets/windowsmash.ico)
+            icns = Path(app, 'Contents', 'Resources', 'opensmash.icns').read_bytes()
+            self.assertEqual(icns[:4], b'icns')   # (the game's, or made from docs/assets/opensmash.ico)
             self.assertEqual(Path(app, 'Contents', 'PkgInfo').read_text(), 'APPL????')
             r = subprocess.run(['codesign', '--verify', app], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
@@ -865,7 +865,7 @@ class LauncherAppTests(unittest.TestCase):
 
 @unittest.skipUnless(BASH, 'needs bash')
 class BootstrapTests(unittest.TestCase):
-    """Install WindowSmash.command: which Python it runs the installer with, and the Python it
+    """Install OpenSmash.command: which Python it runs the installer with, and the Python it
     downloads when there is none (stood in for: curl copies a local file)."""
 
     def setUp(self):
@@ -902,7 +902,7 @@ class BootstrapTests(unittest.TestCase):
         if os.path.exists('/usr/bin/python3'):
             self.assertNotEqual(self.finder(root, '/usr/bin:/bin'), '/usr/bin/python3')
         own = self.fake_python(root / 'deps' / 'python' / 'bin' / 'python3')
-        self.assertEqual(self.finder(root, f'{new.parent}:/usr/bin:/bin'), str(own))   # (WindowSmash's own first)
+        self.assertEqual(self.finder(root, f'{new.parent}:/usr/bin:/bin'), str(own))   # (OpenSmash's own first)
         funcs = shell_function(INSTALL, 'usable_python')
         for p in ('/usr/bin/python3', '/usr/bin/python', ''):
             r = subprocess.run([BASH, '-c', funcs + 'usable_python "$1"', 'x', p], capture_output=True)
@@ -926,7 +926,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(r.returncode, 7, r.stdout + r.stderr)   # (the installer's exit code)
         self.assertIn(f'RAN {py} -u tools/mac/install_mac.py --dry-run --game /My Games', r.stdout)
         log = (root / 'install.log').read_text()
-        self.assertIn('WindowSmash setup: ', log)
+        self.assertIn('OpenSmash setup: ', log)
         self.assertIn('RAN ', log)
         self.assertNotIn('Press Return', r.stdout)   # (no one to press it)
 
@@ -988,7 +988,7 @@ def make_tree(top, tree='.', version=None, data=True, built=True):
     if version:
         (t / 'version.txt').write_text(version + '\n')
     if built:
-        app = t / 'build-mac' / 'WindowSmash.app' / 'Contents'
+        app = t / 'build-mac' / 'OpenSmash.app' / 'Contents'
         with open(write(app / 'Info.plist', '').as_posix(), 'wb') as f:
             plistlib.dump({'CFBundleExecutable': 'ssbu', 'CFBundleIdentifier': 'io.github.sno2207.windowsmash.test-stub',
                            'CFBundlePackageType': 'APPL', 'LSBackgroundOnly': True}, f)
@@ -1006,7 +1006,7 @@ def make_tree(top, tree='.', version=None, data=True, built=True):
 def copy_launchers(top):
     for name in ('Play SSBU.command', 'launchers/Play SSBU Offline.command', 'launchers/Host SSBU Netplay.command',
                  'launchers/Join SSBU Netplay.command', 'launchers/Unlock All Fighters.command',
-                 'launchers/Build WindowSmash.command', 'tools/mac/launch.sh'):
+                 'launchers/Build OpenSmash.command', 'tools/mac/launch.sh'):
         (Path(top) / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / name, Path(top) / name)
 
@@ -1102,7 +1102,7 @@ class LaunchScriptTests(unittest.TestCase):
     def test_game_checks(self):
         r = self.sh('pick_game; echo "not here"')
         self.assertEqual(r.returncode, 1)
-        self.assertIn("The game isn't built here yet: double-click Install WindowSmash.command", r.stdout)
+        self.assertIn("The game isn't built here yet: double-click Install OpenSmash.command", r.stdout)
         self.assertNotIn('not here', r.stdout)
         make_tree(self.top, '.', '13.0.5')
         r = self.sh('pick_game >/dev/null; echo "tree=$tree"')
@@ -1131,11 +1131,11 @@ class LaunchScriptTests(unittest.TestCase):
             r = subprocess.run([BASH, str(self.top / name)], capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                cwd='/', timeout=60)
             self.assertEqual(r.returncode, 1, name)
-            self.assertIn("The game isn't built here yet: double-click Install WindowSmash.command", r.stdout, name)
-        r = subprocess.run([BASH, str(self.top / 'launchers/Build WindowSmash.command')], capture_output=True, text=True,
+            self.assertIn("The game isn't built here yet: double-click Install OpenSmash.command", r.stdout, name)
+        r = subprocess.run([BASH, str(self.top / 'launchers/Build OpenSmash.command')], capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, cwd='/', timeout=60)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("WindowSmash's Python (deps/venv) is not set up yet: double-click Install WindowSmash.command", r.stdout)
+        self.assertIn("OpenSmash's Python (deps/venv) is not set up yet: double-click Install OpenSmash.command", r.stdout)
 
     def test_unlock(self):
         make_tree(self.top, '.', '13.0.5')
@@ -1158,18 +1158,18 @@ class LaunchScriptTests(unittest.TestCase):
         """A deps/venv the tools cannot use (one made by hand from Apple's Python 3.9, or an Intel
         one): the launcher says to run the installer, which makes it again."""
         write(self.top / 'deps' / 'venv' / 'bin' / 'python', '#!/bin/bash\n[ "$1" = -c ] && exit 1\necho "PY $*"\n', 0o755)
-        r = subprocess.run([BASH, str(self.top / 'launchers/Build WindowSmash.command')], capture_output=True, text=True,
+        r = subprocess.run([BASH, str(self.top / 'launchers/Build OpenSmash.command')], capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, cwd='/', timeout=60)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("WindowSmash's Python (deps/venv) is one the tools cannot use (they need Python 3.10 or newer, as "
-                      "arm64): double-click Install WindowSmash.command, which makes it again.", r.stdout)
+        self.assertIn("OpenSmash's Python (deps/venv) is one the tools cannot use (they need Python 3.10 or newer, as "
+                      "arm64): double-click Install OpenSmash.command, which makes it again.", r.stdout)
         self.assertNotIn('PY ', r.stdout)
 
     def test_build(self):
         write(self.top / 'deps' / 'venv' / 'bin' / 'python', '#!/bin/bash\n[ "$1" = -c ] && exit 0\necho "PY $PWD | $*"\nexit 4\n', 0o755)
         fake = Path(self.temp.name) / 'bin'
         write(fake / 'caffeinate', '#!/bin/bash\necho "AWAKE $1"\nshift\nexec "$@"\n', 0o755)
-        r = subprocess.run([BASH, str(self.top / 'launchers/Build WindowSmash.command'), '--jobs', '4'], capture_output=True,
+        r = subprocess.run([BASH, str(self.top / 'launchers/Build OpenSmash.command'), '--jobs', '4'], capture_output=True,
                            text=True, stdin=subprocess.DEVNULL, cwd='/', timeout=60,
                            env={**os.environ, 'PATH': f'{fake}:{os.environ["PATH"]}'})
         self.assertEqual(r.returncode, 4)
@@ -1228,10 +1228,19 @@ class OpenTests(unittest.TestCase):
         self.assertEqual(args, [f'{tree}/dump/modules', '--status', '30'])
         self.assertEqual(env, {'SSBU_CWD': str(self.top), 'SSBU_LOG': f'{tree}/build/play.log'})
 
+    def test_built_before_the_rename(self):
+        # (a folder built before the rename has the game as build-mac/WindowSmash.app until its next build)
+        tree = make_tree(self.top, '.', '13.0.5')
+        (tree / 'build-mac' / 'OpenSmash.app').rename(tree / 'build-mac' / 'WindowSmash.app')
+        r = self.run_launcher('launchers/Play SSBU Offline.command', SSBU_NET_RELAY='lobby.example:1', SSBU_NET_NAME='x')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        _cwd, args, _env = self.record()
+        self.assertEqual(args, [f'{tree}/dump/modules', '--status', '30'])
+
     def test_host(self):
         tree = make_tree(self.top, '.', '13.0.5')
         # (the stand-in writes the address where the runtime does: the folder's netplay_address.txt)
-        exe = tree / 'build-mac' / 'WindowSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
+        exe = tree / 'build-mac' / 'OpenSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
         exe.write_text(exe.read_text().replace('sleep 1', 'echo "203.0.113.7:$SSBU_NET_PORT" > "$(dirname "$(dirname "$1")")/'
                                                           'netplay_address.txt"\nsleep 1'))
         (self.top / 'netplay_address.txt').write_text('stale, from the last time\n')   # (removed before the game starts)
@@ -1259,7 +1268,7 @@ class OpenTests(unittest.TestCase):
 
     def test_stopped_with_an_error(self):
         tree = make_tree(self.top, '.', '13.0.5')
-        exe = tree / 'build-mac' / 'WindowSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
+        exe = tree / 'build-mac' / 'OpenSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
         exe.write_text(exe.read_text().replace('sleep 1', 'echo "*** stopped during boot: cannot open x" >> "$SSBU_LOG"\nsleep 1'))
         (self.top / 'online_server.txt').write_text('off\n')
         r = self.run_launcher('Play SSBU.command')
@@ -1269,7 +1278,7 @@ class OpenTests(unittest.TestCase):
     def test_did_not_start(self):
         """A game that exits at once, writing no log: open's status is 0 even so (or it cannot block on it)."""
         tree = make_tree(self.top, '.', '13.0.5')
-        exe = tree / 'build-mac' / 'WindowSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
+        exe = tree / 'build-mac' / 'OpenSmash.app' / 'Contents' / 'MacOS' / 'ssbu'
         exe.write_text(exe.read_text().replace('echo "stand-in game: running" >> "$SSBU_LOG"\nsleep 1\n', 'exit 0\n'))
         (self.top / 'online_server.txt').write_text('off\n')
         r = self.run_launcher('Play SSBU.command')
@@ -1301,7 +1310,7 @@ class OpenTests(unittest.TestCase):
 class ScriptSyntaxTests(unittest.TestCase):
     def test_bash_syntax(self):
         scripts = SCRIPTS + sorted((ROOT / 'launchers').glob('*.command'))
-        self.assertEqual(len({s.name for s in scripts}), 15)   # (v0.5.0: + "Build Launcher macOS.command")
+        self.assertEqual(len({s.name for s in scripts}), 16)   # (v0.5.0: + "Build Launcher macOS.command"; + the old "Install WindowSmash.command")
         for s in scripts:
             with self.subTest(s.name):
                 r = subprocess.run([BASH, '-n', str(s)], capture_output=True, text=True)
