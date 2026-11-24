@@ -235,7 +235,7 @@ static int so_wsa_errno(int e, int sending) {
     case WSAECONNREFUSED: return 111;
     case WSAEHOSTDOWN: return 112;
     case WSAEHOSTUNREACH: return 113;
-#if defined(__linux__) || defined(PLAT_LINUX_PATHS_ON_MAC)   /* errno values the Winsock names do not cover: the guest's numbers are Linux's */
+#ifndef _WIN32                                            /* errno values the Winsock names do not cover (1, 12, 32 on Linux and macOS alike) */
     case EPIPE: return 32;                                /* send after the peer closed: without this the guest read EIO */
     case EPERM: return 1;
     case ENOMEM: return 12;
@@ -464,7 +464,7 @@ static void so_recv(Ctx *c, uint64_t addr, uint64_t lenp) {   /* (fd, buf, size,
 }
 static void socket_Recv(Ctx *c) { so_recv(c, 0, 0); }
 static void socket_RecvFrom(Ctx *c) { if (!A4 || !A5 || !M32(A5)) so_recv(c, 0, 0); else so_recv(c, A4, A5); }
-#ifndef MSG_NOSIGNAL                                      /* Windows (no SIGPIPE); macOS: none, SIGPIPE still ends the exe there */
+#ifndef MSG_NOSIGNAL                                      /* Windows (no SIGPIPE); a macOS SDK without it: SIGPIPE still ends the exe there */
 #define MSG_NOSIGNAL 0
 #endif
 static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, flags [, const sockaddr *, len]) */
@@ -482,8 +482,8 @@ static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, fla
     else if (addr && !so_is_loopback(a.sin_addr.s_addr)) e = 101;                 /* no network */
     else {
         if (temp) so_nonblock(o, 1);
-        /* Linux: a send after the peer closed fails with EPIPE (the guest's 32) instead of raising SIGPIPE, which would end
-         * the exe without a crash report (nothing ignores SIGPIPE; plat_crash.c's SIG_IGN is only set inside its handler) */
+        /* Linux, and macOS where the SDK has MSG_NOSIGNAL: a send after the peer closed fails with EPIPE (the guest's 32)
+         * instead of raising SIGPIPE, which would end the exe without a word (nothing in the runtime ignores SIGPIPE) */
         int hf = (so_host_flags(gf) & MSG_OOB) | MSG_NOSIGNAL;
         if (addr) n = sendto(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), hf, (struct sockaddr *)&a, sizeof a);
         else n = send(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), hf);
