@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the game from your own files in one go: what launchers\\Build WindowSmash.bat runs.
+"""Build the game from your own files in one go: what OpenSmash.exe runs to build it.
 
 Usage:
   build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir> | --no-firmware] [--jobs N] [--prepare-only]
@@ -52,16 +52,16 @@ the game files made is cleared first (reset_game_files); the save and the settin
                --game-dll links the game's modules into a library of their own beside the
                program (build/ssbu_game.dll; tools/game_dll.py), which the program loads
 
-On Linux (what install-windowsmash.sh runs), step 1 checks clang, lld, bison and flex, the parts
+On Linux (what install-opensmash.sh runs), step 1 checks clang, lld, bison and flex, the parts
 tools/linux/toolchain.py names, and a test link with SDL2, libopus and libvpx; step 9 builds
 build-linux/ssbu: the C generated into build/ (tools/recomp.py all --generate-only), compiled and
 linked for Linux (tools/linux/build_vkd3d.py once, then tools/linux/build_linux.py).
 
-On macOS (what Install WindowSmash.command runs), step 1 checks the Command Line Tools
+On macOS (what Install OpenSmash.command runs), step 1 checks the Command Line Tools
 (tools/mac/toolchain.py), SDL3.framework in deps/SDL3 and the codecs' sources, and builds and runs
 a test program as the game is built: C++ exceptions through C, SDL3, a Metal device, then compiles
 the runtime's sources for their errors against the SDK (an older SDK lacks parts of them); step 9
-builds build-mac/WindowSmash.app: the C generated into build/ (tools/recomp.py all
+builds build-mac/OpenSmash.app: the C generated into build/ (tools/recomp.py all
 --generate-only), compiled and linked for macOS (tools/mac/build_mac.py), with the Mac kept awake
 meanwhile.
 """
@@ -90,7 +90,7 @@ EXEFS = os.path.join(DUMP, "exefs")
 FONTS = os.path.join(DUMP, "fonts")
 MODULES = os.path.join(DUMP, "modules")
 EXE = os.path.join(ROOT, "build-linux", "ssbu") if LINUX else \
-    os.path.join(ROOT, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu") if MACOS else os.path.join(ROOT, "build", "ssbu.exe")
+    os.path.join(ROOT, "build-mac", "OpenSmash.app", "Contents", "MacOS", "ssbu") if MACOS else os.path.join(ROOT, "build", "ssbu.exe")
 SAVED = os.path.join(DUMP, "build_folders.txt")
 SOURCE = os.path.join(DUMP, "game_source.txt")   # which game and version dump/ was set up from
 EXEFS_FILES = ("main", "main.npdm", "rtld", "sdk", "subsdk0")
@@ -274,8 +274,8 @@ def check_tools(fetch=True):
     CompilerDownload returned downloads it while the game files are prepared (its start() after
     step 2, its finish() at step 9). Otherwise None."""
     if sys.version_info < (3, 10):
-        raise Failed(f"this is Python {sys.version.split()[0]}: WindowSmash needs Python 3.10 or newer "
-                     + ("(Install WindowSmash.command makes deps/venv with one: docs/MACOS.md)." if MACOS else "(setup guide step 3)."))
+        raise Failed(f"this is Python {sys.version.split()[0]}: OpenSmash needs Python 3.10 or newer "
+                     + ("(Install OpenSmash.command makes deps/venv with one: docs/MACOS.md)." if MACOS else "(setup guide step 3)."))
     log(f"  Python {sys.version.split()[0]}: {sys.executable}")
     if not MACOS:
         log("  instruction set: {}: {}".format(*instruction_set()))
@@ -305,7 +305,7 @@ def instruction_set():
         raise Failed(str(e))
     features = isa.cpu_features()
     if not told and features is not None and isa.best(features) is None:
-        raise Failed(f"this PC's processor lacks {', '.join(isa.missing('x86-64-v2', features))}, which WindowSmash needs "
+        raise Failed(f"this PC's processor lacks {', '.join(isa.missing('x86-64-v2', features))}, which OpenSmash needs "
                      "(at the least SSE4.2 and POPCNT: x86-64-v2, Intel processors since 2008 and AMD since 2011).")
     return target, why
 
@@ -324,7 +324,7 @@ def windows_compiler_problem(cc):
     else:
         fix = ("Check that Visual Studio has Desktop development with C++ (with a Windows SDK) and C++ Clang tools "
                "for Windows (setup guide step 4).")
-    with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="opensmash-check-") as tmp:
         src, obj, rsp, exe = (os.path.join(tmp, "check" + ext) for ext in (".c", ".obj", ".rsp", ".exe"))
         with open(src, "w") as f:
             f.write("#include <windows.h>\n#include <stdio.h>\n#include <d3d11.h>\n#include <d3dcompiler.h>\n"
@@ -428,30 +428,30 @@ def linux_toolchain():
     try:
         import toolchain
     except SystemExit as e:
-        raise Failed(f"{e}. Run install-windowsmash.sh: it installs them.")
+        raise Failed(f"{e}. Run install-opensmash.sh: it installs them.")
     return toolchain
 
 
 def check_linux_tools():
-    """clang and lld, bison and flex, DXVK and vkd3d's source (install-windowsmash.sh downloads them
+    """clang and lld, bison and flex, DXVK and vkd3d's source (install-opensmash.sh downloads them
     into deps/linux-toolchain), and a test program linked as the game is: C++ with exceptions,
     SDL2, libopus and libvpx."""
     tc = linux_toolchain()
     missing = [n for n in ("bison", "flex") if not shutil.which(n)]
     if missing:
         raise Failed(f"{' and '.join(missing)} not found (vkd3d's shader compiler is made with them). Run "
-                     "install-windowsmash.sh: it installs them.")
+                     "install-opensmash.sh: it installs them.")
     parts = {"DXVK": os.path.join(tc.DXVK_LIBS, "libdxvk_d3d11.so.0"), "DXVK's headers": os.path.join(tc.DXVK_INCLUDE, "windows"),
              "vkd3d's source": tc.VKD3D_SRC}
     absent = [name for name, path in parts.items() if not path or not os.path.exists(path)]
     if absent:
-        raise Failed(f"{', '.join(absent)} not found in {tc.TOOLCHAIN}. Run install-windowsmash.sh: it downloads them.")
+        raise Failed(f"{', '.join(absent)} not found in {tc.TOOLCHAIN}. Run install-opensmash.sh: it downloads them.")
     import install_linux   # (beside toolchain.py)
     gone = [h for h, _ in install_linux.missing_headers(None, os.path.exists)]
     if gone:
         raise Failed(f"{', '.join(gone)} missing from {install_linux.INCLUDE}, and the build needs them (a package can be "
-                     "installed without its headers). Run install-windowsmash.sh: it puts back the packages they come with.")
-    with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
+                     "installed without its headers). Run install-opensmash.sh: it puts back the packages they come with.")
+    with tempfile.TemporaryDirectory(prefix="opensmash-check-") as tmp:
         src, exe = os.path.join(tmp, "check.cpp"), os.path.join(tmp, "check")
         with open(src, "w") as f:
             f.write(LINUX_CHECK)
@@ -460,7 +460,7 @@ def check_linux_tools():
                            capture_output=True, text=True)
         if r.returncode:
             raise Failed(f"{tc.CLANG} could not build a test program with SDL2, libopus and libvpx. Run "
-                         "install-windowsmash.sh: it installs what is missing.\n" + (r.stdout + r.stderr)[-2000:])
+                         "install-opensmash.sh: it installs what is missing.\n" + (r.stdout + r.stderr)[-2000:])
         r = subprocess.run([exe], capture_output=True, text=True)
         if r.returncode:
             raise Failed(f"the test program built with {tc.CLANG} does not run:\n" + (r.stdout + r.stderr)[-2000:])
@@ -519,7 +519,9 @@ def check_mac_runtime(tc, tmp):
     import build_mac
     with open(os.path.join(tmp, "overlay_font.h"), "w") as f:   # (build_mac.py makes it: its fallback)
         f.write("static const unsigned char overlay_font[%d] = {0};\n" % build_mac.OVERLAY_FONT_SIZE)
-    flags = build_mac.RUNTIME_INCLUDES + ["-I", tmp] + build_mac.RUNTIME_DEFINES
+    # (#488) tmp first: a stale build-mac/gen/overlay_font.h of another size (an update that changed the atlas) is on
+    # RUNTIME_INCLUDES too, and the first -I wins; it failed this check before build_mac.py could draw it again (#384)
+    flags = ["-I", tmp] + build_mac.RUNTIME_INCLUDES + build_mac.RUNTIME_DEFINES
     jobs = [(src, os.path.join(tmp, "syntax.o"), "-O0", flags) for src, _obj in build_mac.runtime_sources()
             if not src.endswith(".S")]
     failures = tc.compile_each(jobs, max(4, os.cpu_count() or 4), extra=("-fsyntax-only",))
@@ -535,18 +537,18 @@ def check_mac_runtime(tc, tmp):
 
 def check_mac_tools():
     """The Command Line Tools (clang, the macOS SDK), SDL3.framework in deps/SDL3 (Install
-    WindowSmash.command downloads it), the codecs' sources, a test program built as the game
+    OpenSmash.command downloads it), the codecs' sources, a test program built as the game
     is - C with C++ exceptions, Objective-C, SDL3, Metal - that runs, and the runtime's sources
     compiled for their errors against the SDK."""
     tc = mac_toolchain()
     if not os.path.isfile(os.path.join(tc.SDL3_FRAMEWORK, "Headers", "SDL.h")):
-        raise Failed(f"SDL3.framework is not in {tc.SDL3_DIR}. Run Install WindowSmash.command: it downloads it.")
+        raise Failed(f"SDL3.framework is not in {tc.SDL3_DIR}. Run Install OpenSmash.command: it downloads it.")
     import codec_libs
     if not codec_libs.have_opus() or not codec_libs.have_vpx("config-arm64"):
-        raise Failed("third_party/opus or third_party/libvpx is missing: this WindowSmash folder is incomplete. "
+        raise Failed("third_party/opus or third_party/libvpx is missing: this OpenSmash folder is incomplete. "
                      "Download it again.")
     includes = ["-F", tc.SDL3_DIR, "-I", os.path.join(codec_libs.OPUS, "include"), "-I", codec_libs.VPX]
-    with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="opensmash-check-") as tmp:
         jobs = []
         for name, text in MAC_CHECK.items():
             with open(os.path.join(tmp, name), "w") as f:
@@ -563,7 +565,7 @@ def check_mac_tools():
             raise Failed(tc.LICENCE + ".")
         if failures:
             raise Failed(f"{tc.CLANG} could not build a test program with SDL3 and Metal. Run Install "
-                         "WindowSmash.command: it installs what is missing.\n" + failures[0][1][-2000:])
+                         "OpenSmash.command: it installs what is missing.\n" + failures[0][1][-2000:])
         try:
             r = subprocess.run([exe], capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
@@ -583,8 +585,8 @@ def install_packages():
         return
     run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
         "pip could not install " + ", ".join(missing) + " (see above)."
-        + (" On Linux, install-windowsmash.sh installs them in a Python of WindowSmash's own (deps/venv)." if LINUX else
-           " On macOS, Install WindowSmash.command installs them in a Python of WindowSmash's own (deps/venv)." if MACOS
+        + (" On Linux, install-opensmash.sh installs them in a Python of OpenSmash's own (deps/venv)." if LINUX else
+           " On macOS, Install OpenSmash.command installs them in a Python of OpenSmash's own (deps/venv)." if MACOS
            else ""))
     importlib.invalidate_caches()
 
@@ -632,8 +634,8 @@ def can_ask():
 
 
 def unattended_hint(key):
-    setup = ("the setup (tools/install_windowsmash.ps1)" if HOST == "windows" else
-             "the setup (install-windowsmash.sh)" if LINUX else "the setup (Install WindowSmash.command)")
+    setup = ("the setup (tools/install_opensmash.ps1)" if HOST == "windows" else
+             "the setup (install-opensmash.sh)" if LINUX else "the setup (Install OpenSmash.command)")
     return (f" Nobody can answer here, so the build stops: run {setup} once, or tools/build_game.py in a terminal, "
             f"and give the folder (it is remembered in dump/build_folders.txt); or pass --{key} FOLDER.")
 
@@ -747,9 +749,9 @@ def check_same_game(rec):
         was_display = f.readline().split("\t")[0].strip()
     now = game_identity(rec)
     if was and not same_game(was, now):
-        raise Failed(f"This WindowSmash folder was set up from {describe_identity(was, was_display)}, but the game "
+        raise Failed(f"This OpenSmash folder was set up from {describe_identity(was, was_display)}, but the game "
                      f"folder now has {describe_identity(now, rec['display_version'])} to build from. One folder is "
-                     "set up from one copy of the game: set up the other one in a new WindowSmash folder.")
+                     "set up from one copy of the game: set up the other one in a new OpenSmash folder.")
 
 
 def write_game_source(rec):
@@ -777,10 +779,10 @@ def upgrade_old_folder(old, game, program, keys):
         finally:
             shutil.rmtree(probe, ignore_errors=True)
     if problem:
-        raise Failed(f"This WindowSmash folder was set up from {old} of the game. {problem}")
+        raise Failed(f"This OpenSmash folder was set up from {old} of the game. {problem}")
     if in_use(EXE):
         raise Failed(f"The game is running from {shown(os.path.relpath(EXE, ROOT))}: close it, then run this again.")
-    log(f"\n  This folder was set up from {old} of the game. WindowSmash needs {game_version.REQUIRED} now: "
+    log(f"\n  This folder was set up from {old} of the game. OpenSmash needs {game_version.REQUIRED} now: "
         f"setting it up again from {game}. Your save, settings and prepared shaders stay.")
     try:
         reset_game_files()
@@ -788,7 +790,7 @@ def upgrade_old_folder(old, game, program, keys):
         raise Failed(f"The old game files could not all be cleared ({e}). Close the game and anything else using "
                      "this folder's files, then run this again: it carries on where it stopped.")
     trees = sorted(n for n in os.listdir(ROOT) if re.fullmatch(r"v\d+(\.\d+)*", n) and os.path.isdir(os.path.join(ROOT, n)))
-    for tree in trees:   # (made by the version tool WindowSmash had before)
+    for tree in trees:   # (made by the version tool OpenSmash had before)
         log(f"  {tree}{os.sep} is not used any more. To play on from the save in it, copy {os.path.join(tree, 'save')} "
             f"over this folder's save{os.sep} before starting the game; then {tree}{os.sep} can be deleted.")
 
@@ -854,8 +856,8 @@ def use_open_fonts():
     if os.path.exists(FONTS + ".none"):
         log(f"  already done: no firmware, so the game uses the open fonts of {folder}")
         return
-    again = ("run  bash install-windowsmash.sh --firmware <folder>" if LINUX else
-             "run Install WindowSmash.command again and choose it" if MACOS else
+    again = ("run  bash install-opensmash.sh --firmware <folder>" if LINUX else
+             "run Install OpenSmash.command again and choose it" if MACOS else
              "run OpenSmash.exe again and fill it in")
     log(f"  no firmware: the game uses the open fonts of {folder} in place of your console's "
         f"({shown(os.path.join(folder, 'README.md'))})")
@@ -917,7 +919,7 @@ def write_romfs_cfg(game, keys, the_program):
         from nca import is_plain_romfs
         if not is_plain_romfs(romfs_bin):
             raise Failed(f"{romfs_bin} is not the game's data as a plain RomFS image (unencrypted, with the 13.0.5 "
-                         "update applied). Remove it, and WindowSmash reads the data from the game's own files instead.")
+                         "update applied). Remove it, and OpenSmash reads the data from the game's own files instead.")
         os.makedirs(MODULES, exist_ok=True)
         with open(os.path.join(MODULES, "romfs.cfg"), "w", newline="\n") as f:
             f.write(f"{os.path.abspath(romfs_bin)}\n0\n")
@@ -956,7 +958,7 @@ def write_romfs_cfg(game, keys, the_program):
         base = gamefiles.base_program(result["contents"], program)
         if not base:
             raise Failed(f"{gamefiles.where(program)} is the game's update, whose data is a patch over the game's own: "
-                         f"WindowSmash also needs the game itself (its program .nca, or its .nsp) in {game}, next to it.")
+                         f"OpenSmash also needs the game itself (its program .nca, or its .nsp) in {game}, next to it.")
         base_cfg = os.path.join("dump", "modules", "romfs_base.cfg")
         if base["romfs"] != "plain" and data_in_place():   # (the base read where it is: no decrypted copy of it)
             log(f"  {gamefiles.where(base)}: the game's own data read in place, decrypted as it is read (SSBU_DATA_IN_PLACE=1: "
@@ -1086,7 +1088,7 @@ def game_library():
 def build_is_current(dll=False):
     """build/ssbu.exe is newer than the runtime, the tools and the modules it is built from, and
     has SDL3.dll beside it if SDL3 is there to build with (on Linux: build-linux/ssbu, also newer
-    than the Linux runtime and tools; on macOS: build-mac/WindowSmash.app's program, also newer
+    than the Linux runtime and tools; on macOS: build-mac/OpenSmash.app's program, also newer
     than the platform layers it is made with and the macOS tools, with SDL3.framework in the app). Not
     on Windows and Linux when it was compiled for another instruction set than today's (tools/isa.py).
     dll (--game-dll): with game_library(), which is newer than all of that too; without it, with
@@ -1402,7 +1404,7 @@ def build(a):
     # (Discord's files: tools/online_files.py)
     online_files(log)
     if LINUX:
-        log(f"\nDone: {exe} is ready. Start the game with ./play-ssbu.sh, or WindowSmash in your applications menu.")
+        log(f"\nDone: {exe} is ready. Start the game with ./play-ssbu.sh, or OpenSmash in your applications menu.")
     elif MACOS:
         log(f"\nDone: {exe} is ready. Start the game with Play SSBU.command, or Play SSBU in ~/Applications (Spotlight finds it).")
     else:
@@ -1418,7 +1420,7 @@ def online_files(log):
 
 def build_linux_program(jobs, dll=False):
     """build-linux/ssbu: the game's C generated into build/, then compiled and linked for Linux (dll: --game-dll)."""
-    retry = (f"If the PC ran out of memory, build with fewer jobs at a time: bash install-windowsmash.sh --jobs "
+    retry = (f"If the PC ran out of memory, build with fewer jobs at a time: bash install-opensmash.sh --jobs "
              f"{max(1, jobs // 2)}")
     log("  the first build takes one to a few hours, later ones minutes unless the compiler, its flags or "
         "runtime/recomp.h changed; if it stops, run this again to carry on")
@@ -1442,11 +1444,11 @@ def build_linux_program(jobs, dll=False):
 
 
 def build_mac_program(jobs, dll=False):
-    """build-mac/WindowSmash.app: the game's C generated into build/, then compiled and linked for
+    """build-mac/OpenSmash.app: the game's C generated into build/, then compiled and linked for
     macOS, with the Mac kept from sleeping while this runs (an idle Mac would stop the build). dll:
     --game-dll."""
-    rebuild = '"launchers/Build WindowSmash.command"'
-    if not os.path.isfile(os.path.join(ROOT, "launchers", "Build WindowSmash.command")):
+    rebuild = '"launchers/Build OpenSmash.command"'
+    if not os.path.isfile(os.path.join(ROOT, "launchers", "Build OpenSmash.command")):
         rebuild = (os.path.relpath(sys.executable, ROOT) if sys.executable.startswith(ROOT + os.sep) else sys.executable) + \
             " tools/build_game.py"
     retry = (f"If the Mac ran out of memory, build with fewer jobs at a time: in Terminal, in this folder, run  "
@@ -1468,7 +1470,7 @@ def build_mac_program(jobs, dll=False):
 
 
 def main():
-    launcher = "Install WindowSmash.command" if MACOS else "OpenSmash.exe"
+    launcher = "Install OpenSmash.command" if MACOS else "OpenSmash.exe"
     ap = argparse.ArgumentParser(description=f"Build the game from your own files ({launcher}).")
     ap.add_argument("--game", help=f"the folder with the game's files (asked; default {FOLDERS['game'][1]})")
     ap.add_argument("--keys", help=f"the folder with prod.keys and title.keys (asked; default {FOLDERS['keys'][1]})")

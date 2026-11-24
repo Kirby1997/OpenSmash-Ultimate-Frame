@@ -13,17 +13,17 @@ sites (guest C++ try/catch) are compiled as C++ (see recomp.h). The runtime is r
 the Direct3D 11 renderer, the POSIX parts of the Linux platform layer (runtime/linux) and the
 macOS one (runtime/macos: memory, fibers, window, the Metal renderer); it links against
 SDL3.framework (deps/SDL3) and libopus and libvpx, built from third_party/ (tools/codec_libs.py).
-The program is an app: <out>/WindowSmash.app, with SDL3.framework in it, signed (ad hoc) as a
+The program is an app: <out>/OpenSmash.app, with SDL3.framework in it, signed (ad hoc) as a
 whole; <out>/ssbu.syms names its functions for the profiler. With --game-dll the game's modules are
 linked into a library of their own instead, the app's Contents/Frameworks/ssbu_game.dylib, which the
 program loads at start (tools/game_dll.py): the program is then the runtime alone.
   <out>/obj/       the objects: rt/ (the runtime), main/, subsdk0/, sdk/, nro/<module>/
   <out>/gen/       the files made for the build: hle_table.c, wrap_missing.c, nro_table.c,
-                   overlay_font.h (tools/mac/make_overlay_font.m), windowsmash.icns
+                   overlay_font.h (tools/mac/make_overlay_font.m), opensmash.icns
   <out>/codecs/    libopus.a, libvpx.a
 Incremental: a file is compiled again when its source is newer than its object, and a game object
 also when its C is not the file it was compiled from (obj/game_sources.tsv records each one's size
-and time: a module dir can hold older C than its objects, as one an earlier WindowSmash filled
+and time: a module dir can hold older C than its objects, as one an earlier OpenSmash filled
 with another folder's did) or the
 game's compile command changed (the runtime's: obj/rt/cflags.txt). <out> holds one tree's game
 (port.txt; a tree's own build-mac goes with it when the tree is moved or copied): build another
@@ -64,10 +64,11 @@ JOBS = int(arg("--jobs", str(max(4, (os.cpu_count() or 8) - 2))))
 OBJ = os.path.join(OUT, "obj")
 GAME_SOURCES = os.path.join(OBJ, "game_sources.tsv")
 GEN = os.path.join(OUT, "gen")
-APP = os.path.join(OUT, "WindowSmash.app")
+APP = os.path.join(OUT, "OpenSmash.app")
+OLD_APP = "WindowSmash.app"   # (the app's name before the rename: removed when this one is made)
 EXE = os.path.join(APP, "Contents", "MacOS", "ssbu")
 BUNDLE_ID = "io.github.sno2207.windowsmash"
-ICON = os.path.join(REPO, "docs", "assets", "windowsmash.ico")
+ICON = os.path.join(REPO, "docs", "assets", "opensmash.ico")
 
 RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "macos", "include"), "-I", os.path.join(RUNTIME, "linux", "include"),
                     "-I", RUNTIME, "-I", GEN, "-F", SDL3_DIR, "-I", os.path.join(REPO, "third_party", "libvpx")]
@@ -214,7 +215,7 @@ def game_command():
 def source_id(path):
     """What tells one version of a generated file from another: its size and time, to the second
     (as kept by a copy to a disk that keeps times to the second). A file of a module dir an earlier
-    WindowSmash filled from another folder's (a hard link, or a copy with its times) can be older
+    OpenSmash filled from another folder's (a hard link, or a copy with its times) can be older
     than the folder's objects, so being newer than the object is not enough."""
     st = os.stat(path)
     return f"{st.st_size}\t{int(st.st_mtime)}"
@@ -450,10 +451,10 @@ ICONSET = (("icon_16x16", 16), ("icon_16x16@2x", 32), ("icon_32x32", 32), ("icon
 
 
 def app_icon():
-    """gen/windowsmash.icns, the app's icon: docs/assets/windowsmash.ico's 256-pixel picture at
+    """gen/opensmash.icns, the app's icon: docs/assets/opensmash.ico's 256-pixel picture at
     each size (sips), made into an .icns (iconutil); made once. None without one (the app then
     has the system's icon)."""
-    icns = os.path.join(GEN, "windowsmash.icns")
+    icns = os.path.join(GEN, "opensmash.icns")
     if not needs(icns, ICON, os.path.abspath(__file__)):
         return icns
     png = ico_png(ICON)
@@ -461,11 +462,11 @@ def app_icon():
         print(f"no 256-pixel picture in {ICON}: the app has no icon of its own")
         return None
     os.makedirs(GEN, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="windowsmash-icon-", dir=GEN) as tmp:
+    with tempfile.TemporaryDirectory(prefix="opensmash-icon-", dir=GEN) as tmp:
         src = os.path.join(tmp, "icon.png")
         with open(src, "wb") as f:
             f.write(png)
-        iconset = os.path.join(tmp, "windowsmash.iconset")
+        iconset = os.path.join(tmp, "opensmash.iconset")
         os.makedirs(iconset)
         for name, px in ICONSET:
             dst = os.path.join(iconset, name + ".png")
@@ -476,7 +477,7 @@ def app_icon():
             if r.returncode:
                 print(f"sips could not scale the icon: the app has no icon of its own\n{(r.stdout + r.stderr)[:1000]}")
                 return None
-        partial = os.path.join(tmp, "windowsmash.icns")
+        partial = os.path.join(tmp, "opensmash.icns")
         r = subprocess.run(["iconutil", "-c", "icns", iconset, "-o", partial], capture_output=True, text=True)
         if r.returncode:
             print(f"iconutil could not make the icon: the app has no icon of its own\n{(r.stdout + r.stderr)[:1000]}")
@@ -637,7 +638,7 @@ def codecs():
     missing = [n for n, ok in (("third_party/opus", codec_libs.have_opus()),
                                ("third_party/libvpx", codec_libs.have_vpx("config-arm64"))) if not ok]
     if missing:
-        raise SystemExit(f"{' and '.join(missing)} not found: this checkout of WindowSmash is incomplete")
+        raise SystemExit(f"{' and '.join(missing)} not found: this checkout of OpenSmash is incomplete")
     return codec_libs.build_static(OUT, CLANG, CFLAGS, AR, jobs=JOBS, log=lambda m: print(m, flush=True))
 
 
@@ -645,12 +646,12 @@ def info_plist(version=None):
     """The app's Info.plist: what macOS knows it by (Game Mode, the network, the screen's resolution)."""
     return {
         "CFBundleDevelopmentRegion": "en",
-        "CFBundleDisplayName": "WindowSmash",
+        "CFBundleDisplayName": "OpenSmash",
         "CFBundleExecutable": "ssbu",
-        "CFBundleIconFile": "windowsmash",
+        "CFBundleIconFile": "opensmash",
         "CFBundleIdentifier": BUNDLE_ID,
         "CFBundleInfoDictionaryVersion": "6.0",
-        "CFBundleName": "WindowSmash",
+        "CFBundleName": "OpenSmash",
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": version or "1.0",
         "CFBundleVersion": version or "1.0",
@@ -658,7 +659,7 @@ def info_plist(version=None):
         "LSMinimumSystemVersion": MIN_MACOS,
         "LSSupportsGameMode": True,
         "NSHighResolutionCapable": True,
-        "NSLocalNetworkUsageDescription": "WindowSmash finds the players of local and online matches on your network, "
+        "NSLocalNetworkUsageDescription": "OpenSmash finds the players of local and online matches on your network, "
                                           "and asks your router (UPnP) to let the other players reach you.",
     }
 
@@ -706,7 +707,7 @@ def bundle():
         return False
     icns = app_icon()
     if icns:
-        shutil.copyfile(icns, os.path.join(contents, "Resources", "windowsmash.icns"))
+        shutil.copyfile(icns, os.path.join(contents, "Resources", "opensmash.icns"))
     r = subprocess.run([CODESIGN, "--force", "--deep", "--sign", "-", APP], capture_output=True, text=True)
     if r.returncode:
         print(f"could not sign {APP}:\n{(r.stdout + r.stderr)[:2000]}")
@@ -769,6 +770,9 @@ def link():
     if not bundle():
         os.remove(EXE)   # (not a finished app: the next build makes it again, and no launcher starts it)
         return False
+    old = os.path.join(OUT, OLD_APP)
+    if os.path.isdir(old):   # (the same game, made before the rename: this one replaces it)
+        shutil.rmtree(old, ignore_errors=True)
     print(f"linked {len(objs)} objects into {EXE} ({os.path.getsize(EXE) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
 
@@ -798,7 +802,7 @@ def main():
     ladder.settings()   # (SSBU_COMPILE_LIMIT, SSBU_OPTNONE_ABOVE, SSBU_LONGEST_FIRST: one that is not a number stops the build now)
     os.makedirs(OUT, exist_ok=True)
     if not os.path.isfile(os.path.join(SDL3_FRAMEWORK, "Headers", "SDL.h")):
-        raise SystemExit(f"SDL3.framework is not in {SDL3_DIR}: Install WindowSmash.command downloads it "
+        raise SystemExit(f"SDL3.framework is not in {SDL3_DIR}: Install OpenSmash.command downloads it "
                          "(SSBU_SDL3_DIR names another folder holding one)")
     if not modules() and "--runtime-only" not in sys.argv:
         raise SystemExit(f"no recompiled game in {os.path.join(PORT, 'build')} (tools/recomp.py all --generate-only)")

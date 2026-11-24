@@ -1,4 +1,4 @@
-"""The installer's decisions (tools/install_windowsmash.ps1): its pure functions, run in Windows
+"""The installer's decisions (tools/install_opensmash.ps1): its pure functions, run in Windows
 PowerShell with made-up inputs. No downloads, no installs, no game files."""
 from pathlib import Path
 import json
@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 PS = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
-SCRIPT = ROOT / 'tools/install_windowsmash.ps1'
+SCRIPT = ROOT / 'tools/install_opensmash.ps1'
 
 
 def ps_text(script):
@@ -823,13 +823,13 @@ class InstallerDecisionTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)             # 3.14: compression.zstd
 
     def test_small_decisions(self):
-        got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\WindowSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "
+        got = ps("@{ fw = (Get-FirewallRuleCommand 'C:\\OpenSmash\\build\\ssbu.exe' 'WindowSmash (ssbu.exe)'); "
                  "v1 = (Test-PythonVersionText 'Python 3.14.6'); v2 = (Test-PythonVersionText '3.10.0'); "
                  "v3 = (Test-PythonVersionText '3.9.13'); v4 = (Test-PythonVersionText 'Python was not found'); "
                  "v5 = (Test-PythonVersionText '2.7.18'); "
                  "d1 = (Get-DiskNeedGb 60 25); d2 = (Get-DiskNeedGb 60 70) }")
         self.assertIn('New-NetFirewallRule', got['fw'])
-        self.assertIn("-Program 'C:\\WindowSmash\\build\\ssbu.exe'", got['fw'])
+        self.assertIn("-Program 'C:\\OpenSmash\\build\\ssbu.exe'", got['fw'])
         self.assertIn("-DisplayName 'WindowSmash (ssbu.exe)'", got['fw'])
         self.assertIn('-Direction Inbound', got['fw'])
         self.assertEqual([got['v1'], got['v2'], got['v3'], got['v4'], got['v5']], [True, True, False, False, False])
