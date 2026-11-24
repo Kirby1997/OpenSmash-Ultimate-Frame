@@ -925,6 +925,81 @@ static void t_review5(void) {
 #undef STATE_IS
 }
 
+/* ---- a folder sync that fails (an I/O error; plat_posix.c's host_fsync_parent): the step it belongs to fails. The folder
+ * host_fsync_parent is about to open is made unreadable just before the call and given back at the next call, so only that
+ * one sync fails. Before: the stage's syncs and APPLY's syncs after a deletion or a new folder were not checked (a Commit
+ * reported success with a folder that was not on the disk), and an F whose file an earlier APPLY had moved was skipped
+ * without its folder being synced before the marker went. */
+static char g_sf_dir[2048];
+static const char *g_sf_want;
+static int g_sf_hit;
+static void sf_hook(const char *op, const char *path) {
+    char hp[2048];
+    if (g_sf_dir[0]) { chmod(g_sf_dir, 0777); g_sf_dir[0] = 0; }
+    if (g_nlog < 256) snprintf(g_log[g_nlog++], sizeof g_log[0], "%s %s", op, path ? path : "-");
+    if (g_sf_hit || !path || strcmp(op, "fsync-dir") || !strstr(path, g_sf_want)) return;
+    host_path_resolve(path, hp, sizeof hp);
+    snprintf(g_sf_dir, sizeof g_sf_dir, "%s", hp); *strrchr(g_sf_dir, '/') = 0;
+    chmod(g_sf_dir, 0333);
+    g_sf_hit = 1;
+}
+enum { SF_STAGE, SF_DELETE, SF_MKDIR, SF_N };
+static const char *const k_sf_want[] = {".stage.", "save\\b.bin", "save\\dir1"};
+static const char *const k_sf_name[] = {"a folder of the stage", "the folder of a deletion", "the folder of a new folder"};
+/* changes(), a Commit with the sync failing, then Commit again (the stage) or Unmount (APPLY's syncs). Exit 0: as expected;
+ * 5: the sync was never made; 6: the Commit reported success; 7: decided (stage) / not decided (APPLY); 8: the game's view is
+ * not the decided state; 9: the committed folder was changed; 10: the next Commit failed; 11: the replayed APPLY did not sync
+ * the folder of a file an earlier APPLY had moved before it removed the marker. */
+static int child_sf(int kind) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    char s[2048] = "";
+    changes();
+    g_sf_want = k_sf_want[kind]; g_sf_hit = 0; g_sf_dir[0] = 0; g_nlog = 0; fi_hook = sf_hook;
+    uint32_t r = COMMIT("save");
+    fi_hook = NULL;
+    if (g_sf_dir[0]) { chmod(g_sf_dir, 0777); g_sf_dir[0] = 0; }
+    if (!g_sf_hit) return 5;
+    if (!r) return 6;
+    if (!view_is_new()) return 8;
+    int decided = fsize(tp("ud/save.commit")) >= 0;
+    if (kind == SF_STAGE) {                                      /* not decided: nothing happened, the next Commit makes it */
+        snap(tp("ud/save"), "", s, sizeof s);
+        if (decided) return 7;
+        if (strcmp(s, g_old)) return 9;
+        if (COMMIT("save")) return 10;
+        UNMOUNT("save");
+        return 0;
+    }
+    if (!decided) return 7;                                      /* decided, pending: Unmount applies it */
+    g_sf_want = "\001"; g_sf_hit = 0; g_nlog = 0; fi_hook = sf_hook; /* (the op log only) */
+    UNMOUNT("save");
+    fi_hook = NULL;
+    int unmark = -1, synced = -1;
+    for (int i = 0; i < g_nlog; i++) {
+        if (!strncmp(g_log[i], "unlink ", 7) && strstr(g_log[i], "save.commit")) unmark = i;
+        if (!strncmp(g_log[i], "fsync-dir ", 10) && strcasestr(g_log[i], "save\\a.bin") && synced < 0) synced = i;
+    }
+    if (kind == SF_MKDIR && !(synced >= 0 && synced < unmark)) return 11;    /* (a.bin was moved before M dir1 failed) */
+    return 0;
+}
+static int child_sf_stage(void) { return child_sf(SF_STAGE); }
+static int child_sf_delete(void) { return child_sf(SF_DELETE); }
+static int child_sf_mkdir(void) { return child_sf(SF_MKDIR); }
+static void t_dirsync(void) {
+    SECTION("a folder sync that fails: of the stage (the Commit is refused), after a deletion or a new folder (pending, applied at Unmount)");
+    int (*const fn[SF_N])(void) = {child_sf_stage, child_sf_delete, child_sf_mkdir};
+    for (int kind = 0; kind < SF_N; kind++) {
+        char s[2048] = "";
+        int st;
+        old_state();
+        g_old[0] = 0; snap(tp("ud/save"), "", g_old, sizeof g_old);
+        CHECKF((st = in_child(fn[kind])) == 0, "%s cannot be synced: %d", k_sf_name[kind], st);
+        CHECK(DONE(run_child(1, 0)));
+        snap(tp("ud/save"), "", s, sizeof s);
+        CHECKF(!strcmp(s, k_new) && !leftovers(), "%s cannot be synced, then the next mount: %d leftovers, state %s", k_sf_name[kind], leftovers(), s);
+    }
+}
+
 /* ================================================================ 7. config and font paths, exe dir, the built-in self-tests */
 static int in_child(int (*fn)(void)) { fflush(NULL); pid_t p = fork(); if (!p) _exit(fn()); int st; waitpid(p, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) : 99; }
 static int gfx_existing(void) {                    /* an existing config in another case, named with backslashes */
@@ -998,7 +1073,7 @@ int main(int argc, char **argv) {
     if (!getenv("FS_NO_KILL")) t_commit_kill();
     t_commit_fail();
     if (!getenv("FS_NO_KILL") && !g_skip_fail) { t_commit_fail_kill(); t_two_process(); }
-    if (!g_skip_fail) { t_old_marker(); t_review5(); }
+    if (!g_skip_fail) { t_old_marker(); t_review5(); t_dirsync(); }
     t_misc();
     if (!mt_fail && !getenv("FS_KEEP")) rm_rf(T); else printf("test_fs: kept %s\n", T);
     return mt_done("test_fs");

@@ -578,7 +578,7 @@ static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "
  * Commit (fs_Commit), states and what a crash or a failure leaves:
  *   C1 K exists (an earlier decided commit, of any process, is unfinished, or its marker cannot be read): APPLY it. If that
  *      fails the new Commit is refused and nothing else changes -- a commit is never decided over an unfinished one.
- *   C2 E is copied into a new S; S's files are flushed and its folders synced.
+ *   C2 E is copied into a new S; S's files are flushed and its folders synced (a flush or sync that fails fails the Commit).
  *   C3 the marker is written to a new R.journal.<id> and flushed.  Crash or failure in C2..C3: K absent, R = OLD state;
  *                                                                    S and the journal are dropped (now, or by the sweep).
  *   C4 R.journal.<id> is renamed to K WITHOUT replacing: if a K exists after all (a committer without the lock: an older
@@ -589,10 +589,12 @@ static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "
  *   C6 success: E is emptied (a new E if that fails) and the tombstones dropped (R now holds all of it).
  * APPLY(K), repeatable from any point:
  *   A1 if every F source still exists in W, the D phase may be unfinished: each D target is deleted (read-only cleared,
- *      sharing violations retried on Windows) and must be GONE afterwards, else APPLY stops before the first F (-3). If some
+ *      sharing violations retried on Windows) and must be GONE afterwards, its folder synced on POSIX, else APPLY stops
+ *      before the first F (-3). If some
  *      F source is gone, an F ran, so every D was done: no D runs again (a "D a" + "F a" pair would delete the new a).
- *   A2 M and F lines in order; an F whose source is gone was moved already. A folder that cannot be made, or a move that
- *      fails, stops APPLY (-2): the D phase is complete, the remaining sources are still in W.
+ *   A2 M and F lines in order; an F whose source is gone was moved already (POSIX: its target's folder is synced again). A
+ *      folder that cannot be made, a move that fails, or a sync that fails stops APPLY (-2): the D phase is complete, the
+ *      remaining sources are still in W. (A file system that cannot sync at all is not a failure: plat_posix.c.)
  *   A3 K is deleted and must be GONE (an antivirus can hold it open on Windows), else -4; then R's folder is synced.
  *   A4 then (only then) a stage folder W is removed. (An older build's ".work." W is left to the sweep.)
  *   A K that exists but cannot be read is -1: nothing is done, and it counts as pending.
@@ -690,15 +692,22 @@ static int move_over(const char *from, const char *to) {
         if (!transient_failure(i)) return 0;
     }
 }
-static void sync_folder(const char *dir) {                /* the folder's own entries on disk (POSIX; NTFS journals its metadata) */
+static int sync_folder(const char *dir) {                 /* the folder's own entries on disk (POSIX; NTFS journals its metadata). 1 = done */
 #ifndef _WIN32
     char child[MAX_PATH];
     join(child, dir, "-");
-    host_fsync_parent(child);
+    return host_fsync_parent(child) == 0;
 #else
     (void)dir;
+    return 1;
 #endif
 }
+#ifndef _WIN32
+static int parent_synced(const char *path) {             /* the folder that holds path synced (APPLY); one that is gone has nothing to sync */
+    int r = host_fsync_parent(path);
+    return r == 0 || r == -ENOENT || r == -ENOTDIR;
+}
+#endif
 /* A copy of the tree `from` as `to` (folders and files). durable: every folder synced after its entries. 1 = complete. */
 static int copy_tree(const char *from, const char *to, int durable) {
     char pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
@@ -715,7 +724,7 @@ static int copy_tree(const char *from, const char *to, int durable) {
         else SetFileAttributesA(b, FILE_ATTRIBUTE_NORMAL);
     } while (ok && FindNextFileA(h, &fd));
     FindClose(h);
-    if (ok && durable) sync_folder(to);
+    if (ok && durable && !sync_folder(to)) ok = 0;
     return ok;
 }
 /* The M and F lines of every entry of the folder, depth first; each file is flushed first. 1 = every file reached the disk. */
@@ -782,17 +791,20 @@ static int journal_apply(const char *marker) {
             join(a, root, arg);
             if (!delete_entry(a)) { fclose(j); return -3; }           /* before any F: the next APPLY does the D phase again */
 #ifndef _WIN32
-            host_fsync_parent(a);                         /* on disk before the marker goes: a deleted file must not come back */
+            if (!parent_synced(a)) { fclose(j); return -3; }          /* on disk before the marker goes: a deleted file must not come back */
 #endif
         } else if (line[0] == 'M') {
             join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL);
             if (!is_dir(a)) { fclose(j); return -2; }
 #ifndef _WIN32
-            host_fsync_parent(a);
+            if (!parent_synced(a)) { fclose(j); return -2; }
 #endif
         } else if (line[0] == 'F') {
             join(a, work, arg); join(b, root, arg);
             if (exists(a)) { make_parents(b); if (!move_over(a, b)) { fclose(j); return -2; } }
+#ifndef _WIN32
+            else if (!parent_synced(b)) { fclose(j); return -2; }     /* moved by an earlier APPLY, whose sync may have failed */
+#endif
             n++;
         }
     }
@@ -994,7 +1006,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
         step = "stage";
         ok = !exists(stage) && copy_tree(m->work, stage, 1);
 #ifndef _WIN32
-        if (ok) host_fsync_parent(stage);
+        if (ok) ok = host_fsync_parent(stage) == 0;
 #endif
     }
     if (ok) {                                                                   /* C3 */

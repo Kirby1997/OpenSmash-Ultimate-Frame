@@ -2210,6 +2210,17 @@ static int plat_ci_fix(char *out) {
     }
     return stat(out, &st) == 0;
 }
+/* fsync of an open file or folder: 0, or -errno on a real failure (EIO and the rest). A file system that cannot sync at all
+ * (EINVAL, ENOTSUP, ENOSYS: some network and FUSE ones, for folders) is not a failure: it is said once, and the caller goes on
+ * without the power-cut guarantee (failing there would refuse every save on such a file system, for good). */
+static int plat_fsync(int fd) {
+    if (!fsync(fd)) return 0;
+    int e = errno;
+    if (e != EINVAL && e != ENOTSUP && e != ENOSYS) return -e;
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) fprintf(stderr, "plat: this file system cannot sync files or folders (%s): saved files may not survive a power cut\n", strerror(e));
+    return 0;
+}
 /* host_path_resolve (datapaths.c, C10): `in` -> `out`: '\\' becomes '/', existing components get their stored case, the missing tail is kept. 1 = it exists. */
 int host_path_resolve(const char *in, char *out, size_t n) {
     char t[PATH_MAX];
@@ -2243,7 +2254,7 @@ int host_fsync_parent(const char *path) {
     if (!s) strcpy(rp, "."); else if (s == rp) rp[1] = 0; else *s = 0;
     int fd = open(rp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) return -errno;
-    int r = fsync(fd) == 0 ? 0 : -errno;
+    int r = plat_fsync(fd);
     close(fd);
     return r;
 }
@@ -2443,7 +2454,9 @@ failed:
     return -1;
 }
 /* rename() is atomic. MOVEFILE_REPLACE_EXISTING replaces the target in the same step; without it nothing at `to` is replaced
- * (rename_noreplace), as on Windows. */
+ * (rename_noreplace), as on Windows. MOVEFILE_WRITE_THROUGH: the file's data reaches the disk before the rename, so its new
+ * name never does without it, and the folders of both names after it; a failed fsync fails the call (before the rename: not
+ * moved; after it: moved, but not known to be on the disk). A file system that cannot sync is not a failure (plat_fsync). */
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
     char a[PATH_MAX], b[PATH_MAX], want[PATH_MAX];
     P(from, a); P(to, b);
@@ -2458,7 +2471,7 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
     }
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* the data first: the new name must never reach the disk before it */
         int fd = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd >= 0) { if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fsync(fd)) { int e = errno; close(fd); errno = e; return fail_errno(); } close(fd); }
+        if (fd >= 0) { int r = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) ? plat_fsync(fd) : 0; close(fd); if (r) { errno = -r; return fail_errno(); } }
     }
     if (flags & MOVEFILE_REPLACE_EXISTING ? rename(a, b) : rename_noreplace(a, b)) return fail_errno();     /* EEXIST: ERROR_ALREADY_EXISTS */
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* then both folder entries on disk before returning */
@@ -2474,8 +2487,8 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
             if (k && !strcmp(da, db)) break;
             int fd = open(d[k], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (fd < 0) return fail_errno();
-            int r = fsync(fd); int e = errno; close(fd);
-            if (r) { errno = e; return fail_errno(); }
+            int r = plat_fsync(fd); close(fd);
+            if (r) { errno = -r; return fail_errno(); }
         }
     }
     return TRUE;
