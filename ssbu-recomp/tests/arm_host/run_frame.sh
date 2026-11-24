@@ -1,11 +1,11 @@
 #!/bin/sh
-# Lifter / runtime checks for an ARM host (PORT_AUDIT Phase 2).
+# Lifter / runtime checks for an ARM host (memory ordering, exact FP, native NEON).
 #   tests/arm_host/run_frame.sh [fp random pairs = 20000000] [litmus iterations = 1000000]
 #       on the Frame (aarch64 Linux): everything runs here, in this checkout (the same as --local)
 #   tests/arm_host/run_frame.sh --local [pairs] [iterations]
 #       the same on any host. Needs python3, and for the checks themselves a GNU/LLVM toolchain with `as` and objdump.
 #   tests/arm_host/run_frame.sh <ssh host> [pairs] [iterations]
-#       from a PC: the original flow, host = steamos@frame for example
+#       from a PC: <ssh host> is the aarch64 device (an ssh destination with key login)
 # 1. decoder test (python3), lifted litmus programs, software-FP hash (cc / clang, -DSOFT_ONLY)
 # 2. the target runs frame_tests.sh: codegen of the ordering macros, litmus tests, FP vs. the instructions, neon.h native vs.
 #    portable. From a PC, runtime/{runtime,fpexact,neon}.h and this directory are copied to ~/ssbu-port/lifter/ on the host
@@ -65,7 +65,10 @@ if [ "$MODE" = local ]; then
     exit $st
 fi
 
-HOST=${1:-steamos@frame}
+HOST=${1:-}
+case "$HOST" in
+"" | [0-9]* | -*) echo "usage: $0 <ssh host> [pairs] [iterations]   (or, on an aarch64 Linux host: $0 [--local] [pairs] [iterations])"; exit 2 ;;
+esac
 PAIRS=${2:-20000000}
 ITERS=${3:-1000000}
 W=$(mktemp -d)
@@ -76,7 +79,7 @@ python3 "$HERE/test_lifter_atomics.py" --gen "$W/litmus_gen.h"
 python3 "$HERE/test_lifter_atomics.py" --asm > "$W/litmus.s"
 python3 "$HERE/test_lifter_atomics.py" --words > "$W/litmus.words"
 
-CC=${CC:-$(command -v clang-15 || command -v clang || command -v cc)}
+CC=${CC:-$(command -v clang-19 || command -v clang || command -v cc)}
 "$CC" -O1 -fno-strict-aliasing -ffp-contract=off -DSOFT_ONLY -w -I"$ROOT/runtime" "$HERE/fp_native_test.c" -o "$W/fp_soft" -lm -lpthread
 "$W/fp_soft" "$PAIRS" | grep soft-hash > "$W/x86.hash"
 echo "x86 ($CC): $(cat "$W/x86.hash")"

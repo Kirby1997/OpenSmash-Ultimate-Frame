@@ -7,8 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifndef __aarch64__
-#error "AArch64 only: compares the native NEON paths with the portable ones"
+#if !RECOMP_A64_NATIVE
+#error "RECOMP_A64_NATIVE only (aarch64 Linux): compares the native NEON paths with the portable ones"
 #endif
 
 static uint64_t rng = 0x2545f4914f6cdd1dull;
