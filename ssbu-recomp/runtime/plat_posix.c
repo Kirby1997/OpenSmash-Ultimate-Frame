@@ -9,7 +9,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <fnmatch.h>
 #include <dlfcn.h>
 #ifndef __APPLE__
 #include <link.h>
@@ -365,9 +364,7 @@ typedef struct PlatObj {
     /* files, finds, mappings */
     int fd;
     DIR *dir; char dir_path[MAX_PATH]; char pattern[MAX_PATH];
-#ifdef PLAT_A64_LINUX
     char **fnames; int nfn, ifn;                   /* a find: the folder's names in NTFS order (find_collect), the next one to give */
-#endif
     size_t map_size;
 } PlatObj;
 #define PSEUDO_PROCESS ((HANDLE)(intptr_t)-1)
@@ -392,10 +389,8 @@ static void obj_release(PlatObj *o) {
     if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL)) return;
     if (o->fd >= 0) close(o->fd);
     if (o->dir) closedir(o->dir);
-#ifdef PLAT_A64_LINUX
     for (int i = 0; i < o->nfn; i++) free(o->fnames[i]);
     free(o->fnames);
-#endif
     pthread_mutex_destroy(&o->m);
     pthread_cond_destroy(&o->cv);
     free(o);
@@ -1996,10 +1991,11 @@ HANDLE CreateFileMappingA(HANDLE f, SECURITY_ATTRIBUTES *sa, DWORD prot, DWORD h
     if (!o->map_size) { struct stat st; fstat(o->fd, &st); o->map_size = (size_t)st.st_size; }
     return o;
 }
-/* The views of every thread (nvn_vk_store.c maps them from its workers) in one table, guarded by g_vm_lock: a view is entered
- * in the same hold that maps it and leaves the table in the same hold that unmaps it, so two threads never take one slot, and
- * an address mapped again by another thread at once (low_place packs views tightly on aarch64 Linux) cannot be unmapped
- * through a stale slot. A full table fails the map (ERROR_NOT_ENOUGH_MEMORY) rather than leak a view nobody can unmap. */
+/* The views of every thread (nvn_vk_store.c maps them from its workers) in one table, guarded by g_vm_lock. Only the table is
+ * touched under the lock; mmap and munmap run outside it (unmapping a 64 MB view takes milliseconds). A view enters the table
+ * after its mmap and leaves it before its munmap, so its address, still mapped while it is in the table, cannot be handed to
+ * another view in between, two threads never take one slot, and of two unmaps of one view only the first finds it. A full
+ * table fails the map (ERROR_NOT_ENOUGH_MEMORY) rather than return a view nobody can unmap. */
 typedef struct { void *p; size_t n; } View;
 #define VIEW_MAX 256
 static View g_views[VIEW_MAX];
@@ -2007,35 +2003,36 @@ LPVOID MapViewOfFile(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n) {
     PlatObj *o = m;
     off_t off = (off_t)(((uint64_t)hi << 32) | lo);
     if (!n) n = o->map_size - (size_t)off;
-    int prot = (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
-    vm_lock();
-    int slot = -1;
-    for (int i = 0; i < VIEW_MAX && slot < 0; i++) if (!g_views[i].p) slot = i;
-    if (slot < 0) { vm_unlock(); t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
 #if defined(__aarch64__) && !defined(__APPLE__)
     /* aarch64 Linux: mmap(NULL) puts the view at 0xffff_xxxx_xxxx, above the 2^47 that every pointer the guest sees stays under, and the
      * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place reserves the range below 2^47
-     * (as VirtualAlloc does), the file is mapped over it. (linux-arm64 vks_base was placed the same way.) */
+     * (as VirtualAlloc does; its cursor wants g_vm_lock), the file is mapped over it. (linux-arm64 vks_base was placed the same way.) */
+    int prot = (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
     size_t pg = (size_t)sysconf(_SC_PAGESIZE), rn = (n + pg - 1) & ~(pg - 1);
+    vm_lock();
     void *res = low_place(rn, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    vm_unlock();
     void *p = res == MAP_FAILED ? MAP_FAILED : mmap(res, n, prot, MAP_SHARED | MAP_FIXED, o->fd, off);
     if (res != MAP_FAILED && p == MAP_FAILED) { int e = errno; munmap(res, rn); errno = e; }
 #else
-    void *p = mmap(NULL, n, prot, MAP_SHARED, o->fd, off);
+    void *p = mmap(NULL, n, (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, o->fd, off);
 #endif
-    if (p != MAP_FAILED) { g_views[slot].p = p; g_views[slot].n = n; }
-    int e = errno;
+    if (p == MAP_FAILED) { fail_errno(); return NULL; }
+    int slot = -1;
+    vm_lock();
+    for (int i = 0; i < VIEW_MAX && slot < 0; i++) if (!g_views[i].p) { slot = i; g_views[i].p = p; g_views[i].n = n; }
     vm_unlock();
-    if (p == MAP_FAILED) { errno = e; fail_errno(); return NULL; }
+    if (slot < 0) { munmap(p, n); t_lasterr = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
     return p;
 }
 BOOL UnmapViewOfFile(LPCVOID p) {
+    View v = { NULL, 0 };
     vm_lock();
-    for (int i = 0; i < VIEW_MAX; i++)
-        if (p && g_views[i].p == p) { munmap(g_views[i].p, g_views[i].n); g_views[i].p = NULL; vm_unlock(); return TRUE; }
+    for (int i = 0; i < VIEW_MAX && p && !v.p; i++) if (g_views[i].p == p) { v = g_views[i]; g_views[i].p = NULL; }
     vm_unlock();
-    t_lasterr = ERROR_INVALID_ADDRESS;
-    return FALSE;
+    if (!v.p) { t_lasterr = ERROR_INVALID_ADDRESS; return FALSE; }
+    munmap(v.p, v.n);
+    return TRUE;
 }
 
 /* ================================================================ C runtime */
@@ -2413,40 +2410,58 @@ BOOL SetFileAttributesA(LPCSTR path, DWORD attr) { (void)path; (void)attr; retur
 BOOL CreateDirectoryA(LPCSTR path, SECURITY_ATTRIBUTES *sa) { (void)sa; char b[PATH_MAX]; P(path, b); plat_ci_pre(b); return mkdir(b, 0777) ? fail_errno() : TRUE; }
 BOOL RemoveDirectoryA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (rmdir(b) && !(plat_ci_retry(b) && !rmdir(b))) return fail_errno(); return TRUE; }
 BOOL DeleteFileA(LPCSTR path) { char b[PATH_MAX]; P(path, b); if (unlink(b) && !(plat_ci_retry(b) && !unlink(b))) return fail_errno(); return TRUE; }
-/* rename that fails with EEXIST when `b` exists, in one step (nnfs.c's commit marker relies on it): renameat2 RENAME_NOREPLACE on
- * Linux (link + unlink for a file where the file system lacks it), renamex_np RENAME_EXCL on macOS. A folder on a file system
- * with neither falls back to a plain rename after the caller's existence check. */
+/* rename() without replacing what is at `b` (Windows' MoveFileEx without MOVEFILE_REPLACE_EXISTING fails there with
+ * ERROR_ALREADY_EXISTS), in one step, so a name another process or thread makes in between is never replaced: renameat2's
+ * RENAME_NOREPLACE on Linux, renamex_np's RENAME_EXCL on macOS. On a file system without those, a file gets its new name by
+ * link, which never replaces, then loses the old; a folder (or a file on a file system without links: FAT) is looked for first
+ * and then renamed, which a process making `b` in between could race. A change of case only, which a case-insensitive file
+ * system sees as `b` being there already, is a rename, as on Windows. -1 with errno if not done (EEXIST: `b` is there). */
 static int rename_noreplace(const char *a, const char *b) {
-#if defined(__APPLE__)
-    if (!renamex_np(a, b, RENAME_EXCL) || errno == EEXIST) return errno == EEXIST ? -1 : 0;
-#else
-#if defined(SYS_renameat2) && defined(RENAME_NOREPLACE)
-    if (!syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE)) return 0;
-    if (errno != EINVAL && errno != ENOSYS) return -1;
+    struct stat sa, sb;
+#ifdef __APPLE__
+    if (!renamex_np(a, b, RENAME_EXCL)) return 0;
+    if (errno != ENOTSUP && errno != EINVAL) goto failed;
+#elif defined(SYS_renameat2)
+    if (!syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, 1 /* RENAME_NOREPLACE */)) return 0;
+    if (errno != ENOSYS && errno != EINVAL) goto failed;
 #endif
-    struct stat st;
-    if (!lstat(a, &st) && !S_ISDIR(st.st_mode)) {
-        if (link(a, b)) return -1;                        /* EEXIST: the target appeared */
-        unlink(a);
-        return 0;
+    if (lstat(a, &sa)) return -1;
+    if (!S_ISDIR(sa.st_mode)) {
+        if (!link(a, b)) {
+            if (!unlink(a)) return 0;
+            int e = errno;
+            unlink(b);
+            errno = e;
+            return -1;
+        }
+        if (errno == EEXIST) goto failed;
     }
-#endif
+    if (!lstat(b, &sb)) { errno = EEXIST; goto failed; }
     return rename(a, b);
+failed:
+    if (errno == EEXIST && !strcasecmp(a, b) && !lstat(a, &sa) && !lstat(b, &sb) && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino)
+        return rename(a, b);
+    return -1;
 }
-BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {      /* rename() replaces the target in one step, as MOVEFILE_REPLACE_EXISTING does */
-    char a[PATH_MAX], b[PATH_MAX];
+/* rename() is atomic. MOVEFILE_REPLACE_EXISTING replaces the target in the same step; without it nothing at `to` is replaced
+ * (rename_noreplace), as on Windows. */
+BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
+    char a[PATH_MAX], b[PATH_MAX], want[PATH_MAX];
     P(from, a); P(to, b);
-    struct stat st;
+    struct stat st, sb;
     if (lstat(a, &st) && plat_ci_retry(a)) {}
+    snprintf(want, sizeof want, "%s", b);
     plat_ci_pre(b);                                      /* the target's folders and, if it exists, its stored name */
-    if (!(flags & MOVEFILE_REPLACE_EXISTING) && !access(b, F_OK)) { t_lasterr = ERROR_ALREADY_EXISTS; return FALSE; }
+    if (strcmp(want, b) && !lstat(a, &st) && !lstat(b, &sb) && st.st_dev == sb.st_dev && st.st_ino == sb.st_ino) {
+        /* a change of case only: the look-up found the source itself; the folders as stored, the new name as asked */
+        char *bs = strrchr(b, '/'); const char *ws = strrchr(want, '/');
+        if (bs && ws) snprintf(bs + 1, sizeof b - (size_t)(bs + 1 - b), "%s", ws + 1); else if (!bs && !ws) strcpy(b, want);
+    }
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* the data first: the new name must never reach the disk before it */
         int fd = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd >= 0) { if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fsync(fd)) { int e = errno; close(fd); errno = e; return fail_errno(); } close(fd); }
     }
-    if (!(flags & MOVEFILE_REPLACE_EXISTING)) {          /* as on Windows, atomically: a target that appears after the check above is not replaced */
-        if (rename_noreplace(a, b)) { if (errno == EEXIST) { t_lasterr = ERROR_ALREADY_EXISTS; return FALSE; } return fail_errno(); }
-    } else if (rename(a, b)) return fail_errno();
+    if (flags & MOVEFILE_REPLACE_EXISTING ? rename(a, b) : rename_noreplace(a, b)) return fail_errno();     /* EEXIST: ERROR_ALREADY_EXISTS */
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* then both folder entries on disk before returning */
         char da[PATH_MAX], db[PATH_MAX];
         const char *p[2] = {b, a};
@@ -2471,18 +2486,21 @@ BOOL CopyFileA(LPCSTR from, LPCSTR to, BOOL fail_if_exists) {
     int in = open(P(from, a), O_RDONLY | O_CLOEXEC);
     if (in < 0 && plat_ci_retry(a)) in = open(a, O_RDONLY | O_CLOEXEC);      /* as CreateFileA: the source in another case */
     if (in < 0) return fail_errno();
+    struct stat st;
+    if (!fstat(in, &st) && S_ISDIR(st.st_mode)) { close(in); t_lasterr = ERROR_ACCESS_DENIED; return FALSE; }      /* as Windows: before the target is touched */
     plat_ci_pre(P(to, b));                                                  /* an existing target in another case is the one written */
     int out = open(b, O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
     if (out < 0) { close(in); return fail_errno(); }
-    char buf[1 << 16]; ssize_t k; BOOL ok = TRUE;      /* a read error (EIO, EISDIR) or a short write fails the copy, and no partial target is left */
+    char buf[1 << 16]; ssize_t k; BOOL ok = TRUE;      /* a read error (EIO) or a short write fails the copy, and no partial target is left */
     while ((k = read(in, buf, sizeof buf)) != 0) {
         if (k < 0) { if (errno == EINTR) continue; ok = fail_errno(); break; }
         ssize_t w = write(out, buf, (size_t)k);
         if (w != k) { if (w >= 0) errno = ENOSPC; ok = fail_errno(); break; }
     }
     close(in);
+    int reg = !fstat(out, &st) && S_ISREG(st.st_mode);                     /* (a device or FIFO given as the target is never unlinked) */
     if (close(out) && ok) ok = fail_errno();
-    if (!ok) { DWORD e = t_lasterr; unlink(b); t_lasterr = e; }
+    if (!ok && reg) { DWORD e = t_lasterr; unlink(b); t_lasterr = e; }
     return ok;
 }
 DWORD GetTempPathA(DWORD n, LPSTR out) { const char *t = getenv("TMPDIR"); int k = snprintf(out, n, "%s/", t && t[0] ? t : "/tmp"); return (DWORD)k; }
@@ -2505,19 +2523,30 @@ DWORD GetFullPathNameA(LPCSTR path, DWORD n, LPSTR out, LPSTR *file) {
     if (file) { char *s = strrchr(out, '/'); *file = s ? s + 1 : out; }
     return k;
 }
-#ifdef PLAT_A64_LINUX
-/* A folder listing in NTFS order. NTFS lists a folder sorted by upper-case ordinal; readdir gives the file system's own order (a
- * hash on ext4 and btrfs, different from disk to disk), and the game and the mods it loads see these listings (nnfsdir.c). The names
- * are read at FindFirstFileA, sorted like the case-insensitive lookup does (ASCII fold, then the bytes), and given in that order
- * (linux-arm64 hostpath.c did this). Win32 wildcards: '*' and '?' only, so "[1]*" means a name starting with "[1]" (fnmatch would
- * read a character class); "*.*" is everything. */
+/* A folder listing in NTFS order. NTFS lists "." and ".." first, then the names sorted by upper-case ordinal; readdir gives the
+ * file system's own order (a hash on ext4 and btrfs, APFS's own: different from disk to disk), and the game and the mods it loads
+ * see these listings (nnfs.c's save folders and journal, loose_files.c, skyline.c, fighter_sdk's *.dll scans). The names are read
+ * at FindFirstFileA, sorted (ASCII fold, then the bytes) and given in that order: the search is a snapshot, as every caller here
+ * lists a folder in one go. Win32 wildcards, ignoring case: '*' any run of characters (dots too), '?' one character (one UTF-8
+ * sequence), "*.*" everything; there are no [ ] classes, so "[1]*" means a name starting with "[1]" (fnmatch read a class).
+ * Simplifications: only a-z are folded (NTFS upper-cases other alphabets too), names past U+FFFF sort by code point rather than
+ * as UTF-16 surrogates, and DOS's special patterns ("*.", "a.*" matching "a", a trailing '?' matching nothing) and 8.3 short
+ * names are not matched. The sort is the case-insensitive lookup's (ci_order). */
+static int find_dots(const char *s) { return s[0] != '.' ? 0 : !s[1] ? 1 : s[1] == '.' && !s[2] ? 2 : 0; }      /* "." 1, ".." 2 */
+static int find_order(const void *x, const void *y) {          /* "." and ".." first, then NTFS's order */
+    int a = find_dots(*(const char *const *)x), b = find_dots(*(const char *const *)y);
+    if (a || b) return (a ? a : 3) - (b ? b : 3);
+    return ci_order(x, y);
+}
+static const char *utf8_next(const char *s) { for (s++; (*(const unsigned char *)s & 0xC0) == 0x80; s++) {} return s; }
 static int find_wild(const char *p, const char *n) {
     const char *star = NULL, *sn = NULL;
     for (;;) {
         if (*p == '*') { star = p++; sn = n; continue; }
-        if (*n && *p && (*p == '?' || (*p >= 'a' && *p <= 'z' ? *p - 32 : *p) == (*n >= 'a' && *n <= 'z' ? *n - 32 : *n))) { p++; n++; continue; }
+        if (*n && *p == '?') { p++; n = utf8_next(n); continue; }
+        if (*n && *p && (*p >= 'a' && *p <= 'z' ? *p - 32 : *p) == (*n >= 'a' && *n <= 'z' ? *n - 32 : *n)) { p++; n++; continue; }
         if (!*p && !*n) return 1;
-        if (star && *sn) { p = star + 1; n = ++sn; continue; }       /* the last '*' takes one more character */
+        if (star && *sn) { p = star + 1; n = sn = utf8_next(sn); continue; }       /* the last '*' takes one more character */
         return 0;
     }
 }
@@ -2543,26 +2572,21 @@ static void find_collect(PlatObj *o) {           /* out of memory: the folder is
     }
     closedir(o->dir);
     o->dir = NULL;
-    qsort(names, (size_t)n, sizeof *names, ci_order);
+    qsort(names, (size_t)n, sizeof *names, find_order);
     o->fnames = names; o->nfn = n;
 }
-#endif
 static BOOL find_next(PlatObj *o, WIN32_FIND_DATAA *fd) {
-    struct dirent *e;
     for (;;) {
         const char *name;
-#ifdef PLAT_A64_LINUX
         if (o->fnames) {
             if (o->ifn >= o->nfn) break;
             name = o->fnames[o->ifn++];
-            if (!find_wild(o->pattern, name)) continue;
-        } else
-#endif
-        {
-            if (!(e = readdir(o->dir))) break;
+        } else {
+            struct dirent *e = o->dir ? readdir(o->dir) : NULL;
+            if (!e) break;
             name = e->d_name;
-            if (fnmatch(o->pattern, name, FNM_CASEFOLD)) continue;
         }
+        if (!find_wild(o->pattern, name)) continue;
         char full[PATH_MAX]; struct stat st;
         snprintf(full, sizeof full, "%s/%s", o->dir_path, name);
         memset(fd, 0, sizeof *fd);
@@ -2588,9 +2612,7 @@ HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *fd) {
     o->dir = opendir(o->dir_path);
     if (!o->dir && plat_ci_retry(o->dir_path)) o->dir = opendir(o->dir_path);
     if (!o->dir) { fail_errno(); if (t_lasterr == ERROR_FILE_NOT_FOUND) t_lasterr = ERROR_PATH_NOT_FOUND; obj_release(o); return INVALID_HANDLE_VALUE; }
-#ifdef PLAT_A64_LINUX
     find_collect(o);
-#endif
     if (!find_next(o, fd)) { obj_release(o); t_lasterr = ERROR_FILE_NOT_FOUND; return INVALID_HANDLE_VALUE; }
     return o;
 }

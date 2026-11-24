@@ -4,6 +4,7 @@
 #   test_virtual   VirtualAlloc / Free / Protect / Query: fixed addresses, collisions, commit cycles, host memory, a walk, 8 threads
 #   test_readable  IsBadReadPtr (VirtualQuery) against plat_crash.c's crash_read (the kernel's EFAULT) on every kind of memory
 #   test_modules   LoadLibraryA / GetModuleHandleExA / GetProcAddress / GetModuleFileNameA: how nncxxrt.c binds the game library
+#   test_files     FindFirstFileA order and wildcards, MoveFileExA without replacing, CopyFileA from a folder, file views (8 threads)
 #   test_crypto    BCryptHash SHA-256 (built in; nnro.c's NRR check) and the CryptoAPI SHA-1 / MD5 / SHA-256 (OpenSSL) against vectors
 # No game data. SDL3 is a stand-in (no test reaches it); libcrypto is the system's when there is one (else test_crypto skips
 # its OpenSSL half).
@@ -47,7 +48,7 @@ if [ -n "$HEAP" ]; then $CC $F -c $HEAP -o "$OUT/plat_heap.o"; OBJS="$OBJS $OUT/
 nat_stubs "$OUT/stubs.c" "$OUT/plat_posix.o"                       # abort() stubs for the SDL_* / EVP_* symbols no real library gives
 $CC $F -c "$OUT/stubs.c" -o "$OUT/stubs.o"
 OBJS="$OBJS $OUT/stubs.o"
-for t in test_virtual test_readable test_crypto; do
+for t in test_virtual test_readable test_crypto test_files; do
     $CC $F $T/$t.c $OBJS $L -o "$OUT/$t"
 done
 # the headers, both orders, held to -Wall -Wextra -Werror
@@ -59,7 +60,7 @@ $CC "$OUT/hdr_first.o" "$OUT/hdr_last.o" $OBJS $L -o "$OUT/test_headers"
 $CC $F $SHARED $T/dlbind_lib.c -o "$OUT/dlbind_lib$SO"
 $CC $F $T/test_modules.c $OBJS "$OUT/dlbind_lib$SO" $RPATH $L -o "$OUT/test_modules"
 fail=0
-for t in test_headers test_virtual test_readable test_modules test_crypto; do
+for t in test_headers test_virtual test_readable test_modules test_crypto test_files; do
     echo "== $OUT/$t"
     timeout 300 "$OUT/$t" || { echo "$t: exit $?"; fail=1; }
 done
