@@ -61,7 +61,7 @@ namespace OpenSmash.Launcher
             ["volume"] = "The game's whole sound (display.ini volume, the same setting as the in-game menu's Volume row). 100 is full. It applies the next time you press Play.",
             ["name"] = "What other players see. Leave it empty and the game picks one.",
             ["lobby"] = "Official lobby: your region's server, every match relayed. Private: only players with the same code. LAN: players on this network. Offline: no network.",
-            ["region"] = "Players on another region are not listed.",   // (Europe or North America East: OpenSmash.Core.OnlineSettings)
+            ["region"] = "Players on another region are not listed.",   // (Europe, North America East or South America: OpenSmash.Core.OnlineSettings)
             ["code"] = "A word your friends type too. Capital letters count.",
             ["server"] = "host:port of a lobby you run, for example 192.168.1.20:39420.",
             ["direct"] = "Rooms on this network and private rooms only. On is faster and announces your room. The official lobbies never connect players directly.",
@@ -2083,6 +2083,8 @@ namespace OpenSmash.Launcher
             string message = string.IsNullOrEmpty(_updateMessage) ? "Check GitHub for a newer version of OpenSmash. Play is paused while an update installs." : _updateMessage;
             Theme.DrawWrapped(g, message, FB(15 * s), A(Theme.Muted), x + pad, ty, cwIn - pad * 2, 64 * s);
             if (!string.IsNullOrEmpty(_updateDetail)) Theme.DrawWrapped(g, _updateDetail, FB(13 * s), A(Theme.Dim), x + pad, ty + 70 * s, cwIn - pad * 2, 54 * s);
+            // (the three versions a report asks for: OpenSmash.Core.VersionInfo; the game's Esc menu shows them too)
+            Theme.Label(g, OpenSmash.Core.VersionInfo.Line(_repo), FM(12 * s), A(Theme.Dim), x + pad, listTop + ch - 110 * s, 16 * s, 12 * s * 0.08f);
             if (_updateLocal.Length > 0 || _updateHead.Length > 0)
             {
                 Font vf = FM(12 * s);

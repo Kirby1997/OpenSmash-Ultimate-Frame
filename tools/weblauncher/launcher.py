@@ -211,11 +211,11 @@ CHOICES = {
                      ("2", "2: 3840x2160 (4K)"), ("3", "3: 5760x3240")],
     "overlay": [("1", "Show it in the corner"), ("0", "Hidden")],
     "hide_cursor": [("1", "When it stops moving"), ("0", "Keep it shown")],
-    "lobby": [("public", "Official lobby (relay only, EU / NA East)"), ("private", "Private lobby (a code)"), ("custom", "Your own server"),
+    "lobby": [("public", "Official lobby (relay only, EU / NA East / SA)"), ("private", "Private lobby (a code)"), ("custom", "Your own server"),
               ("lan", "This network (LAN)"), ("offline", "Offline")],
     # (our regions only, as OpenSmash.Core.OnlineSettings: "auto" in the file - the game's default, the closest - is shown as
     # the region it plays on and written only when one is picked)
-    "region": [(r[0], {"eu": "Europe", "na-east": "North America East"}.get(r[0], r[1])) for r in server_region.REGIONS],
+    "region": [(r[0], {"eu": "Europe", "na-east": "North America East", "sa": "South America"}.get(r[0], r[1])) for r in server_region.REGIONS],
     "direct": [("on", "On"), ("off", "Off")],
     "keyboard_player": [(str(n), f"Player {n}") for n in range(1, 9)] + [("0", "Nobody (no keyboard)")],
     "background": [("1", "Work while another window is in front"), ("0", "Only while the game is in front")],
@@ -279,7 +279,7 @@ def read_settings(root):
         s["server"] = saved["server"]
     s["direct"] = "off" if first_line(config_file(root, "online_direct.txt")).lower().startswith("off") else "on"
     s["name"] = first_line(config_file(root, "online_name.txt"))
-    # the official lobby's region: Europe or North America East ("auto" shows as the region it plays on); region_shown: an
+    # the official lobby's region: Europe, North America East or South America ("auto" shows as the region it plays on); region_shown: an
     # override's server
     s["region"] = region_choice(root)
     s["region_shown"] = server_region.override(root) or ""
@@ -506,11 +506,42 @@ SIGN_IN_SAY = ("Sign in with the OpenSmash launcher to play on the official lobb
                "Offline still work.")
 
 
-def online_pass(root, settings, now=None):
+RENEW_MARGIN = 600   # (as tools/mac/launch.sh: a ticket with less than 10 minutes left is asked for again at Play)
+
+
+def launcher_program(root, host=HOST):
+    """The OpenSmash launcher's program in this folder (tools/launcher_fetch.py puts it there), or None."""
+    path = {"macos": os.path.join(root, "OpenSmash.Avalonia.app", "Contents", "MacOS", "OpenSmash.Avalonia"),
+            "linux": os.path.join(root, "OpenSmash-Launcher")}.get(host)
+    return path if path and os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def renew_pass(root, host=HOST, run=subprocess.run):
+    """At Play: the launcher asked, with no window, for a fresh ticket from the session signed in there
+    (OpenSmash.Avalonia --online-pass: build/cache/online_pass.txt) when the one there is missing or about to expire.
+    What it said, or "" when it was not asked."""
+    if discord_account.stored_ticket(root, RENEW_MARGIN) is not None:
+        return ""
+    program = launcher_program(root, host)
+    if program is None:
+        return ""
+    try:
+        r = run([program, "--online-pass", "--project", root], cwd=root, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=15)
+        lines = (r.stdout or "").strip().splitlines()
+        return lines[-1] if lines else ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"online pass: the OpenSmash launcher did not answer ({e})"
+
+
+def online_pass(root, settings, now=None, renew=False):
     """(the game's variables, what to say) for Play: SSBU_ONLINE_TICKET_FILE when the lobby is an official one and a
-    signed-in launcher left a ticket that is still good, else ({}, SIGN_IN_SAY); other lobbies: ({}, "")."""
+    signed-in launcher left a ticket that is still good (with renew, the launcher asked for one first: renew_pass),
+    else ({}, SIGN_IN_SAY); other lobbies: ({}, "")."""
     if settings.get("lobby") not in ("public", "private"):
         return {}, ""
+    if renew:
+        renew_pass(root)
     if discord_account.stored_ticket(root, TICKET_MARGIN, now) is None:
         if os.environ.get("OPENSMASH_LAUNCHER_FAILED"):   # (opensmash-launcher.sh: OpenSmash-Launcher did not start here)
             return {}, SIGN_IN_SAY + (" The OpenSmash launcher did not start on this computer: its reason is in "
@@ -770,7 +801,7 @@ class App:
         env = {**os.environ}
         say = ""
         if mode != "offline":
-            extra, say = online_pass(self.root, settings)
+            extra, say = online_pass(self.root, settings, renew=True)
             env.update(extra)
         self.game = subprocess.Popen(play_command(self.root, mode), cwd=self.root, stdin=subprocess.DEVNULL, stdout=out,
                                      stderr=subprocess.STDOUT, env=env)
