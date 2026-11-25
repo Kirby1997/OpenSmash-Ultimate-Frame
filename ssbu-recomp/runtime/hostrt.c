@@ -259,6 +259,7 @@ uint64_t guest_function_of(uint64_t rip) {
 typedef struct { char name[72]; ImportFn fn; volatile LONG64 calls; LONG64 first; void (*fnu)(Ctx *, void *); void *user; } HostFn;
 #define MAX_HOSTFN 16384
 static HostFn g_hostfn[MAX_HOSTFN];
+static int g_import_count_all;                    /* (with the imports below: SSBU_IMPORT_COUNTS / SSBU_AUDIT_COUNTS) */
 static volatile LONG g_hostfn_count;
 static volatile LONG64 g_hostfn_seq;
 static SRWLOCK g_hostfn_lock = SRWLOCK_INIT;
@@ -316,7 +317,8 @@ void print_hostfn_summary(FILE *out) {
     for (int i = 0; i < n; i++) if (g_hostfn[i].calls) order[used++] = i;
     for (int i = 1; i < used; i++)
         for (int j = i; j > 0 && g_hostfn[order[j]].first < g_hostfn[order[j - 1]].first; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
-    fprintf(out, "\nrun-time host functions: %d handed out, %d called, in order of first call:\n", n, used);
+    fprintf(out, "\nrun-time host functions: %d handed out, %d called, in order of first call%s:\n", n, used,
+            g_import_count_all ? "" : " (counted up to 4 calls; SSBU_IMPORT_COUNTS=1 counts every call)");
     for (int i = 0; i < used; i++) fprintf(out, "  %8lld  %s\n", (long long)g_hostfn[order[i]].calls, g_hostfn[order[i]].name);
     free(order);
 }
@@ -409,9 +411,11 @@ static __attribute__((noinline)) void call_hostfn(Ctx *c, int i) {
     HostFn *h = &g_hostfn[i];
     /* the call count is a diagnostic (print_hostfn_summary, the audit): a plain increment after the first call, which may
      * lose a count when two threads call the same function at once. The first call is still counted exactly once (the
-     * atomic increment from 0), and only it does the first-call work. No locked read-modify-write per call. */
+     * atomic increment from 0), and only it does the first-call work. No locked read-modify-write per call. As for the
+     * imports, the count stops at 4 unless SSBU_IMPORT_COUNTS or SSBU_AUDIT_COUNTS is set (nvn_stub.c traces the first
+     * 3 calls): no store per call into a line that two threads calling the same function would pass back and forth. */
     LONG64 n = __atomic_load_n(&h->calls, __ATOMIC_RELAXED);
-    if (n) __atomic_store_n(&h->calls, n + 1, __ATOMIC_RELAXED);
+    if (n) { if (n < 4 || g_import_count_all) __atomic_store_n(&h->calls, n + 1, __ATOMIC_RELAXED); }
     else if (InterlockedIncrement64(&h->calls) == 1) {
         h->first = InterlockedIncrement64(&g_hostfn_seq);
         if (audit_path_hostfn(h->name)) audit_path_hit("run-time host function", h->name, c->x[30] - 4);
