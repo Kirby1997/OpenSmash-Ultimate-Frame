@@ -966,6 +966,7 @@ static LONG64 g_lat_near;                    /* round 2: frames ready less than 
 static volatile LONG g_lat_ri;
 static volatile LONG64 g_lat_release, g_lat_d_sum, g_lat_d_n, g_lat_waits, g_lat_last_d, g_lat_backoffs;
 int gfx_latency(void);                       /* gfx_options.c: graphics.ini latency = normal 0 | low 1 | lowest 2 */
+static void l1_test_options(void);
 int latency_mode(void) {
     if (g_lat_mode < 0) {
         const char *e = getenv("SSBU_LATENCY"), *m = getenv("SSBU_LATENCY_MARGIN");
@@ -973,29 +974,116 @@ int latency_mode(void) {
         if (g_lat_mode < 0 || g_lat_mode > 2) g_lat_mode = 0;
         if (m && atof(m) >= 0.0) g_lat_margin = atof(m);
         g_l1 = getenv("SSBU_L1") && atoi(getenv("SSBU_L1"));
+        l1_test_options();
         printf("display: latency = %s%s (margin %.1f ms)%c", g_lat_mode == 2 ? "lowest" : g_lat_mode == 1 ? "low" : "normal",
                g_lat_mode ? ": the game is released late in the frame so that it reads the pad just in time for the next tick" : "", g_lat_margin, 10);
     }
     return g_lat_mode;
 }
-typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks; int polls, press; } L1Frame;
+typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks, at, tq, gid; int polls, press; } L1Frame;      /* at: the tick it is shown at (tq: its time); gid: its GPU-done mark (0 none) */
 static L1Frame g_l1_ring[64], g_l1_cur;
 static volatile LONG64 g_l1_wr, g_l1_rd;
 static volatile LONG64 g_l1_poll_qpc, g_l1_polls, g_l1_ticks;
 static volatile LONG g_l1_press;             /* a new press was seen at a poll since the last present call */
 static LONG64 g_l1_press_qpc, g_l1_press_left, g_l1_press_n;
 #define L1_BINS 1000                         /* 0.1 ms bins up to 100 ms */
-#define L1_ST 7
+#define L1_ST 12
 static LONG64 g_l1_hist[L1_ST][L1_BINS + 1], g_l1_cnt[L1_ST];
 static double g_l1_sum[L1_ST], g_l1_max[L1_ST];
 static const char *const k_l1_name[L1_ST] = {"release -> poll", "poll -> present call", "present call -> ready (render thread)", "ready -> vkQueuePresentKHR (hold)",
-                                             "vkQueuePresentKHR -> next vblank", "poll -> next vblank after the present (TOTAL of our pipeline)", "tick -> release (latency mode delay)"};
+                                             "vkQueuePresentKHR -> next vblank", "poll -> next vblank after the present (TOTAL of our pipeline)", "tick -> release (latency mode delay)",
+                                             "poll -> vkQueuePresentKHR", "tick shown at -> vkQueuePresentKHR", "vkQueuePresentKHR -> GPU done (0 = done before)", "poll -> GPU done", "ready -> GPU done"};
+/* 2026-11 (latency, the Frame): what SSBU_L1=1 adds, also on a PC without a vblank source (Linux): stages 7-8 at every
+ * present (stage 8 counts the frames presented at or after their tick; a late frame goes out before the tick it is shown at);
+ * SSBU_L1_GPU=1 (TEST): stages 9-11, the time the GPU finished each presented frame (nvn_vk.c: a fence submitted right
+ * after the present blit, waited for on a thread of its own: the render thread never waits for it);
+ * SSBU_L1_CSV=<file> (TEST): one line per presented frame, the times in ns of the host's clock (CLOCK_MONOTONIC on Linux:
+ * the evdev / perf time base), kept in memory and written at exit. Both work without SSBU_L1 (then no l1-stage lines). */
+static int g_l1_gpu, g_l1_join;              /* SSBU_L1_GPU; the GPU-done times are matched with their frame (stages 9-11 or the CSV) */
+static char *g_l1_csv_path;
+static LONG64 g_l1_gid_seq, g_l1_gid_next;   /* render thread: the GPU-done mark of the frame being presented (display_gpu_id) */
 static void l1_add(int k, LONG64 a, LONG64 b) {
     if (!a || !b) return;
     double ms = (double)(b - a) * 1000.0 / (double)g_freq.QuadPart;
     if (ms < 0) return;
     int bin = (int)(ms * 10.0); if (bin > L1_BINS) bin = L1_BINS;
     g_l1_hist[k][bin]++; g_l1_cnt[k]++; g_l1_sum[k] += ms; if (ms > g_l1_max[k]) g_l1_max[k] = ms;
+}
+/* QPC ticks in ns of the same clock (on Linux QPC is CLOCK_MONOTONIC / 100, plat_posix.c); 0 stays 0 */
+static LONG64 qpc_ns(LONG64 q) { LONG64 f = g_freq.QuadPart; return q ? q / f * 1000000000LL + q % f * 1000000000LL / f : 0; }
+/* QPC time of tick k: when the vsync thread gave it (one of the last 15 given), or projected from the last one given */
+static LONG64 tick_qpc(LONG64 k) {
+    LONG64 n = g_vsync_n, t;
+    if (k <= 0) return 0;
+    if (k <= n) return n - k < 15 ? g_tick_at[k & 15] : 0;
+    t = g_tick_at[n & 15];
+    return t ? t + (LONG64)((double)(k - n) * (g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0)) : 0;
+}
+#define L1_CSV_MAX (1 << 18)                 /* lines kept: 73 minutes at 60 fps (80 bytes each, the pages taken as written) */
+#define L1_CSV_COLS 10
+static LONG64 (*g_csv)[L1_CSV_COLS], g_csv_n, g_csv_lost;
+static int g_csv_closed;
+static SRWLOCK g_lj_lock = SRWLOCK_INIT;     /* the matching below and the CSV lines; never held while waiting for anything */
+typedef struct { L1Frame f; LONG64 gpu; int fight, have; } L1Join;      /* have: 1 the frame is here, 2 only its GPU-done time (gid in f.gid) */
+static L1Join g_lj[64];
+static void l1_test_options(void) {
+    const char *g = getenv("SSBU_L1_GPU"), *cp = getenv("SSBU_L1_CSV");
+    g_l1_gpu = g && atoi(g);
+    if (cp && cp[0]) {
+        g_csv = malloc(sizeof *g_csv * L1_CSV_MAX);
+        g_l1_csv_path = g_csv ? _strdup(cp) : NULL;
+        if (!g_l1_csv_path) { free(g_csv); g_csv = NULL; }
+    }
+    g_l1_join = (g_l1 && g_l1_gpu) || g_l1_csv_path;
+    if (g_l1_gpu || cp) printf("display: L1 test: GPU-done times %s; per-present CSV %s%s%c", g_l1_gpu ? "ON (SSBU_L1_GPU)" : "off", g_l1_csv_path ? "to " : cp && cp[0] ? "NOT kept (no memory)" : "off",
+                               g_l1_csv_path ? g_l1_csv_path : "", 10);
+}
+/* g_lj_lock held: one presented frame, with the time the GPU finished it (0 = not measured): stages 9-11 and its CSV line */
+static void l1_emit(const L1Frame *f, int fight, LONG64 gpu) {
+    if (gpu && fight && g_l1) { l1_add(9, f->qp, gpu > f->qp ? gpu : f->qp); l1_add(10, f->poll, gpu); l1_add(11, f->ready, gpu); }
+    if (!g_csv || g_csv_closed) return;
+    if (g_csv_n >= L1_CSV_MAX) { g_csv_lost++; return; }
+    LONG64 *r = g_csv[g_csv_n++];
+    r[0] = f->n; r[1] = fight; r[2] = qpc_ns(f->tq); r[3] = qpc_ns(f->release); r[4] = qpc_ns(f->poll); r[5] = qpc_ns(f->call); r[6] = qpc_ns(f->ready); r[7] = qpc_ns(f->qp); r[8] = qpc_ns(gpu); r[9] = qpc_ns(f->shown);
+}
+/* render thread, at vkQueuePresentKHR: the frame waits here for its GPU-done time unless that came first */
+static void l1_join_frame(const L1Frame *f, int fight) {
+    AcquireSRWLockExclusive(&g_lj_lock);
+    L1Join *e = &g_lj[f->gid & 63];
+    if (!f->gid) l1_emit(f, fight, 0);
+    else if (e->have == 2 && e->f.gid == f->gid) { e->have = 0; l1_emit(f, fight, e->gpu); }
+    else { if (e->have == 1) l1_emit(&e->f, e->fight, 0); e->f = *f; e->fight = fight; e->have = 1; }      /* (one that never got its time goes out without it) */
+    ReleaseSRWLockExclusive(&g_lj_lock);
+}
+/* nvn_vk.c, render thread, right after the present blit was submitted: the number of the fence that times this frame, and
+ * the tick it is held for (0: not held) */
+LONG64 display_gpu_id(LONG64 *tgt) { *tgt = g_hold_target; return g_l1_gid_next = ++g_l1_gid_seq; }
+/* nvn_vk.c, its watcher thread: the GPU finished frame gid at qpc */
+void display_gpu_done(LONG64 gid, LONG64 tgt, LONG64 qpc) {
+    (void)tgt;
+    if (!g_l1_join || !gid) return;
+    AcquireSRWLockExclusive(&g_lj_lock);
+    L1Join *e = &g_lj[gid & 63];
+    if (e->have == 1 && e->f.gid == gid) { e->have = 0; l1_emit(&e->f, e->fight, qpc); }
+    else { if (e->have == 1) l1_emit(&e->f, e->fight, 0); e->f.gid = gid; e->gpu = qpc; e->have = 2; }
+    ReleaseSRWLockExclusive(&g_lj_lock);
+}
+/* nvn_vk.c, at its start: run the GPU-done watcher (SSBU_L1_GPU=1) */
+int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"); return g && atoi(g); }
+static void l1_csv_write(FILE *out) {
+    AcquireSRWLockExclusive(&g_lj_lock);
+    for (int i = 0; i < 64; i++) if (g_lj[i].have == 1) { g_lj[i].have = 0; l1_emit(&g_lj[i].f, g_lj[i].fight, 0); }      /* still waiting for their GPU time */
+    g_csv_closed = 1;
+    ReleaseSRWLockExclusive(&g_lj_lock);
+    FILE *f = fopen(g_l1_csv_path, "w");
+    if (!f) { fprintf(out, "l1-csv: %s cannot be written: %lld lines lost\n", g_l1_csv_path, (long long)g_csv_n); return; }
+    fprintf(f, "frame,fight,tick,release,poll,call,ready,qp,gpu_done,presented\n");
+    for (LONG64 i = 0; i < g_csv_n; i++) {
+        const LONG64 *r = g_csv[i];
+        fprintf(f, "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)r[0], (long long)r[1], (long long)r[2], (long long)r[3], (long long)r[4], (long long)r[5], (long long)r[6], (long long)r[7], (long long)r[8], (long long)r[9]);
+    }
+    fclose(f);
+    fprintf(out, "l1-csv: %lld presented frames written to %s (ns of the host clock, 0 = not measured)%s\n", (long long)g_csv_n, g_l1_csv_path, g_csv_lost ? " (more frames than it keeps: the later ones are not in it)" : "");
 }
 static volatile LONG g_l1_trace_left, g_l1_trace_done;
 static LONG64 g_l1_trace_t0;
@@ -1033,7 +1121,7 @@ int display_l1_pipe_default(void) { return 1; }      /* L1 round 4: pipe ON by d
 void display_l1_submit(void) { if (g_l1_waited) InterlockedIncrement(&g_l1_subs_now); }
 void display_l1_early_skip(void) { g_l1_early_skips++; }
 /* game thread, display_present_plan */
-static void l1_plan(int late) {
+static void l1_plan(int late, LONG64 at) {
     if (g_l1_trace_left > 0) { printf("l1-trace: %+8.2f present call planned (frames left %ld)%c", display_l1_ms(), (long)g_l1_trace_left, 10); InterlockedDecrement(&g_l1_trace_left); }
     if (InterlockedExchange(&g_l1_waited, 0)) { g_l1_chk_frames++; if (g_l1_subs_now) { g_l1_chk_bad++; g_l1_chk_subs += g_l1_subs_now; } }
     LARGE_INTEGER now;
@@ -1042,7 +1130,7 @@ static void l1_plan(int late) {
     L1Frame f;
     memset(&f, 0, sizeof f);
     f.release = g_lat_release; f.poll = g_l1_poll_qpc; f.call = now.QuadPart; f.n = g_frames + 1; f.polls = (int)InterlockedExchange64(&g_l1_polls, 0); f.fight_ticks = g_l1_ticks;
-    f.press = InterlockedExchange(&g_l1_press, 0);
+    f.press = InterlockedExchange(&g_l1_press, 0); f.at = at;
     if (f.poll && f.poll < f.release) f.poll = 0;                  /* no poll since the release: the frame did not read the pad after it */
     g_l1_ring[g_l1_wr & 63] = f;
     InterlockedIncrement64(&g_l1_wr);
@@ -1053,10 +1141,11 @@ static void l1_ready(LONG64 tgt) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (g_l1_wr - g_l1_rd > 4) g_l1_rd = g_l1_wr - 1;               /* lost step (first-run screen, a movie): resynchronise */
-    if (g_l1_rd >= g_l1_wr) { memset(&g_l1_cur, 0, sizeof g_l1_cur); return; }
+    if (g_l1_rd >= g_l1_wr) { memset(&g_l1_cur, 0, sizeof g_l1_cur); g_l1_gid_next = 0; return; }
     g_l1_cur = g_l1_ring[g_l1_rd & 63];
     InterlockedIncrement64(&g_l1_rd);
     g_l1_cur.ready = now.QuadPart;
+    g_l1_cur.gid = g_l1_gid_next; g_l1_gid_next = 0;
     (void)late;
     if (g_lat_mode > 0 && tgt && g_lat_last_d > 0) {      /* round 2: a NEAR miss of a delayed frame (ready < 2 ms before its tick): no delay for 120 frames */
         LONG64 n = g_vsync_n, t = g_tick_at[n & 15];
@@ -1075,14 +1164,17 @@ static void l1_done(int fight, LONG64 shown) {
     L1Frame *f = &g_l1_cur;
     if (!f->call) return;
     f->qp = now.QuadPart; f->shown = shown;
+    f->tq = tick_qpc(f->at);
     if (fight && g_l1) {
         l1_add(0, f->release, f->poll); l1_add(1, f->poll, f->call); l1_add(2, f->call, f->ready); l1_add(3, f->ready, f->qp); l1_add(4, f->qp, f->shown); l1_add(5, f->poll, f->shown);
+        l1_add(7, f->poll, f->qp); l1_add(8, f->tq, f->qp);
     }
+    if (g_l1_join) l1_join_frame(f, fight);
     if (g_l1 && g_l1_press_left > 0) {
         double fq = (double)g_freq.QuadPart / 1000.0, p = (double)g_l1_press_qpc;
         printf("l1-after: present %lld after the press poll (game frame %lld, fight ticks %lld, polls %d%s): release %+.2f, poll %+.2f, present call %+.2f, ready %+.2f, vkQueuePresentKHR %+.2f, next vblank %+.2f ms%c",
                (long long)g_l1_press_n, (long long)f->n, (long long)f->fight_ticks, f->polls, f->press ? ", THE PRESS POLL" : "", ((double)f->release - p) / fq, f->poll ? ((double)f->poll - p) / fq : -999.0,
-               ((double)f->call - p) / fq, ((double)f->ready - p) / fq, ((double)f->qp - p) / fq, ((double)f->shown - p) / fq, 10);
+               ((double)f->call - p) / fq, ((double)f->ready - p) / fq, ((double)f->qp - p) / fq, f->shown ? ((double)f->shown - p) / fq : -999.0, 10);
         if (f->press || g_l1_press_n) { g_l1_press_n++; g_l1_press_left--; }
     }
     f->call = 0;
@@ -1121,6 +1213,7 @@ static void l1_report(FILE *out) {
     { void nvn_l1_report(FILE *out); nvn_l1_report(out); }
     if (g_lat_mode) fprintf(out, "l1: latency = %s: release delayed in %lld of %lld waits, mean delay %.2f ms, late frames (then 300 frames without) %lld, near misses (then 120 without) %lld\n", g_lat_mode == 2 ? "lowest" : "low", (long long)g_lat_d_n, (long long)g_lat_waits,
                             g_lat_d_n ? (double)g_lat_d_sum / (double)g_lat_d_n * 1000.0 / (double)g_freq.QuadPart : 0.0, (long long)g_lat_backoffs, (long long)g_lat_near);
+    if (g_l1_csv_path) l1_csv_write(out);
     if (!g_l1) return;
     for (int k = 0; k < L1_ST; k++) {
         if (!g_l1_cnt[k]) continue;
@@ -1144,7 +1237,7 @@ void display_present_plan(int vulkan) {
     g_latch = at;
     InterlockedExchange(&g_latch_pending, iv != 0);
     if (iv && !on_time) g_hold_late++;
-    l1_plan(iv && !on_time && now_n > prev + iv);      /* L1 (a frame queued after the tick it was due at = late) */
+    l1_plan(iv && !on_time && now_n > prev + iv, at);      /* L1 (a frame queued after the tick it was due at = late) */
     InterlockedExchange64(&g_hold_target, on_time && g_hold_on && !g_lockstep ? at : 0);
     InterlockedExchange(&g_planned, 1);
 }
@@ -1187,7 +1280,8 @@ static void pace_stat_line(FILE *out, const char *what, int i, int since) {
 void display_present_done(int fight) {
     static int stat = -1;
     LARGE_INTEGER now;
-    if (g_vb_state != 2 || g_lockstep) return;
+    if (g_lockstep) return;
+    if (g_vb_state != 2) { if (g_l1 > 0 || g_l1_csv_path) l1_done(fight, 0); return; }      /* no vblank source (Linux): the L1 times without "next vblank" */
     if (stat < 0) stat = getenv("SSBU_PACESTAT") && atoi(getenv("SSBU_PACESTAT"));
     QueryPerformanceCounter(&now);
     AcquireSRWLockShared(&g_vb_lock);
