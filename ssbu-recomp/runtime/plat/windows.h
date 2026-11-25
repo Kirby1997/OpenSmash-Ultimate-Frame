@@ -239,12 +239,13 @@ typedef SRWLOCK *PSRWLOCK;
 #define ReleaseSRWLockShared(l) pthread_rwlock_unlock(l)
 #define TryAcquireSRWLockExclusive(l) (pthread_rwlock_trywrlock(l) == 0)
 #define TryAcquireSRWLockShared(l) (pthread_rwlock_tryrdlock(l) == 0)
-/* A futex sequence counter: works with either kind of lock, as the Windows one does. */
-typedef struct { volatile uint32_t seq; } CONDITION_VARIABLE;
+/* A futex sequence counter: works with either kind of lock, as the Windows one does. waiters counts the threads inside a
+ * Sleep (plat_posix.c cv_wait), so a Wake with none makes no system call. */
+typedef struct { volatile uint32_t seq, waiters; } CONDITION_VARIABLE;
 typedef CONDITION_VARIABLE *PCONDITION_VARIABLE;
-#define CONDITION_VARIABLE_INIT {0}
+#define CONDITION_VARIABLE_INIT {0, 0}
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 1
-#define InitializeConditionVariable(cv) ((cv)->seq = 0)
+#define InitializeConditionVariable(cv) ((cv)->seq = 0, (cv)->waiters = 0)
 BOOL SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms);
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags);
 void WakeConditionVariable(CONDITION_VARIABLE *cv);
