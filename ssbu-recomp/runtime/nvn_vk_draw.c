@@ -4293,11 +4293,12 @@ void vkd_init(void) {
         VKC(vkAllocateCommandBuffers(V.device, &ai, &R.slot[i].cmd));
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
-    {   /* G3 step 1: SSBU_VK_RING_MB = stream ring size in MB (default 256, clamped to 64..2048); a size the device cannot give falls back to 256 */
+    {   /* G3 step 1: SSBU_VK_RING_MB = stream ring size in MB (default 256, clamped to 128..2048); a size the device cannot give falls back to 256 */
         const uint64_t usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;      /* TRANSFER_DST: cb_assemble */
         const char *e = getenv("SSBU_VK_RING_MB");
         long long mb = e && *e ? atoll(e) : 256, want_mb;
-        if (mb < 64 || mb > 2048) { if (e && *e) printf("nvn_vk: SSBU_VK_RING_MB=%s is outside 64..2048: clamped\n", e); mb = mb < 64 ? 64 : 2048; }
+        /* floor 128: ring_raw rejects a range above ring/4, so a 64 MB ring would stop the game on any range over 16 MB */
+        if (mb < 128 || mb > 2048) { if (e && *e) printf("nvn_vk: SSBU_VK_RING_MB=%s is outside 128..2048: clamped\n", e); mb = mb < 128 ? 128 : 2048; }
         want_mb = mb;
         if (mb != 256 && g_max_alloc && (uint64_t)mb << 20 > g_max_alloc) { printf("nvn_vk: SSBU_VK_RING_MB=%lld is above this device's maxMemoryAllocationSize (%llu MB): using 256\n", mb, (unsigned long long)(g_max_alloc >> 20)); mb = 256; }
         R.ring_size = (uint64_t)mb << 20;
