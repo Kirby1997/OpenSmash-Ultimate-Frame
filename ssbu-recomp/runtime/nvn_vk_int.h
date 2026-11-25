@@ -256,7 +256,7 @@ extern struct VRender {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
     VkCommandBuffer cmd;
     /* stream ring */
-    VkBuffer ring; VMem ring_mem; uint64_t ring_pos, ring_size; uint32_t gen;
+    VkBuffer ring; VMem ring_mem; uint64_t ring_pos, ring_size, ring_bytes; uint32_t gen;
     struct { uint64_t addr, size, off; uint32_t gen; } acache[8192];
     VkBuffer zero; VMem zero_mem;
     /* pass */

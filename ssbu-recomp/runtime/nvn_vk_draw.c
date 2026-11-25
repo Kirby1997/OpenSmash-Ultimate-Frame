@@ -34,6 +34,7 @@ static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 
 struct VFeatures D;                                     /* the members: nvn_vk_int.h */
 static PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT;
+static uint64_t g_max_alloc;                            /* VkPhysicalDeviceVulkan11Properties::maxMemoryAllocationSize (0 = not known) */
 LONG64 g_sb_cut;                                  /* storage buffer ranges cut to maxStorageBufferRange (sb_range; the exit report in nvn_vk_m4.c) */
 static PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV;
 static PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV;
@@ -104,6 +105,7 @@ static void vkd_device_report(const VkExtensionProperties *dext, uint32_t ndext)
     if (has_name(dext, ndext, "VK_KHR_push_descriptor")) { *tail = &pp; tail = &pp.pNext; }
     if (D.ext_gpl) { *tail = &gp; tail = &gp.pNext; }
     if (gp2) gp2(V.gpu, &p2);
+    if (gp2) g_max_alloc = p11.maxMemoryAllocationSize;
     if (gp2)
         printf("nvn_vk: driver: %s, %s (driver ID %d), conformance %u.%u.%u.%u, driverVersion 0x%08x (%u.%u.%u read as a Vulkan version: the Mesa drivers' encoding), device Vulkan %u.%u.%u\n",
                p12.driverName[0] ? p12.driverName : "?", p12.driverInfo[0] ? p12.driverInfo : "no driver info", (int)p12.driverID, (unsigned)p12.conformanceVersion.major,
@@ -220,6 +222,7 @@ typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; in
 static VBlock *g_blk[2048];
 static int g_nblk;
 static LONG64 g_mem_total, g_mem_leak;
+static int g_vmem_soft;                                 /* vmem_alloc: a failed vkAllocateMemory returns block -1 instead of stopping (the stream ring tries its size) */
 VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
     uint32_t type = 32;
@@ -251,6 +254,7 @@ VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
         k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
         ai.allocationSize = k->size; ai.memoryTypeIndex = type;
         VkResult r = vkAllocateMemory(V.device, &ai, NULL, &k->mem);
+        if (r != VK_SUCCESS && g_vmem_soft) { free(k); return m; }
         if (r != VK_SUCCESS) vkd_fail("vkAllocateMemory of %llu MB (type %u): %s; %lld MB allocated so far", (unsigned long long)(k->size >> 20), type, vk_result_name(r), (long long)(g_mem_total >> 20));
         if (D.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) VKC(vkMapMemory(V.device, k->mem, 0, VK_WHOLE_SIZE, 0, &k->map));
         k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
@@ -301,6 +305,7 @@ VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
         }
     }
     *mem = vmem_alloc(rq, want, 1);
+    if (g_vmem_soft && mem->block < 0) { vkDestroyBuffer(V.device, b, NULL); return NULL; }
     VKC(vkBindBufferMemory(V.device, b, mem->mem, mem->off));
     return b;
 }
@@ -448,7 +453,7 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
     if (R.ring_pos + n > R.ring_size) { cmd_wait_all(); cb_ring_wrap(); R.ring_pos = 0; R.gen++; R.ring_wraps++; }     /* everything that reads the ring has finished */
     uint64_t off = R.ring_pos;
     if (p) memcpy((uint8_t *)R.ring_mem.map + off, p, (size_t)n);
-    R.ring_pos += n;
+    R.ring_pos += n; R.ring_bytes += n;
     return off;
 }
 static uint64_t ring_put(uint64_t addr, uint64_t size) {
@@ -2789,7 +2794,6 @@ static int draw_prepare(unsigned prim) {
         VkDescriptorSet sets[2] = {NULL, NULL};
         int nw = 0, ib = 0, it = 0;
         if (!p->push0 && p->nb[0]) sets[0] = set_alloc(p->dl[0]);
-        memset(w, 0, sizeof w[0] * (size_t)(p->nb[0] + p->nb[1]));
         for (int s = 0; s < (fs ? 2 : 1); s++) {
             VStage *v = s ? fs : vs;
             for (unsigned n = 1; n < 34; n++) {
@@ -2797,8 +2801,10 @@ static int draw_prepare(unsigned prim) {
                 if (!bit) continue;
                 BufRef *b = &bufs[ib];
                 bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : sb_range(b->size);
-                w[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[nw].dstSet = sets[0]; w[nw].dstBinding = 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18); w[nw].descriptorCount = 1;
-                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nw].pBufferInfo = &bi[ib]; nw++; ib++;
+                /* every field of the entry is set here (the compound literal zeroes pNext, dstArrayElement, pImageInfo, pTexelBufferView); no bulk memset per draw */
+                w[nw] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[0], .dstBinding = 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18),
+                                                .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[ib] };
+                nw++; ib++;
             }
         }
         if (p->push0) { if (nw) vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, (uint32_t)nw, w); }
@@ -4040,14 +4046,15 @@ swap: ;
         tex_ahead(frame);
     }
     if (frame % 300 == 0) {                      /* where the render thread's time went, per frame, in the last 300 frames */
-        static LONG64 last[12], last_sets, last_flush, last_reused, last_disp;
+        static LONG64 last[12], last_sets, last_flush, last_reused, last_disp, last_ringb, last_wraps;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         double k = 1000.0 / (double)fq.QuadPart / 300.0;
         if (g_ts_on > 0) { static double ts_last; static LONG64 n_last; printf("nvn_vk_gpu: frames %lld..%lld: GPU time %.2f ms per frame (first to last command of %lld command buffers finished in the window)\n", (long long)frame - 300, (long long)frame, (g_ts_ns - ts_last) / 1e6 / 300.0, (long long)(g_ts_n - n_last)); ts_last = g_ts_ns; n_last = g_ts_n; }
-        printf("nvn_vk_perf: frames %lld..%lld ms/frame: batch replay %.2f (of it: dispatch %.2f, draw preparation %.2f, pipelines %.2f, shader modules %.2f), wait for the GPU %.2f, copy-back %.2f (waiting at batch start %.2f), present %.2f | per frame: %.1f dispatches, %.0f descriptor sets allocated, %.0f reused, %.1f submissions | pipelines not made ahead so far: %lld | holds so far: %lld, %.1f ms, longest %.1f ms\n",
+        printf("nvn_vk_perf: frames %lld..%lld ms/frame: batch replay %.2f (of it: dispatch %.2f, draw preparation %.2f, pipelines %.2f, shader modules %.2f), wait for the GPU %.2f, copy-back %.2f (waiting at batch start %.2f), present %.2f | per frame: %.1f dispatches, %.0f descriptor sets allocated, %.0f reused, %.1f submissions | pipelines not made ahead so far: %lld | holds so far: %lld, %.1f ms, longest %.1f ms | stream ring: %.2f MB/frame streamed, %lld wraps in the window (%lld in all)\n",
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
-               (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
+               (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0,
+               (double)(R.ring_bytes - last_ringb) / 1048576.0 / 300.0, (long long)(R.ring_wraps - last_wraps), (long long)R.ring_wraps);
         if (g_tl_n) {
             double q = 1000.0 / (double)fq.QuadPart / (double)g_tl_n;
             printf("nvn_vk_timeline: frames %lld..%lld, %lld frames with fighters, ms after the start of the batch replay: first submission to the GPU %.2f, last (the frame is complete on the GPU's queue) %.2f, present job begins %.2f | per frame %.2f submissions between passes (SSBU_VK_SPLIT=%d) | the game's fence waits that had to wait: %.2f per frame, %.2f ms each, ending %.2f ms after the batch start\n",
@@ -4085,7 +4092,7 @@ swap: ;
             if (frame % 3000 == 0) due = 1;
             if (due && (infight || !g_in_fight)) { m4_report(); due = 0; }
         }
-        memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
+        memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches; last_ringb = R.ring_bytes; last_wraps = R.ring_wraps;
     }
     if (frame % 600 == 0)
         printf("nvn_vk: totals at frame %lld: %lld images made (%lld live, %lld views), %lld uploads (%lld MB), %lld shader modules, %lld pipelines, %lld descriptor sets, %lld command buffers, %lld ring wraps, %lld feedback passes, %lld MB device memory\n",
@@ -4286,8 +4293,19 @@ void vkd_init(void) {
         VKC(vkAllocateCommandBuffers(V.device, &ai, &R.slot[i].cmd));
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
-    R.ring_size = 256ull << 20;
-    R.ring = vbuf_new(R.ring_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &R.ring_mem);      /* TRANSFER_DST: cb_assemble */
+    {   /* G3 step 1: SSBU_VK_RING_MB = stream ring size in MB (default 256, clamped to 64..2048); a size the device cannot give falls back to 256 */
+        const uint64_t usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;      /* TRANSFER_DST: cb_assemble */
+        const char *e = getenv("SSBU_VK_RING_MB");
+        long long mb = e && *e ? atoll(e) : 256, want_mb;
+        if (mb < 64 || mb > 2048) { if (e && *e) printf("nvn_vk: SSBU_VK_RING_MB=%s is outside 64..2048: clamped\n", e); mb = mb < 64 ? 64 : 2048; }
+        want_mb = mb;
+        if (mb != 256 && g_max_alloc && (uint64_t)mb << 20 > g_max_alloc) { printf("nvn_vk: SSBU_VK_RING_MB=%lld is above this device's maxMemoryAllocationSize (%llu MB): using 256\n", mb, (unsigned long long)(g_max_alloc >> 20)); mb = 256; }
+        R.ring_size = (uint64_t)mb << 20;
+        if (mb != 256) { g_vmem_soft = 1; R.ring = vbuf_new(R.ring_size, usage, &R.ring_mem); g_vmem_soft = 0; }      /* a failed buffer or allocation gives NULL */
+        if (!R.ring && mb != 256) { printf("nvn_vk: a %lld MB stream ring could not be allocated: using 256\n", mb); mb = 256; R.ring_size = 256ull << 20; }
+        if (!R.ring) R.ring = vbuf_new(R.ring_size, usage, &R.ring_mem);
+        printf("nvn_vk: stream ring %llu MB (SSBU_VK_RING_MB %s; requested %lld; default 256)\n", (unsigned long long)(R.ring_size >> 20), e && *e ? e : "unset", want_mb);
+    }
     R.zero = vbuf_new(65536 + 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &R.zero_mem);
     memset(R.zero_mem.map, 0, 65536 + 64);
     { float f1 = 1.0f; uint32_t i1 = 1; memcpy((uint8_t *)R.zero_mem.map + 65536 + 12, &f1, 4); memcpy((uint8_t *)R.zero_mem.map + 65536 + 28, &i1, 4); }
