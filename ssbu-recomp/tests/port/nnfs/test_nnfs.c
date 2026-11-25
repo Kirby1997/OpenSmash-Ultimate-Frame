@@ -925,6 +925,225 @@ static void t_review5(void) {
 #undef STATE_IS
 }
 
+/* ---- a folder sync that fails (an I/O error; plat_posix.c's host_fsync_parent): the step it belongs to fails. The folder
+ * host_fsync_parent is about to open is made unreadable just before the call and given back at the next call, so only that
+ * one sync fails. Before: the stage's syncs and APPLY's syncs after a deletion or a new folder were not checked (a Commit
+ * reported success with a folder that was not on the disk), and an F whose file an earlier APPLY had moved was skipped
+ * without its folder being synced before the marker went. */
+static char g_sf_dir[2048];
+static const char *g_sf_want;
+static int g_sf_hit;
+static void sf_hook(const char *op, const char *path) {
+    char hp[2048];
+    if (g_sf_dir[0]) { chmod(g_sf_dir, 0777); g_sf_dir[0] = 0; }
+    if (g_nlog < 256) snprintf(g_log[g_nlog++], sizeof g_log[0], "%s %s", op, path ? path : "-");
+    if (g_sf_hit || !path || strcmp(op, "fsync-dir") || !strstr(path, g_sf_want)) return;
+    host_path_resolve(path, hp, sizeof hp);
+    snprintf(g_sf_dir, sizeof g_sf_dir, "%s", hp); *strrchr(g_sf_dir, '/') = 0;
+    chmod(g_sf_dir, 0333);
+    g_sf_hit = 1;
+}
+enum { SF_STAGE, SF_DELETE, SF_MKDIR, SF_N };
+static const char *const k_sf_want[] = {".stage.", "save\\b.bin", "save\\dir1"};
+static const char *const k_sf_name[] = {"a folder of the stage", "the folder of a deletion", "the folder of a new folder"};
+/* changes(), a Commit with the sync failing, then Commit again (the stage) or Unmount (APPLY's syncs). Exit 0: as expected;
+ * 5: the sync was never made; 6: the Commit reported success; 7: decided (stage) / not decided (APPLY); 8: the game's view is
+ * not the decided state; 9: the committed folder was changed; 10: the next Commit failed; 11: the replayed APPLY did not sync
+ * the folder of a file an earlier APPLY had moved before it removed the marker. */
+static int child_sf(int kind) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    char s[2048] = "";
+    changes();
+    g_sf_want = k_sf_want[kind]; g_sf_hit = 0; g_sf_dir[0] = 0; g_nlog = 0; fi_hook = sf_hook;
+    uint32_t r = COMMIT("save");
+    fi_hook = NULL;
+    if (g_sf_dir[0]) { chmod(g_sf_dir, 0777); g_sf_dir[0] = 0; }
+    if (!g_sf_hit) return 5;
+    if (!r) return 6;
+    if (!view_is_new()) return 8;
+    int decided = fsize(tp("ud/save.commit")) >= 0;
+    if (kind == SF_STAGE) {                                      /* not decided: nothing happened, the next Commit makes it */
+        snap(tp("ud/save"), "", s, sizeof s);
+        if (decided) return 7;
+        if (strcmp(s, g_old)) return 9;
+        if (COMMIT("save")) return 10;
+        UNMOUNT("save");
+        return 0;
+    }
+    if (!decided) return 7;                                      /* decided, pending: Unmount applies it */
+    g_sf_want = "\001"; g_sf_hit = 0; g_nlog = 0; fi_hook = sf_hook; /* (the op log only) */
+    UNMOUNT("save");
+    fi_hook = NULL;
+    int unmark = -1, synced = -1;
+    for (int i = 0; i < g_nlog; i++) {
+        if (!strncmp(g_log[i], "unlink ", 7) && strstr(g_log[i], "save.commit")) unmark = i;
+        if (!strncmp(g_log[i], "fsync-dir ", 10) && strcasestr(g_log[i], "save\\a.bin") && synced < 0) synced = i;
+    }
+    if (kind == SF_MKDIR && !(synced >= 0 && synced < unmark)) return 11;    /* (a.bin was moved before M dir1 failed) */
+    return 0;
+}
+static int child_sf_stage(void) { return child_sf(SF_STAGE); }
+static int child_sf_delete(void) { return child_sf(SF_DELETE); }
+static int child_sf_mkdir(void) { return child_sf(SF_MKDIR); }
+static void t_dirsync(void) {
+    SECTION("a folder sync that fails: of the stage (the Commit is refused), after a deletion or a new folder (pending, applied at Unmount)");
+    int (*const fn[SF_N])(void) = {child_sf_stage, child_sf_delete, child_sf_mkdir};
+    for (int kind = 0; kind < SF_N; kind++) {
+        char s[2048] = "";
+        int st;
+        old_state();
+        g_old[0] = 0; snap(tp("ud/save"), "", g_old, sizeof g_old);
+        CHECKF((st = in_child(fn[kind])) == 0, "%s cannot be synced: %d", k_sf_name[kind], st);
+        CHECK(DONE(run_child(1, 0)));
+        snap(tp("ud/save"), "", s, sizeof s);
+        CHECKF(!strcmp(s, k_new) && !leftovers(), "%s cannot be synced, then the next mount: %d leftovers, state %s", k_sf_name[kind], leftovers(), s);
+    }
+}
+
+/* ---- review of A3: the decision's folder sync gets one try and comes first in every APPLY (also a replayed one); a file
+ * that cannot be looked at is not taken as absent; a failed decision whose marker exists leaves the stage alone.
+ * child_dec: changes(), a Commit whose sync of the marker's folder fails (once: made unreadable and given back at the next
+ * call; all: until the Commit returns), then Commit again with the op log. Exit 6: the first Commit reported success (a
+ * second fsync after a failed one can report 0 for what never reached the disk); 7: not pending; 8: the game's view is not
+ * the decided state; 9: R changed; 10: the replay moved a file into the save before the marker's folder was synced; 11: the
+ * second Commit failed. */
+static int child_dec(int once) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    char s[2048] = "";
+    changes();
+    uint32_t r;
+    if (once) { g_sf_want = "save.commit"; g_sf_hit = 0; g_sf_dir[0] = 0; g_nlog = 0; fi_hook = sf_hook; }
+    else { g_syncfail = 0; fi_hook = syncfail_hook; }
+    r = COMMIT("save");
+    fi_hook = NULL;
+    if (g_sf_dir[0]) { chmod(g_sf_dir, 0777); g_sf_dir[0] = 0; }
+    chmod(tp("ud"), 0777);
+    if (!r) return 6;
+    if (fsize(tp("ud/save.commit")) < 0) return 7;
+    snap(tp("ud/save"), "", s, sizeof s);
+    if (strcmp(s, g_old)) return 9;
+    if (!view_is_new()) return 8;
+    g_sf_want = "\001"; g_sf_hit = 0; g_nlog = 0; fi_hook = sf_hook;     /* (the op log only) */
+    r = COMMIT("save");
+    fi_hook = NULL;
+    int synced = -1, moved = -1;
+    for (int i = 0; i < g_nlog; i++) {
+        if (synced < 0 && !strncmp(g_log[i], "fsync-dir ", 10) && strstr(g_log[i], "save.commit")) synced = i;
+        if (moved < 0 && !strncmp(g_log[i], "move ", 5) && strcasestr(g_log[i], "\\save\\")) moved = i;
+    }
+    if (moved < 0 || synced < 0 || synced > moved) return 10;
+    if (r) return 11;
+    UNMOUNT("save");
+    return 0;
+}
+static int child_dec_once(void) { return child_dec(1); }
+static int child_dec_all(void) { return child_dec(0); }
+/* A pending commit (a Commit failing at the k-th call of `kind`, then SIGKILL), for the F4 runs. */
+static int g_pend_kind, g_pend_k;
+static int child_pend(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    changes();
+    if (!fail_commit(g_pend_kind, g_pend_k)) return 5;
+    chmod(g_ro, 0777);
+    kill(getpid(), SIGKILL);
+    return 0;
+}
+/* every folder of the pending stage that still holds a file: made unsearchable (mode 0666: its files cannot be looked at,
+ * EACCES) or given back; the number changed */
+static int stage_lock(mode_t mode) {
+    char st[2048] = "", sub[2048];
+    DIR *d = opendir(tp("ud")), *e;
+    struct dirent *x, *y;
+    int n = 0;
+    while (d && (x = readdir(d))) if (strstr(x->d_name, "save.stage.")) snprintf(st, sizeof st, "%s/%s", tp("ud"), x->d_name);
+    if (d) closedir(d);
+    if (!st[0] || !(d = opendir(st))) return 0;
+    while ((x = readdir(d))) {
+        if (x->d_name[0] == '.') continue;
+        snprintf(sub, sizeof sub, "%s/%s", st, x->d_name);
+        struct stat sb;
+        if (stat(sub, &sb) || !S_ISDIR(sb.st_mode)) continue;
+        if (mode == 0777) { chmod(sub, mode); n++; continue; }
+        int files = 0;
+        if ((e = opendir(sub))) { while ((y = readdir(e))) files += y->d_name[0] != '.'; closedir(e); }
+        if (files) { chmod(sub, mode); n++; }
+    }
+    closedir(d);
+    return n;
+}
+/* S2: the decision's rename fails although the marker is there and is this commit's (on a file system without
+ * RENAME_NOREPLACE: link done, both unlinks failed): the journal is renamed into place just before the rename, which then
+ * fails (its source is gone). A removal of the stage would be partial (a folder of it is made read-only), and the replay
+ * of the marker would then move the rest: a mixed save. Exit 6: the Commit reported success; 5: not set up. */
+static int g_s2_moved;
+static char g_s2_ro[2048];
+static void s2_hook(const char *op, const char *path) {
+    char hp[2048];
+    if (!path) return;
+    if (!g_s2_moved && !strcmp(op, "move") && strstr(path, "save.commit")) {
+        DIR *d = opendir(tp("ud"));
+        struct dirent *x;
+        char j[2048] = "";
+        while (d && (x = readdir(d))) if (strstr(x->d_name, "save.journal.")) snprintf(j, sizeof j, "%s/%s", tp("ud"), x->d_name);
+        if (d) closedir(d);
+        if (j[0] && !rename(j, tp("ud/save.commit"))) g_s2_moved = 1;
+    }
+    if (g_s2_moved && !g_s2_ro[0] && !strcmp(op, "unlink") && strstr(path, ".stage.") && strchr(strstr(path, ".stage."), '\\')
+        && strchr(strchr(strstr(path, ".stage."), '\\') + 1, '\\')) {         /* a file in a folder of the stage */
+        host_path_resolve(path, hp, sizeof hp);
+        snprintf(g_s2_ro, sizeof g_s2_ro, "%s", hp); *strrchr(g_s2_ro, '/') = 0; chmod(g_s2_ro, 0555);
+    }
+}
+static int child_s2(void) {
+    if (!getenv("FS_TRACE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); }
+    changes();
+    g_s2_moved = 0; g_s2_ro[0] = 0; fi_hook = s2_hook;
+    uint32_t r = COMMIT("save");
+    fi_hook = NULL;
+    if (g_s2_ro[0]) chmod(g_s2_ro, 0777);
+    if (!g_s2_moved) return 5;
+    if (!r) return 6;
+    UNMOUNT("save");                                             /* the marker (this commit's) is applied */
+    return 0;
+}
+static void t_review_a3(void) {
+    SECTION("A3 review: the decision's sync fails once / always (pending; the replay syncs the marker's folder first), "
+            "a stage file that cannot be looked at (not absent), a failed decision whose marker is there (stage kept)");
+    char s[2048];
+    int st;
+    for (int once = 1; once >= 0; once--) {
+        old_state();
+        g_old[0] = 0; snap(tp("ud/save"), "", g_old, sizeof g_old);
+        CHECKF((st = in_child(once ? child_dec_once : child_dec_all)) == 0, "the decision's folder sync fails %s: %d", once ? "once" : "every time", st);
+        CHECK(DONE(run_child(1, 0)));
+        s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+        CHECKF(!strcmp(s, k_new) && !leftovers(), "decision sync fails %s, then Commit again: %d leftovers, state %s", once ? "once" : "always", leftovers(), s);
+    }
+    static const int pend[2][2] = {{FAIL_DELETE, 1}, {FAIL_MOVE, 2}};    /* no F done yet (marker_open) / one F done (APPLY) */
+    for (int i = 0; i < 2; i++) {
+        old_state();
+        g_pend_kind = pend[i][0]; g_pend_k = pend[i][1];
+        CHECK(in_child(child_pend) == 99);
+        CHECK(fsize(tp("ud/save.commit")) >= 0);
+        int n = stage_lock(0666);
+        CHECKF(n > 0, "%s %d: no folder of the stage holds a file", k_fail_kind[pend[i][0]], pend[i][1]);
+        int st1 = run_child(1, 0);                               /* must not go on: refused, everything kept */
+        stage_lock(0777);
+        CHECKF(!DONE(st1) && fsize(tp("ud/save.commit")) >= 0, "%s %d, stage files that cannot be looked at: the mount went on (%x), marker %s",
+               k_fail_kind[pend[i][0]], pend[i][1], st1, fsize(tp("ud/save.commit")) >= 0 ? "kept" : "GONE");
+        CHECK(DONE(run_child(1, 0)));
+        s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+        CHECKF(!strcmp(s, k_new) && !leftovers(), "%s %d, stage files that cannot be looked at, then the next mount: %d leftovers, state %s",
+               k_fail_kind[pend[i][0]], pend[i][1], leftovers(), s);
+    }
+    old_state();
+    g_old[0] = 0; snap(tp("ud/save"), "", g_old, sizeof g_old);
+    CHECKF((st = in_child(child_s2)) == 0, "a failed decision whose marker is this commit's: %d", st);
+    CHECK(DONE(run_child(1, 0)));
+    s[0] = 0; snap(tp("ud/save"), "", s, sizeof s);
+    CHECKF((!strcmp(s, k_new) || !strcmp(s, g_old)) && !leftovers(), "a failed decision whose marker is this commit's: %d leftovers, state %s (neither old nor new)", leftovers(), s);
+}
+
 /* ================================================================ 7. config and font paths, exe dir, the built-in self-tests */
 static int in_child(int (*fn)(void)) { fflush(NULL); pid_t p = fork(); if (!p) _exit(fn()); int st; waitpid(p, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) : 99; }
 static int gfx_existing(void) {                    /* an existing config in another case, named with backslashes */
@@ -998,7 +1217,7 @@ int main(int argc, char **argv) {
     if (!getenv("FS_NO_KILL")) t_commit_kill();
     t_commit_fail();
     if (!getenv("FS_NO_KILL") && !g_skip_fail) { t_commit_fail_kill(); t_two_process(); }
-    if (!g_skip_fail) { t_old_marker(); t_review5(); }
+    if (!g_skip_fail) { t_old_marker(); t_review5(); t_dirsync(); t_review_a3(); }
     t_misc();
     if (!mt_fail && !getenv("FS_KEEP")) rm_rf(T); else printf("test_fs: kept %s\n", T);
     return mt_done("test_fs");

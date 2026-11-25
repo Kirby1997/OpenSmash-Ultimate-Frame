@@ -1615,12 +1615,13 @@ void plat_map_retry(const char *what, unsigned long long want) {
 #define LOW_START 0x7600000000ULL
 #define LOW_END   0x800000000000ULL
 static uintptr_t g_low_cursor = LOW_START;
-static void *low_place(size_t n, int prot, int flags) {
+static void *low_place(size_t n, int prot, int flags, int fd, off_t off) {    /* fd -1: anonymous memory */
+    if (n > LOW_END - LOW_START) { errno = ENOMEM; return MAP_FAILED; }
     size_t step = (n + 0xffff) & ~(size_t)0xffff;
     uintptr_t at = g_low_cursor;
     for (int tries = 0; tries < 4096; tries++) {
         if (at + n > LOW_END || at < LOW_START) at = LOW_START;
-        void *p = mmap((void *)at, n, prot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+        void *p = mmap((void *)at, n, prot, flags | MAP_FIXED_NOREPLACE, fd, off);
         if (p != MAP_FAILED && (uintptr_t)p == at) { g_low_cursor = at + step; return p; }
         if (p != MAP_FAILED) munmap(p, n);          /* kernel without MAP_FIXED_NOREPLACE put it elsewhere */
         else if (errno != EEXIST) return MAP_FAILED;
@@ -1640,7 +1641,7 @@ static void *low_stack(size_t size, size_t guard) {
     void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 #else
     vm_lock();
-    void *p = low_place(n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK);
+    void *p = low_place(n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
     vm_unlock();
 #endif
     if (p == MAP_FAILED) return NULL;
@@ -1669,7 +1670,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         void *p;
         if (addr) p = mmap((void *)lo, nm, mprot, flags | MAP_FIXED_NOREPLACE, -1, 0);
 #if defined(__aarch64__) && !defined(__APPLE__)
-        else p = low_place(nm, mprot, flags);
+        else p = low_place(nm, mprot, flags, -1, 0);
 #else
         else {
             /* 64 KB alignment: over-allocate and trim */
@@ -2005,15 +2006,12 @@ LPVOID MapViewOfFile(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n) {
     if (!n) n = o->map_size - (size_t)off;
 #if defined(__aarch64__) && !defined(__APPLE__)
     /* aarch64 Linux: mmap(NULL) puts the view at 0xffff_xxxx_xxxx, above the 2^47 that every pointer the guest sees stays under, and the
-     * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place reserves the range below 2^47
-     * (as VirtualAlloc does; its cursor wants g_vm_lock), the file is mapped over it. (linux-arm64 vks_base was placed the same way.) */
-    int prot = (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
-    size_t pg = (size_t)sysconf(_SC_PAGESIZE), rn = (n + pg - 1) & ~(pg - 1);
+     * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place maps the file below 2^47
+     * (as VirtualAlloc does; its cursor wants g_vm_lock). Only the mmap runs under the lock (no page is touched: microseconds).
+     * (linux-arm64 vks_base was placed the same way.) */
     vm_lock();
-    void *res = low_place(rn, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    void *p = low_place(n, (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, o->fd, off);
     vm_unlock();
-    void *p = res == MAP_FAILED ? MAP_FAILED : mmap(res, n, prot, MAP_SHARED | MAP_FIXED, o->fd, off);
-    if (res != MAP_FAILED && p == MAP_FAILED) { int e = errno; munmap(res, rn); errno = e; }
 #else
     void *p = mmap(NULL, n, (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, o->fd, off);
 #endif
@@ -2211,6 +2209,17 @@ static int plat_ci_fix(char *out) {
     }
     return stat(out, &st) == 0;
 }
+/* fsync of an open file or folder: 0, or -errno on a real failure (EIO and the rest). A file system that cannot sync at all
+ * (EINVAL, ENOTSUP, ENOSYS: some network and FUSE ones, for folders) is not a failure: it is said once, and the caller goes on
+ * without the power-cut guarantee (failing there would refuse every save on such a file system, for good). */
+static int plat_fsync(int fd) {
+    if (!fsync(fd)) return 0;
+    int e = errno;
+    if (e != EINVAL && e != ENOTSUP && e != ENOSYS) return -e;
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) fprintf(stderr, "plat: this file system cannot sync files or folders (%s): saved files may not survive a power cut\n", strerror(e));
+    return 0;
+}
 /* host_path_resolve (datapaths.c, C10): `in` -> `out`: '\\' becomes '/', existing components get their stored case, the missing tail is kept. 1 = it exists. */
 int host_path_resolve(const char *in, char *out, size_t n) {
     char t[PATH_MAX];
@@ -2244,7 +2253,7 @@ int host_fsync_parent(const char *path) {
     if (!s) strcpy(rp, "."); else if (s == rp) rp[1] = 0; else *s = 0;
     int fd = open(rp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) return -errno;
-    int r = fsync(fd) == 0 ? 0 : -errno;
+    int r = plat_fsync(fd);
     close(fd);
     return r;
 }
@@ -2444,7 +2453,9 @@ failed:
     return -1;
 }
 /* rename() is atomic. MOVEFILE_REPLACE_EXISTING replaces the target in the same step; without it nothing at `to` is replaced
- * (rename_noreplace), as on Windows. */
+ * (rename_noreplace), as on Windows. MOVEFILE_WRITE_THROUGH: the file's data reaches the disk before the rename, so its new
+ * name never does without it, and the folders of both names after it; a failed fsync fails the call (before the rename: not
+ * moved; after it: moved, but not known to be on the disk). A file system that cannot sync is not a failure (plat_fsync). */
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
     char a[PATH_MAX], b[PATH_MAX], want[PATH_MAX];
     P(from, a); P(to, b);
@@ -2459,7 +2470,7 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
     }
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* the data first: the new name must never reach the disk before it */
         int fd = open(a, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd >= 0) { if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && fsync(fd)) { int e = errno; close(fd); errno = e; return fail_errno(); } close(fd); }
+        if (fd >= 0) { int r = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) ? plat_fsync(fd) : 0; close(fd); if (r) { errno = -r; return fail_errno(); } }
     }
     if (flags & MOVEFILE_REPLACE_EXISTING ? rename(a, b) : rename_noreplace(a, b)) return fail_errno();     /* EEXIST: ERROR_ALREADY_EXISTS */
     if (flags & MOVEFILE_WRITE_THROUGH) {                /* then both folder entries on disk before returning */
@@ -2475,8 +2486,8 @@ BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
             if (k && !strcmp(da, db)) break;
             int fd = open(d[k], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (fd < 0) return fail_errno();
-            int r = fsync(fd); int e = errno; close(fd);
-            if (r) { errno = e; return fail_errno(); }
+            int r = plat_fsync(fd); close(fd);
+            if (r) { errno = -r; return fail_errno(); }
         }
     }
     return TRUE;

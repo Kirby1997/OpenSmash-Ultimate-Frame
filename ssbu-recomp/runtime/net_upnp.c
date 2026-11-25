@@ -145,7 +145,7 @@ out:
 #include <strings.h>
 #include <sys/time.h>
 #include <unistd.h>
-#ifndef MSG_NOSIGNAL                                      /* macOS: none (SIGPIPE stays possible there) */
+#ifndef MSG_NOSIGNAL                                      /* a macOS SDK without it: SIGPIPE stays possible there */
 #define MSG_NOSIGNAL 0
 #endif
 typedef struct { char host[64]; uint16_t port; char path[256]; } upnp_url;
@@ -189,7 +189,7 @@ static int upnp_http(const upnp_url *u, const char *head, const char *body, char
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);              /* (also bounds connect on Linux) */
     len = snprintf(req, sizeof req, "%s %s HTTP/1.0\r\nHost: %s:%u\r\n%sContent-Length: %u\r\nConnection: close\r\n\r\n%s",
                    body ? "POST" : "GET", u->path, u->host, u->port, head ? head : "", body ? (unsigned)strlen(body) : 0u, body ? body : "");
-    if (len > 0 && len < (int)sizeof req && !connect(s, (struct sockaddr *)&a, sizeof a) && send(s, req, (size_t)len, MSG_NOSIGNAL) == len) {   /* a router that resets: EPIPE, not SIGPIPE (the exe does not ignore it) */
+    if (len > 0 && len < (int)sizeof req && !connect(s, (struct sockaddr *)&a, sizeof a) && send(s, req, (size_t)len, MSG_NOSIGNAL) == len) {   /* a router that already reset the connection: EPIPE, not SIGPIPE (nothing in the runtime ignores it) */
         for (;;) {
             ssize_t r = recv(s, out + got, n - 1 - got, 0);
             if (r <= 0) break;

@@ -113,7 +113,15 @@ static void fs_roots(void) {
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
 
 static int is_dir(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
-static int exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
+/* 1: there; 0: absent (not found, or a folder on its path is not there); -1: it cannot be looked at now (an I/O error, access
+ * denied, a file being deleted on Windows): neither, so nothing that depends on it is done. */
+static int presence(const char *p) {
+    if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return 1;
+    DWORD e = GetLastError();
+    return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? 0 : -1;
+}
+static int exists(const char *p) { return presence(p) > 0; }
+static int absent(const char *p) { return presence(p) == 0; }
 static void make_parents(const char *path) {             /* creates every missing folder above `path` */
     char tmp[MAX_PATH];
     snprintf(tmp, sizeof tmp, "%s", path);
@@ -149,7 +157,7 @@ static int remove_tree(const char *dir) {
     }
     SetFileAttributesA(dir, FILE_ATTRIBUTE_NORMAL);       /* Windows: a read-only folder is not removed */
     for (int i = 0; exists(dir); i++) if (RemoveDirectoryA(dir) || !transient_failure(i)) break;
-    return !exists(dir);
+    return absent(dir);
 }
 
 /* ---- tombstones */
@@ -571,28 +579,35 @@ static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "
  *   R.commit      (K)  the marker. Lines: "W <folder the files come from>", "R <root>", then "D rel" (delete), then "M rel"
  *                      (make folder) and "F rel" (move file) in the order of a walk of W. All D lines come before the first
  *                      F line. Earlier builds wrote the same lines with W = their E; those are applied the same way.
- * A commit is DECIDED once K is renamed into place (on POSIX: and its folder is synced). Every step below runs under the
- * commit lock: a named mutex on Windows, flock of R's parent folder elsewhere (plat_posix.c's CreateMutexA has no names).
- * When the lock cannot be taken, Commit is refused, recovery does nothing, and a mount over a pending commit is refused.
+ * A commit is DECIDED once K is renamed into place. Every step below runs under the commit lock: a named mutex on Windows,
+ * flock of R's parent folder elsewhere (plat_posix.c's CreateMutexA has no names). When the lock cannot be taken, Commit
+ * is refused, recovery does nothing, and a mount over a pending commit is refused.
+ * Whether a file or folder is there is asked with three answers: there, absent (not found), or not known (an I/O error,
+ * access denied); a step that depends on the answer does not go on with "not known".
  *
  * Commit (fs_Commit), states and what a crash or a failure leaves:
  *   C1 K exists (an earlier decided commit, of any process, is unfinished, or its marker cannot be read): APPLY it. If that
  *      fails the new Commit is refused and nothing else changes -- a commit is never decided over an unfinished one.
- *   C2 E is copied into a new S; S's files are flushed and its folders synced.
+ *   C2 E is copied into a new S; S's files are flushed and its folders synced (a flush or sync that fails fails the Commit).
  *   C3 the marker is written to a new R.journal.<id> and flushed.  Crash or failure in C2..C3: K absent, R = OLD state;
  *                                                                    S and the journal are dropped (now, or by the sweep).
  *   C4 R.journal.<id> is renamed to K WITHOUT replacing: if a K exists after all (a committer without the lock: an older
- *      build), the rename fails and this commit is not decided. POSIX: K's folder is then synced (3 tries): if that fails,
- *      K stays but is not applied now -- the moves of C5 must not reach the disk before K does; the commit is pending.
+ *      build), the rename fails and this commit is not decided; S is then removed only if no K exists (a K may be this
+ *      commit's after all: a link-and-unlink rename whose undo failed).
  *   C5 APPLY K.                                                      Crash in C4..C5: K present, the next mount APPLIES it:
  *                                                                    R = NEW state. Failure in C5: K stays, see "pending".
  *   C6 success: E is emptied (a new E if that fails) and the tombstones dropped (R now holds all of it).
  * APPLY(K), repeatable from any point:
+ *   A0 POSIX: K's folder is synced, one try (a second fsync can report success for what did not reach the disk): the
+ *      steps below must not reach the disk before K does, also when K is replayed. If that fails nothing is done (-5).
  *   A1 if every F source still exists in W, the D phase may be unfinished: each D target is deleted (read-only cleared,
- *      sharing violations retried on Windows) and must be GONE afterwards, else APPLY stops before the first F (-3). If some
- *      F source is gone, an F ran, so every D was done: no D runs again (a "D a" + "F a" pair would delete the new a).
- *   A2 M and F lines in order; an F whose source is gone was moved already. A folder that cannot be made, or a move that
- *      fails, stops APPLY (-2): the D phase is complete, the remaining sources are still in W.
+ *      sharing violations retried on Windows) and must be GONE afterwards, its folder synced on POSIX, else APPLY stops
+ *      before the first F (-3). If some F source is gone, an F ran, so every D was done: no D runs again (a "D a" + "F a"
+ *      pair would delete the new a). An F source that cannot be looked at: -1, nothing is done.
+ *   A2 M and F lines in order; an F whose source is gone was moved already (POSIX: its target's folder is synced again). A
+ *      folder that cannot be made, a move that fails, a sync that fails, or an F source that cannot be looked at stops
+ *      APPLY (-2): the D phase is complete, the remaining sources are still in W. (A file system that cannot sync at all is
+ *      not a failure: plat_posix.c.)
  *   A3 K is deleted and must be GONE (an antivirus can hold it open on Windows), else -4; then R's folder is synced.
  *   A4 then (only then) a stage folder W is removed. (An older build's ".work." W is left to the sweep.)
  *   A K that exists but cannot be read is -1: nothing is done, and it counts as pending.
@@ -600,8 +615,9 @@ static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "
  *   - The committing mount keeps E and its tombstones: they still describe the decided state, which is what the game sees.
  *     New writes go to E only; S is untouched, so they are never applied by the pending commit.
  *   - A mount that finds K pending (after its own APPLY attempt failed) starts E as a copy of W, plus tombstones for the D
- *     lines when the D phase is unfinished: it sees the decided state too. If K cannot be read, or that copy fails, or the
- *     lock is not held, the mount fails (the game sees an error, not a wrong state; everything stays for the next attempt).
+ *     lines when the D phase is unfinished: it sees the decided state too. If K cannot be read, or that copy fails, or W
+ *     cannot be looked at, or the lock is not held, the mount fails (the game sees an error, not a wrong state; everything
+ *     stays for the next attempt).
  *   - While a commit is pending, every deletion records a tombstone, since a file may exist only in the pending commit,
  *     which C1 moves into R before this mount's own changes.
  *   - K is APPLIED again by the next Commit (C1), by Unmount, and by every mount.
@@ -681,7 +697,7 @@ static int delete_entry(const char *path) {               /* 1 = gone afterwards
         SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);  /* Windows: DeleteFileA refuses a read-only file */
         if (DeleteFileA(path) || !transient_failure(i)) break;
     }
-    return !exists(path);
+    return absent(path);
 }
 static int move_over(const char *from, const char *to) {
     if (exists(to)) SetFileAttributesA(to, FILE_ATTRIBUTE_NORMAL);   /* Windows: MoveFileEx does not replace a read-only file */
@@ -690,15 +706,22 @@ static int move_over(const char *from, const char *to) {
         if (!transient_failure(i)) return 0;
     }
 }
-static void sync_folder(const char *dir) {                /* the folder's own entries on disk (POSIX; NTFS journals its metadata) */
+static int sync_folder(const char *dir) {                 /* the folder's own entries on disk (POSIX; NTFS journals its metadata). 1 = done */
 #ifndef _WIN32
     char child[MAX_PATH];
     join(child, dir, "-");
-    host_fsync_parent(child);
+    return host_fsync_parent(child) == 0;
 #else
     (void)dir;
+    return 1;
 #endif
 }
+#ifndef _WIN32
+static int parent_synced(const char *path) {             /* the folder that holds path synced (APPLY); one that is gone has nothing to sync */
+    int r = host_fsync_parent(path);
+    return r == 0 || r == -ENOENT || r == -ENOTDIR;
+}
+#endif
 /* A copy of the tree `from` as `to` (folders and files). durable: every folder synced after its entries. 1 = complete. */
 static int copy_tree(const char *from, const char *to, int durable) {
     char pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
@@ -715,7 +738,7 @@ static int copy_tree(const char *from, const char *to, int durable) {
         else SetFileAttributesA(b, FILE_ATTRIBUTE_NORMAL);
     } while (ok && FindNextFileA(h, &fd));
     FindClose(h);
-    if (ok && durable) sync_folder(to);
+    if (ok && durable && !sync_folder(to)) ok = 0;
     return ok;
 }
 /* The M and F lines of every entry of the folder, depth first; each file is flushed first. 1 = every file reached the disk. */
@@ -750,7 +773,7 @@ static int marker_line(FILE *j, char *line, size_t cap) {  /* next line without 
     return 1;
 }
 /* Opens a marker and reads its W and R (either may be "") and whether its D phase is over (some F source is gone, see A1).
- * The file is positioned at its start again. */
+ * The file is positioned at its start again. NULL also when an F source cannot be looked at (neither there nor absent). */
 static FILE *marker_open(const char *marker, char *work, char *root, int *deletes_done) {
     char line[MAX_PATH + 8], a[MAX_PATH];
     FILE *j = fopen(marker, "r");
@@ -760,19 +783,29 @@ static FILE *marker_open(const char *marker, char *work, char *root, int *delete
         if (strlen(line) < 3) continue;
         if (line[0] == 'W') snprintf(work, MAX_PATH, "%s", line + 2);
         else if (line[0] == 'R') snprintf(root, MAX_PATH, "%s", line + 2);
-        else if (line[0] == 'F' && work[0] && !*deletes_done) { join(a, work, line + 2); *deletes_done = !exists(a); }
+        else if (line[0] == 'F' && work[0] && !*deletes_done) {
+            join(a, work, line + 2);
+            int p = presence(a);
+            if (p < 0) { fclose(j); return NULL; }            /* cannot tell whether the D phase is over: as unreadable */
+            *deletes_done = !p;
+        }
     }
     rewind(j);
     return j;
 }
 static int is_stage(const char *folder) { const char *leaf = strrchr(folder, '\\'); return strstr(leaf ? leaf : folder, ".stage.") != NULL; }
-/* APPLY (A1..A4 above). >= 0: done (the number of changes); -1 no marker, -2 a folder or a move failed, -3 a deletion failed,
- * -4 the marker could not be removed. */
+/* APPLY (A0..A4 above). >= 0: done (the number of changes); -1 no marker (or one that cannot be read), -2 a folder or a move
+ * failed, -3 a deletion failed, -4 the marker could not be removed, -5 the marker's folder could not be synced (POSIX). */
 static int journal_apply(const char *marker) {
     char line[MAX_PATH + 8], work[MAX_PATH], root[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
     int n = 0, deletes_done;
     FILE *j = marker_open(marker, work, root, &deletes_done);
     if (!j) return -1;
+#ifndef _WIN32
+    int r;
+    while ((r = host_fsync_parent(marker)) == -EINTR) {}  /* A0: one try (a second fsync can report 0 for what failed to reach the disk) */
+    if (r) { fclose(j); return -5; }
+#endif
     while (root[0] && work[0] && marker_line(j, line, sizeof line)) {
         if (strlen(line) < 3) continue;
         const char *arg = line + 2;
@@ -782,17 +815,22 @@ static int journal_apply(const char *marker) {
             join(a, root, arg);
             if (!delete_entry(a)) { fclose(j); return -3; }           /* before any F: the next APPLY does the D phase again */
 #ifndef _WIN32
-            host_fsync_parent(a);                         /* on disk before the marker goes: a deleted file must not come back */
+            if (!parent_synced(a)) { fclose(j); return -3; }          /* on disk before the marker goes: a deleted file must not come back */
 #endif
         } else if (line[0] == 'M') {
             join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL);
             if (!is_dir(a)) { fclose(j); return -2; }
 #ifndef _WIN32
-            host_fsync_parent(a);
+            if (!parent_synced(a)) { fclose(j); return -2; }
 #endif
         } else if (line[0] == 'F') {
             join(a, work, arg); join(b, root, arg);
-            if (exists(a)) { make_parents(b); if (!move_over(a, b)) { fclose(j); return -2; } }
+            int p = presence(a);
+            if (p > 0) { make_parents(b); if (!move_over(a, b)) { fclose(j); return -2; } }
+            else if (p < 0) { fclose(j); return -2; }                 /* not known to be moved: it may still be in W */
+#ifndef _WIN32
+            else if (!parent_synced(b)) { fclose(j); return -2; }     /* moved by an earlier APPLY, whose sync may have failed */
+#endif
             n++;
         }
     }
@@ -811,7 +849,7 @@ static int commit_pending(const char *root, char *work) {
     int done;
     snprintf(marker, sizeof marker, "%s.commit", root);
     FILE *j = marker_open(marker, work, r, &done);
-    if (!j) return exists(marker) ? -1 : 0;
+    if (!j) return absent(marker) ? 0 : -1;
     fclose(j);
     return 1;
 }
@@ -831,13 +869,13 @@ static void journal_recover(const char *root) {
     CommitLock mx = commit_mutex(root);
     if (!mx.ok) { printf("nn::fs: the commit lock of %s could not be taken: recovery skipped\n", root); return; }
     snprintf(marker, sizeof marker, "%s.commit", root);
-    if (exists(marker)) {
+    if (!absent(marker)) {
         int n = journal_apply(marker);
         if (n >= 0) printf("nn::fs: a commit of %s was interrupted after it was decided: finished now (%d changes)\n", root, n);
         else printf("nn::fs: a decided commit of %s could not be finished yet (%d); it is kept and tried again\n", root, n);
         trace_printf("     fs journal: interrupted commit of %s rolled forward (%d)\n", root, n);
     }
-    int marker_left = exists(marker);
+    int marker_left = !absent(marker);
     snprintf(pat, sizeof pat, "%s.*", root);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -862,8 +900,9 @@ static int seed_from_pending(Mount *m) {
     int deletes_done;
     snprintf(marker, sizeof marker, "%s.commit", m->root);
     FILE *j = marker_open(marker, work, root, &deletes_done);
-    if (!j) return 1;
-    int ok = !work[0] || !is_dir(work) || copy_tree(work, m->work, 0);       /* (no W left: every move was done) */
+    if (!j) return absent(marker);                                           /* (gone since: applied by another process) */
+    int w = work[0] ? presence(work) : 0;
+    int ok = w == 0 || (w > 0 && copy_tree(work, m->work, 0));             /* (no W left: every move was done) */
     while (ok && !deletes_done && marker_line(j, line, sizeof line))
         if (strlen(line) >= 3 && line[0] == 'D') tomb_add(m, line + 2);
     fclose(j);
@@ -987,19 +1026,19 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     int changes = -1, ok = mx.ok, decided = 0;
     if (ok) {                                                                   /* C1 */
         step = "finish the pending commit";
-        changes = exists(marker) ? journal_apply(marker) : 0;                  /* (-1: a marker that cannot be read) */
+        changes = absent(marker) ? 0 : journal_apply(marker);                  /* (-1: a marker that cannot be read) */
         ok = changes >= 0;
     }
     if (ok) {                                                                   /* C2 */
         step = "stage";
-        ok = !exists(stage) && copy_tree(m->work, stage, 1);
+        ok = absent(stage) && copy_tree(m->work, stage, 1);
 #ifndef _WIN32
-        if (ok) host_fsync_parent(stage);
+        if (ok) ok = host_fsync_parent(stage) == 0;
 #endif
     }
     if (ok) {                                                                   /* C3 */
         step = "write the journal";
-        FILE *j = exists(journal) ? NULL : fopen(journal, "w");
+        FILE *j = absent(journal) ? fopen(journal, "w") : NULL;
         ok = j != NULL;
         if (ok) {
             fprintf(j, "W\t%s\nR\t%s\n", stage, m->root);
@@ -1012,19 +1051,19 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     if (ok) {                                                                   /* C4 */
         step = "decide";
         /* never over an existing marker (an older build, or a process without the lock, may have decided one since C1): the
-         * rename fails instead, and this commit is not decided */
+         * rename fails instead, and this commit is not decided. POSIX: the journal's data is on disk already; its folder is
+         * synced by APPLY's A0. */
 #ifdef _WIN32
         decided = ok = MoveFileExA(journal, marker, MOVEFILE_WRITE_THROUGH);
 #else
-        decided = ok = MoveFileExA(journal, marker, 0);   /* (the journal's data is on disk already; its folder is synced next) */
-        if (decided) {
-            step = "sync the decision";
-            ok = 0;
-            for (int i = 0; i < 3 && !ok; i++) ok = host_fsync_parent(marker) == 0;
-        }                                                 /* not synced: K stays and is not applied now (C5 must not outrun it to the disk) */
+        decided = ok = MoveFileExA(journal, marker, 0);
 #endif
     }
-    if (decided && ok) { step = "apply"; changes = journal_apply(marker); ok = changes >= 0; }     /* C5 */
+    if (decided && ok) {                                                        /* C5 */
+        changes = journal_apply(marker);
+        step = changes == -5 ? "sync the decision" : "apply";                  /* (K stays and is not applied now: pending) */
+        ok = changes >= 0;
+    }
     DWORD err = ok ? 0 : GetLastError();
     if (ok) {                                                                   /* C6 */
         tomb_clear(m);
@@ -1033,7 +1072,10 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
         m->pend = 0;
     }
     else if (decided) m->pend = 1;                         /* E and the tombstones stay: they show the decided state */
-    else if (mx.ok && changes >= 0) { delete_entry(journal); remove_tree(stage); }   /* not decided: nothing happened (leftovers are swept later) */
+    else if (mx.ok && changes >= 0) {                     /* not decided: nothing happened (leftovers are swept later) */
+        delete_entry(journal);
+        if (absent(marker)) remove_tree(stage);           /* a marker after all may be this one (a link whose undo failed): it names S */
+    }
     commit_done(mx);
     fs_unlock();
     trace_printf("     fs commit \"%s\": %s (%d changes)\n", name, ok ? "ok" : step, changes);
