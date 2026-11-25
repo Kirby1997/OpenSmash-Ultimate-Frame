@@ -3161,6 +3161,31 @@ static void dt_vk(int fight, int idx, int ok, const Cmd *m, int indexed, const B
            (unsigned long long)R.ds, R.poly[0], R.poly[1], R.poly[2], R.poly[3], R.polyoff[0], R.polyoff[1], R.polyoff[2], R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3], R.have_viewport,
            R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.have_scissor, R.drange[0], R.drange[1], R.depth_clamp, R.restart, R.rast_discard, R.pass_w, R.pass_h, R.ncol, R.depth.tex != NULL, R.chanmask, R.blend_on, R.gen);
 }
+/* The "draw preparation" ms of the nvn_vk_perf line without a clock pair per draw (perf team 2026-11-25: the two
+ * QueryPerformanceCounter calls per draw were 5.5 % of the render thread at 8 fighters). One draw in about 64 is timed (a
+ * random stride of 32..95, so a draw sequence that repeats every frame is not sampled in step with itself) and stands for
+ * the draws since the last timed one. The rare long waits inside a draw's preparation (a ring wrap's wait for the GPU,
+ * a copy-back, a pipeline or stage made or waited for at the draw) already have clock pairs of their own: their ticks
+ * (g_tm 0, 1, 5, 6, all written by this thread only) are added exactly for every draw, and only the rest is scaled.
+ * SSBU_VK_DRAWTIME=1: every draw timed (the old exact sum). */
+static int g_dp_every = -1;
+static unsigned g_dp_left, g_dp_n, g_dp_rnd = 0x2545F491u;
+static inline LONG64 dp_exact(void) { return g_tm[0] + g_tm[1] + g_tm[5] + g_tm[6]; }
+static int draw_prepare_timed(unsigned prim) {
+    if (g_dp_every < 0) { const char *e = getenv("SSBU_VK_DRAWTIME"); g_dp_every = e && atoi(e) > 0;
+                          printf("nvn_vk: draw preparation time (nvn_vk_perf): %s\n", g_dp_every ? "every draw timed (SSBU_VK_DRAWTIME=1)" : "one draw in about 64 timed and scaled, waits inside it added exactly (SSBU_VK_DRAWTIME=1: every draw)"); }
+    int timed = g_dp_every || g_dp_left <= 1;
+    LONG64 x0 = dp_exact(), t0 = timed ? tk() : 0;
+    int ok = draw_prepare(prim);                   /* one call site: the compiler keeps a single copy of it */
+    LONG64 dx = dp_exact() - x0;
+    if (!timed) { g_dp_left--; g_dp_n++; g_tm[8] += dx; return ok; }
+    LONG64 dt = tk() - t0;
+    if (g_dp_every) { g_tm[8] += dt; return ok; }
+    g_tm[8] += dx + (dt > dx ? dt - dx : 0) * (LONG64)(g_dp_n + 1);
+    g_dp_rnd = g_dp_rnd * 1664525u + 1013904223u;
+    g_dp_left = 32 + (g_dp_rnd >> 26); g_dp_n = 0;
+    return ok;
+}
 static void replay(uint64_t handle, int depth);
 static void exec(const Cmd *m, int depth) {
     const uint8_t *blob = BLOB(m);
@@ -3311,7 +3336,7 @@ static void exec(const Cmd *m, int depth) {
         break;
     }
     case OP_DRAW_ARRAYS:
-        { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        { int ok = draw_prepare_timed((unsigned)a[0]); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         if (D.has_ckpt) ckpt_mark(0, (unsigned)a[0], (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], 0, 0);
         vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]);
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
@@ -3323,7 +3348,7 @@ static void exec(const Cmd *m, int depth) {
         if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); break; }
         BufRef ib;
         buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
-        { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        { int ok = draw_prepare_timed((unsigned)a[0]); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         if (D.has_ckpt) ckpt_mark(1, (unsigned)a[0], (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], t);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
