@@ -1614,12 +1614,13 @@ void plat_map_retry(const char *what, unsigned long long want) {
 #define LOW_START 0x7600000000ULL
 #define LOW_END   0x800000000000ULL
 static uintptr_t g_low_cursor = LOW_START;
-static void *low_place(size_t n, int prot, int flags) {
+static void *low_place(size_t n, int prot, int flags, int fd, off_t off) {    /* fd -1: anonymous memory */
+    if (n > LOW_END - LOW_START) { errno = ENOMEM; return MAP_FAILED; }
     size_t step = (n + 0xffff) & ~(size_t)0xffff;
     uintptr_t at = g_low_cursor;
     for (int tries = 0; tries < 4096; tries++) {
         if (at + n > LOW_END || at < LOW_START) at = LOW_START;
-        void *p = mmap((void *)at, n, prot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+        void *p = mmap((void *)at, n, prot, flags | MAP_FIXED_NOREPLACE, fd, off);
         if (p != MAP_FAILED && (uintptr_t)p == at) { g_low_cursor = at + step; return p; }
         if (p != MAP_FAILED) munmap(p, n);          /* kernel without MAP_FIXED_NOREPLACE put it elsewhere */
         else if (errno != EEXIST) return MAP_FAILED;
@@ -1639,7 +1640,7 @@ static void *low_stack(size_t size, size_t guard) {
     void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 #else
     vm_lock();
-    void *p = low_place(n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK);
+    void *p = low_place(n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
     vm_unlock();
 #endif
     if (p == MAP_FAILED) return NULL;
@@ -1668,7 +1669,7 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
         void *p;
         if (addr) p = mmap((void *)lo, nm, mprot, flags | MAP_FIXED_NOREPLACE, -1, 0);
 #if defined(__aarch64__) && !defined(__APPLE__)
-        else p = low_place(nm, mprot, flags);
+        else p = low_place(nm, mprot, flags, -1, 0);
 #else
         else {
             /* 64 KB alignment: over-allocate and trim */
@@ -2004,15 +2005,12 @@ LPVOID MapViewOfFile(HANDLE m, DWORD access, DWORD hi, DWORD lo, SIZE_T n) {
     if (!n) n = o->map_size - (size_t)off;
 #if defined(__aarch64__) && !defined(__APPLE__)
     /* aarch64 Linux: mmap(NULL) puts the view at 0xffff_xxxx_xxxx, above the 2^47 that every pointer the guest sees stays under, and the
-     * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place reserves the range below 2^47
-     * (as VirtualAlloc does; its cursor wants g_vm_lock), the file is mapped over it. (linux-arm64 vks_base was placed the same way.) */
-    int prot = (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
-    size_t pg = (size_t)sysconf(_SC_PAGESIZE), rn = (n + pg - 1) & ~(pg - 1);
+     * views are guest-visible: nvn_vk_store.c hands them to the game's own (lifted) zstd decoder. low_place maps the file below 2^47
+     * (as VirtualAlloc does; its cursor wants g_vm_lock). Only the mmap runs under the lock (no page is touched: microseconds).
+     * (linux-arm64 vks_base was placed the same way.) */
     vm_lock();
-    void *res = low_place(rn, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+    void *p = low_place(n, (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, o->fd, off);
     vm_unlock();
-    void *p = res == MAP_FAILED ? MAP_FAILED : mmap(res, n, prot, MAP_SHARED | MAP_FIXED, o->fd, off);
-    if (res != MAP_FAILED && p == MAP_FAILED) { int e = errno; munmap(res, rn); errno = e; }
 #else
     void *p = mmap(NULL, n, (access & FILE_MAP_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, o->fd, off);
 #endif
