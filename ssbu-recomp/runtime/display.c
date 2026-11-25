@@ -143,8 +143,9 @@ static void pcore_init(void) {
     }
 }
 #else
-/* Linux build: CPU sets and ProcessPowerThrottling are Windows calls; the scheduler is left to choose the cores */
-static void pcore_init(void) { g_pc_n = 0; printf("display: CPU: the cores are left to the system (performance-core pinning is a Windows feature of this build)%c", 10); }
+/* Linux build: CPU sets and ProcessPowerThrottling are Windows calls. On a hybrid aarch64 CPU os_threads.c places the
+ * critical threads instead (SSBU_CPU_PLACE, its "cpu place:" line); elsewhere the scheduler chooses the cores. */
+static void pcore_init(void) { g_pc_n = 0; printf("display: CPU: no Windows performance-core sets here (SSBU_PCORES has no effect; Linux on a hybrid aarch64 CPU: see the \"cpu place:\" line, SSBU_CPU_PLACE)%c", 10); }
 #endif
 /* the calling thread: performance cores only (once per thread is enough; cheap to repeat) */
 void display_perf_thread(void) {

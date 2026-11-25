@@ -361,6 +361,9 @@ typedef struct PlatObj {
 #ifdef PLAT_A64_LINUX
     void *stack_map; size_t stack_map_size;      /* the thread's own stack (low_stack), guard page included */
 #endif
+#ifdef __linux__
+    const cpu_set_t *start_aff;                  /* the affinity it starts with instead of its creator's (plat_thread_placed); NULL = inherited */
+#endif
     /* files, finds, mappings */
     int fd;
     DIR *dir; char dir_path[MAX_PATH]; char pattern[MAX_PATH];
@@ -449,6 +452,12 @@ static void stack_trim(void *map, size_t size) {
 }
 #endif
 static __thread PlatObj *t_self;
+#ifdef __linux__
+/* os_threads.c (SSBU_CPU_PLACE): the calling thread narrowed its own affinity; the threads it creates from now on start
+ * with `child_set` (the process's mask at start-up, kept for the life of the process) instead of inheriting the narrow one. */
+static __thread const cpu_set_t *t_child_aff;
+void plat_thread_placed(const cpu_set_t *child_set) { t_child_aff = child_set; }
+#endif
 static PlatObj *g_thr[1024]; static int g_nthr; static pthread_mutex_t g_thr_lock = PTHREAD_MUTEX_INITIALIZER;   /* live threads of CreateThread */
 static void *thread_tramp(void *p) {
     PlatObj *o = p;
@@ -456,6 +465,9 @@ static void *thread_tramp(void *p) {
     crash_thread_init();                       /* alternate signal stack: a stack overflow on this thread still gets its crash report (plat_crash.c) */
 #endif
     t_self = o;
+#ifdef __linux__
+    if (o->start_aff) sched_setaffinity(0, sizeof *o->start_aff, o->start_aff);   /* (on failure it keeps its creator's mask) */
+#endif
     plat_current_stack(&o->stk_lo, &o->stk_hi);
     pthread_mutex_lock(&g_thr_lock); if (g_nthr < 1024) g_thr[g_nthr++] = o; pthread_mutex_unlock(&g_thr_lock);
     o->tid = os_tid();
@@ -492,6 +504,9 @@ HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, LPTHREAD_START_ROUTIN
     (void)sa;
     PlatObj *o = obj_new(PO_THREAD);
     o->fn = fn; o->arg = arg; o->refs = 2; o->started = !(flags & CREATE_SUSPENDED); o->exit_code = STILL_ACTIVE;
+#ifdef __linux__
+    o->start_aff = t_child_aff;
+#endif
     pthread_attr_t a;
     pthread_attr_init(&a);
     SIZE_T size = stack ? (stack < (1 << 20) ? (1 << 20) : stack) : (SIZE_T)8 << 20;   /* Windows default: 1 MB; ours: 8 MB */
