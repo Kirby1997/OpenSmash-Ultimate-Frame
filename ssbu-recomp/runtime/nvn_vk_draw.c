@@ -1915,6 +1915,7 @@ typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;
 static CB g_cb[256];
 static CDisp g_cdisp[2048];
 static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
+static int g_cb_scan, g_lv_n;                      /* defined with the searches below (cb_inside) */
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 /* SSBU_VK_CBKEEP: the buffer's bytes go to guest memory. With the snapshot of the fill (SSBU_VK_CBMERGE, the default) only
  * the words compute changed since the fill are written, and a word the game changed since then stays the game's. */
@@ -2004,7 +2005,7 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
         c->state = c->dirty = 0; c->mid_stg = 0;
         c->busy = midbatch ? R.serial + 1 : 0;
     }
-    g_cb_live = g_cb_pending = 0; g_live_lo = ~0ull; g_live_hi = 0;
+    g_cb_live = g_cb_pending = 0; g_live_lo = ~0ull; g_live_hi = 0; g_lv_n = 0;
     nvn_front_ccmp_landed();                       /* SSBU_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
     g_tm[1] += tk() - t0;
@@ -2258,14 +2259,27 @@ void nvn_vk_memory_retire(void *arg) {
 static void cb_batch_end(void) {
     if (!g_cb_live) return;
     g_cb_serial = cmd_submit(NULL, NULL);
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1) { g_cb[i].state = 2; g_cb[i].kserial = g_cb_serial; g_cb[i].touch = 0; }
-    g_cb_pending = g_cb_live; g_cb_live = 0; g_live_lo = ~0ull; g_live_hi = 0;
+    int nlive = 0;
+    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1) { g_cb[i].state = 2; g_cb[i].kserial = g_cb_serial; g_cb[i].touch = 0; nlive++; }
+    if (g_cb_scan > 0 && (nlive != g_lv_n || g_lv_n > 256)) { printf("nvn_vk: the packed list of live compute buffers has %d entries, %d are live: walking all 256 from now on\n", g_lv_n, nlive); g_cb_scan = 0; }
+    g_cb_pending = g_cb_live; g_cb_live = 0; g_live_lo = ~0ull; g_live_hi = 0; g_lv_n = 0;
 }
 /* Round "four players" (P3): both searches are made for every buffer a draw names (about 2.5 million entries looked at per
  * frame with four fighters: 1.9 ms of the render thread). g_cb_hi = one past the highest entry cb_new has ever handed out
  * (it never goes down): entries above it have state 0, so stopping there finds exactly what the walk over all 256 found,
  * in the same order. SSBU_VK_CBSCAN=0 = the walk over all 256 as before. */
 static int g_cb_hi, g_cb_scan = -1, g_cb_bound = -1;
+/* perf team 2026-11-25: at 8 fighters (about 45 compute buffers live per batch, 685 draws) the two walks over g_cb[0..g_cb_hi)
+ * per buffer a draw names were most of buf_ref's 0.58 ms per frame (x7 against 1v1: x2.2 draws times x3 buffers). The
+ * buffers live in this batch (state 1) are now also kept packed, {lo, hi, index}, 24 bytes each instead of a walk over the
+ * 200-byte entries that are mostly not live. An entry becomes live only in cb_new (appended there) and leaves state 1
+ * only all together (cb_land, cb_batch_end, shutdown: g_cb_live = 0, the list is emptied there), so the list holds exactly
+ * the live entries. A match is checked against the entry itself (state 1); cb_inside returns the lowest index, as the walk
+ * did. cb_batch_end compares the list's length with g_cb_live: on a difference the walk comes back for good (logged).
+ * SSBU_VK_CBSCAN=0: the walk over all 256 as before round "four players". */
+static struct { uint64_t lo, hi; int idx; } g_lv[256];
+static int g_lv_n;
+static void lv_add(CB *c) { if (g_lv_n < 256) { g_lv[g_lv_n].lo = c->addr; g_lv[g_lv_n].hi = c->addr + c->size; g_lv[g_lv_n].idx = (int)(c - g_cb); } g_lv_n++; }
 /* What a guest thread may know about the CBs without a round trip through the render thread: the address ranges of every
  * CB that is not free (states 1..4), copied by the render thread after each job (nvn_vk_cb_publish, from render_loop) under
  * a sequence count. nvn_front_memory_retire (nvn_front.c) reads it: a finalized pool or buffer that meets none of them, with no
@@ -2305,14 +2319,39 @@ int nvn_vk_cb_may_overlap(uint64_t addr, uint64_t size) {     /* any thread: 1 =
     return 1;
 }
 static CB *cb_inside(uint64_t addr, uint64_t size) {
-    int n = g_cb_scan ? g_cb_hi : 256;
-    for (int i = 0; i < n; i++) if (g_cb[i].state == 1 && addr >= g_cb[i].addr && addr + size <= g_cb[i].addr + g_cb[i].size) return &g_cb[i];
+    if (g_cb_scan > 0) {
+        CB *best = NULL;
+        for (int k = 0; k < g_lv_n; k++)
+            if (addr >= g_lv[k].lo && addr + size <= g_lv[k].hi) { CB *c = &g_cb[g_lv[k].idx]; if (c->state == 1 && (!best || c < best)) best = c; }
+        return best;
+    }
+    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr >= g_cb[i].addr && addr + size <= g_cb[i].addr + g_cb[i].size) return &g_cb[i];
     return NULL;
 }
 static int cb_overlap(uint64_t addr, uint64_t size) {
-    int n = g_cb_scan ? g_cb_hi : 256;
-    for (int i = 0; i < n; i++) if (g_cb[i].state == 1 && addr < g_cb[i].addr + g_cb[i].size && g_cb[i].addr < addr + size) return 1;
+    if (g_cb_scan > 0) {
+        for (int k = 0; k < g_lv_n; k++) if (addr < g_lv[k].hi && g_lv[k].lo < addr + size && g_cb[g_lv[k].idx].state == 1) return 1;
+        return 0;
+    }
+    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr < g_cb[i].addr + g_cb[i].size && g_cb[i].addr < addr + size) return 1;
     return 0;
+}
+/* both questions of buf_ref in one walk over the packed list: the live buffer containing the range (lowest index), and
+ * whether any live buffer overlaps it */
+static CB *cb_find(uint64_t addr, uint64_t size, int *overlap) {
+    if (g_cb_scan <= 0) { CB *c = cb_inside(addr, size); *overlap = c || cb_overlap(addr, size); return c; }
+    CB *best = NULL;
+    int ov = 0;
+    uint64_t end = addr + size;
+    for (int k = 0; k < g_lv_n; k++) {
+        if (!(addr < g_lv[k].hi && g_lv[k].lo < end)) continue;
+        CB *c = &g_cb[g_lv[k].idx];
+        if (c->state != 1) continue;
+        ov = 1;
+        if (addr >= g_lv[k].lo && end <= g_lv[k].hi && (!best || c < best)) best = c;
+    }
+    *overlap = ov;
+    return best;
 }
 static CB *cb_new(uint64_t addr, uint64_t size) {
     CB *c = NULL, *empty = NULL, *victim = NULL;
@@ -2321,7 +2360,7 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
             CB *k = &g_cb[i];
             if (k->state != 3 || k->addr != addr || k->size != size) continue;
             if (g_cb_ww && cb_guest_wrote(k)) { cb_kept_land(k, 4); break; }      /* the game wrote into the range: merged back, then filled again below */
-            k->state = 1; k->dirty = 0; g_cb_live++; g_ck_hits++;
+            k->state = 1; k->dirty = 0; g_cb_live++; g_ck_hits++; lv_add(k);
             if (--g_cb_nkept == 0) { g_kept_lo = ~0ull; g_kept_hi = 0; }
             if (addr < g_live_lo) g_live_lo = addr;
             if (addr + size > g_live_hi) g_live_hi = addr + size;
@@ -2379,7 +2418,7 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
     } else
     memcpy(c->mem.map, P(addr), (size_t)size);
     c->stale = 0; g_ck_fills++; g_ck_fill_bytes += (LONG64)size;
-    g_cb_live++;
+    g_cb_live++; lv_add(c);
     return c;
 }
 typedef struct { uint64_t off, size; int zero; VkBuffer buf; } BufRef;
@@ -2453,9 +2492,10 @@ static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
     b->zero = 0; b->size = size;
     if (g_cb_bound < 0) g_cb_bound = !(getenv("SSBU_VK_CBBOUND") && !atoi(getenv("SSBU_VK_CBBOUND")));      /* round 16, default 1 (=0: cb_inside / cb_overlap are asked for every range as before): a range outside the bounds of the live buffers cannot be inside or overlap one. Proof of the picture: run p16_h_bf5 (old path + this) = p16_d_bfd (this off), all pixels, three frames. NOTE for picture tests on battle_field: the picture has two forms that alternate with the PRESENTED frame number (17-19 % of the pixels, small differences): compare shots whose "saved at presented frame" numbers have the same parity. */
     if (g_cb_live && (!g_cb_bound || (addr < g_live_hi && addr + size > g_live_lo))) {
-        CB *c = cb_inside(addr, size);
+        int ov;
+        CB *c = cb_find(addr, size, &ov);
         if (c && (addr - c->addr) % align == 0) { b->buf = c->buf; b->off = addr - c->addr; return 1; }
-        if (cb_overlap(addr, size)) {
+        if (ov) {
             if (cb_assemble(addr, size, b)) return 1;
             CB_WHY(c ? CBW_ALIGN : CBW_READ, addr, size); cb_sync();
         }
@@ -4475,7 +4515,7 @@ void vkd_shutdown(void) {
     fl_shutdown();
     if (g_ovl.made) { vkDestroyImage(V.device, g_ovl.img, NULL); g_ovl.made = 0; }      /* the progress bar's image; its memory goes with the blocks */
     for (int i = 0; i < 256; i++) if (g_cb[i].buf) { vkDestroyBuffer(V.device, g_cb[i].buf, NULL); g_cb[i].buf = NULL; g_cb[i].state = 0; }
-    g_cb_live = g_cb_pending = g_ncdisp = 0;
+    g_cb_live = g_cb_pending = g_ncdisp = 0; g_lv_n = 0;
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i], *n; v; v = n) {
         n = v->next;
         if (v->cp) { vkDestroyPipeline(V.device, v->cp, NULL); vkDestroyPipelineLayout(V.device, v->cl, NULL); vkDestroyDescriptorSetLayout(V.device, v->cdl[0], NULL); vkDestroyDescriptorSetLayout(V.device, v->cdl[1], NULL); }
