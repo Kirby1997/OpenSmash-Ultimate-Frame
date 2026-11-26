@@ -463,15 +463,73 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
     R.ring_pos += n; R.ring_bytes += n;
     return off;
 }
-static uint64_t ring_put(uint64_t addr, uint64_t size) {
+/* SSBU_VK_STREAMKEEP=1 (opt-in; POSIX builds only; perf team 2026-11-25, design C2 of report_perf_gpu): a guest range of a
+ * vertex, index or constant buffer is NOT copied into the ring again in a later batch when nothing can have changed its
+ * bytes since its last copy: the last copy's offset is bound again. At 8 fighters the ring streamed about 22 MB per frame
+ * (53 wraps of 256 MB in 600 frames), nearly all of it the same static vertex and index data every frame, because the
+ * range cache (acache) is emptied at every batch.
+ *
+ * When a copy may be reused (sk_put; all four must hold, else it is copied as before):
+ *   1. the range is write-watched memory: ww_newest (nvn_front.c, the texture and compute-buffer machinery) answers a
+ *      stamp, not 0. The question is asked BEFORE the copy, so a write by any thread after the question is either in
+ *      the copy or seen at the next question; a write before it is in the copy. This is the rule cb_new already uses
+ *      for kept compute buffers (c->ww).
+ *   2. the stamp now equals the stamp asked before that copy: no page of the range was written since, by any thread,
+ *      the kernel's copy_to_user included (userfaultfd async write protection resolves kernel-mode faults the same
+ *      way), and the render thread's own writes into guest memory included (copy-backs of compute buffers, buffer
+ *      updates / copies / clears, texture read-backs are all CPU writes into the watched pages). Stamps outlive
+ *      the other questions over the same pages (textures, compute buffers): see ww_newest.
+ *   3. no VirtualFree / UnmapViewOfFile since that copy (plat_vm_epoch, plat_posix.c): decommitted pages come back as
+ *      zeros WITHOUT counting as written (plat_selftest "decommit is not a write"), and a released and newly reserved
+ *      range starts unwritten too; so any of these anywhere makes every kept copy invalid.
+ *   4. the ring has not wrapped since that copy: ring bytes are only appended within a wrap, and the copy is bound only
+ *      by commands that read it.
+ * And the GPU never writes a kept copy: only vertex, index and constant-buffer uses are kept (BU_KEEP), all read-only in
+ * the translated shaders; a storage-buffer use of the same (address, size) in a draw (it may be written: such a use
+ * would share the acache copy) drops the kept entry (BU_WRITE). Ranges below SSBU_VK_STREAMKEEP_MIN bytes (default
+ * 16384) are copied as before: there the question (a PAGEMAP_SCAN ioctl) would cost about what the copy does. A range
+ * whose bytes changed at two questions in a row is not asked again for 2^n batches (it is copied as before meanwhile).
+ * Counted in the "nvn_vk_streamkeep:" line. */
+enum { BU_NONE = 0, BU_KEEP = 1, BU_WRITE = -1 };
+#ifdef _WIN32
+static unsigned long long plat_vm_epoch(void) { return 0; }      /* not available: no epoch of decommits (sk_on stays 0) */
+#else
+unsigned long long plat_vm_epoch(void);              /* plat_posix.c: VirtualFree / UnmapViewOfFile calls so far */
+#endif
+uint64_t nvn_front_mem_newest(const void *p, size_t n);      /* nvn_front.c */
+#define SK_NEWEST(addr, size) nvn_front_mem_newest(P(addr), (size_t)(size))
+#define SK_EPOCH() plat_vm_epoch()
+#define SK_WRAPS R.ring_wraps
+#define SK_COPY(addr, size) sk_copy(addr, size)
+static uint64_t sk_copy(uint64_t addr, uint64_t size) {
+    uint64_t off = ring_raw(P(addr), size);
+    int c = st_class(size); g_st_bytes[c] += (LONG64)size; g_st_n[c]++;
+    return off;
+}
+#include "stream_keep.inc"
+static int g_sk_on = -1;                           /* SSBU_VK_STREAMKEEP */
+static uint64_t g_sk_min = 16384;                  /* SSBU_VK_STREAMKEEP_MIN */
+static void sk_init(void) {
+    const char *e = getenv("SSBU_VK_STREAMKEEP"), *m = getenv("SSBU_VK_STREAMKEEP_MIN");
+    g_sk_on = 0;
+#ifndef _WIN32
+    g_sk_on = e && atoi(e) > 0;
+#endif
+    if (m && atoll(m) > 0) g_sk_min = (uint64_t)atoll(m);
+    if (g_sk_on && !(g_sk = calloc((size_t)SK_SETS * SK_WAYS, sizeof *g_sk))) g_sk_on = 0;
+    printf("nvn_vk: stream keep (SSBU_VK_STREAMKEEP): %s\n", g_sk_on ? "on: vertex, index and constant ranges in write-watched memory are not copied again while unchanged" : e && atoi(e) > 0 ? "not available in this build" : "off");
+    if (g_sk_on) printf("nvn_vk: stream keep: ranges of %llu bytes and more (SSBU_VK_STREAMKEEP_MIN)\n", (unsigned long long)g_sk_min);
+}
+static uint64_t ring_put(uint64_t addr, uint64_t size, int use) {
+    if (g_sk_on < 0) sk_init();
+    if (use == BU_WRITE && g_sk_on) sk_kill(addr, size);      /* before the acache: a hit there would share the kept copy */
     unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19;
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
         if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) return R.acache[i].off;
         if (R.acache[i].gen != R.gen) { h = i; break; }
     }
-    uint64_t off = ring_raw(P(addr), size);
-    { int c = st_class(size); g_st_bytes[c] += (LONG64)size; g_st_n[c]++; }
+    uint64_t off = use == BU_KEEP && g_sk_on && size >= g_sk_min ? sk_put(addr, size) : sk_copy(addr, size);
     h &= 8191;
     R.acache[h].addr = addr; R.acache[h].size = size; R.acache[h].off = off; R.acache[h].gen = R.gen;
     return off;
@@ -2488,7 +2546,7 @@ static VkDeviceSize sb_range(uint64_t size) {
 }
 /* Where a command reads the guest range from: a CB of this batch that contains it, else the stream ring. align: the offset
  * alignment the use needs (storage descriptors), 1 = none. Returns 1 when a CB is bound. */
-static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
+static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b, int use) {
     b->zero = 0; b->size = size;
     if (g_cb_bound < 0) g_cb_bound = !(getenv("SSBU_VK_CBBOUND") && !atoi(getenv("SSBU_VK_CBBOUND")));      /* round 16, default 1 (=0: cb_inside / cb_overlap are asked for every range as before): a range outside the bounds of the live buffers cannot be inside or overlap one. Proof of the picture: run p16_h_bf5 (old path + this) = p16_d_bfd (this off), all pixels, three frames. NOTE for picture tests on battle_field: the picture has two forms that alternate with the PRESENTED frame number (17-19 % of the pixels, small differences): compare shots whose "saved at presented frame" numbers have the same parity. */
     if (g_cb_live && (!g_cb_bound || (addr < g_live_hi && addr + size > g_live_lo))) {
@@ -2518,7 +2576,7 @@ static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
         if (on && cb_assemble(addr, size, b)) return 1;
         cb_kept_range(addr, size, 1);
     }
-    b->off = ring_put(addr, size); b->buf = R.ring;      /* in this order: a ring wrap submits */
+    b->off = ring_put(addr, size, use); b->buf = R.ring;      /* in this order: a ring wrap submits */
     return 0;
 }
 static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uint32_t gy, uint32_t gz);
@@ -2609,8 +2667,8 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
             if (n == 2) { b->off = c2_put(5); b->size = sizeof R.c2[5]; }
-            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code + st->ctl[4]), b->size); }
-            else if (n >= 3 && R.ubo[5][n - 3].addr && R.ubo[5][n - 3].size) buf_ref(R.ubo[5][n - 3].addr, R.ubo[5][n - 3].size, al, b);
+            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code + st->ctl[4]), b->size, BU_NONE); }
+            else if (n >= 3 && R.ubo[5][n - 3].addr && R.ubo[5][n - 3].size) buf_ref(R.ubo[5][n - 3].addr, R.ubo[5][n - 3].size, al, b, BU_KEEP);
             else b->zero = 1;                      /* c0 outside the storage descriptors, or nothing bound: zeros (OpenGL: nothing bound) */
         }
         for (unsigned k = 0; k < 16; k++) {
@@ -2619,7 +2677,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             Range r = R.ssbo[5][k];
             b->zero = !(r.addr && r.size); b->buf = R.ring;
             if (b->zero) continue;
-            if (!(v->ssbo_w >> k & 1)) { buf_ref(r.addr, r.size, al, b); continue; }
+            if (!(v->ssbo_w >> k & 1)) { buf_ref(r.addr, r.size, al, b, BU_NONE); continue; }
             CB *c = g_cb_live ? cb_inside(r.addr, r.size) : NULL;
             if (c && (r.addr - c->addr) % al) c = NULL;
             if (!c) { if (g_cb_live && cb_overlap(r.addr, r.size)) { CB_WHY(CBW_WRITE, r.addr, r.size); cb_sync(); } c = cb_new(r.addr, r.size); }
@@ -2753,15 +2811,15 @@ static int draw_prepare(unsigned prim) {
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
             if (n == 2) { b->off = c2_put(s); b->size = sizeof R.c2[s]; }
-            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
-            else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
+            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size, BU_NONE); }
+            else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b, BU_KEEP);
             else b->zero = 1;
         }
         for (unsigned k = 0; k < 16; k++) {
             if (!(v->ssbos >> k & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = !(R.ssbo[s][k].addr && R.ssbo[s][k].size); b->buf = R.ring;
-            if (!b->zero) buf_ref(R.ssbo[s][k].addr, R.ssbo[s][k].size, sal, b);
+            if (!b->zero) buf_ref(R.ssbo[s][k].addr, R.ssbo[s][k].size, sal, b, BU_WRITE);      /* a draw's storage buffer may be written by the shader: never shares a kept copy */
         }
     }
     /* vertex streams: only the ones an attribute names (a stale binding of another mesh is not read, and is not copied) */
@@ -2774,7 +2832,7 @@ static int draw_prepare(unsigned prim) {
         BufRef b;
         voff[i] = ~0ull; vbufs[i] = R.ring;
         if (!(streams >> i & 1) || !R.vbuf[i].addr || !R.vbuf[i].size) continue;
-        from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b);
+        from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b, BU_KEEP);
         voff[i] = b.off; vbufs[i] = b.buf;
     }
     if (nvn_front_draw_tag()) { memcpy(g_dt_voff, voff, sizeof g_dt_voff); memcpy(g_dt_vb, vbufs, sizeof g_dt_vb); }      /* round 17, test (SSBU_DRAWTAG) */
@@ -3411,7 +3469,7 @@ static void exec(const Cmd *m, int depth) {
         if (count <= 0 || !a[3]) { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), 0, m, 0, NULL); R.frame_skipped++; nvn_front_count(1, 1); break; }
         if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); break; }
         BufRef ib;
-        buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
+        buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib, BU_KEEP);    /* before the draw is prepared: a ring wrap submits */
         { int ok = draw_prepare_timed((unsigned)a[0]); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         if (D.has_ckpt) ckpt_mark(1, (unsigned)a[0], (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], t);
@@ -3504,6 +3562,7 @@ static void vk_submit(void *arg) {
     if (g_in_fight) { g_tl_t0 = t0; g_tl_first = g_tl_last = 0; } else g_tl_t0 = 0;
     nvn_front_batch_begin();
     GEN_BUMP(GEN_BATCH);                           /* guest memory may have changed since the last batch */
+    g_sk_batch++;                                  /* SSBU_VK_STREAMKEEP: ages and back-off of the kept ranges */
     if (g_scan_on) { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }      /* session 4: what this batch will need goes to the workers before it is replayed */
     { void nvn_front_racechk(const uint64_t *handles, int count, int phase); nvn_front_racechk(j->handles, j->count, 1);      /* round 18, TEST (SSBU_RACECHK) */
       for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
@@ -4158,6 +4217,15 @@ swap: ;
                    (double)((g_gen_why[0] - lg[0]) + (g_gen_why[1] - lg[1]) + (g_gen_why[2] - lg[2]) + (g_gen_why[3] - lg[3]) + (g_gen_why[4] - lg[4])) * f,
                    (double)(g_gen_why[GEN_BATCH] - lg[GEN_BATCH]) * f, (double)(g_gen_why[GEN_WRAP] - lg[GEN_WRAP]) * f, (double)(g_gen_why[GEN_LAND] - lg[GEN_LAND]) * f, (double)(g_gen_why[GEN_GCMD] - lg[GEN_GCMD]) * f, (double)(g_gen_why[GEN_TEXREAD] - lg[GEN_TEXREAD]) * f);
             memcpy(lb, g_st_bytes, sizeof lb); memcpy(ln, g_st_n, sizeof ln); memcpy(lg, g_gen_why, sizeof lg); lc2c = g_c2_copies; lc2r = g_c2_reused;
+        }
+        if (g_sk_on > 0) {   /* SSBU_VK_STREAMKEEP (ring_put / sk_put) */
+            static LONG64 l[8]; static unsigned long long lep;
+            const double f = 1.0 / 300.0;
+            unsigned long long ep = plat_vm_epoch();
+            printf("nvn_vk_streamkeep: frames %lld..%lld per frame: %.1f ranges bound again without a copy (%.2f MB not copied) | %.1f questions to the write watch: %.1f changed since their copy, %.1f not write-watched; %.1f copied without asking (changed twice in a row: back-off), %.2f stale (ring wrap or VirtualFree since the copy), %.2f dropped for a storage-buffer use | VirtualFree / UnmapViewOfFile in the window: %llu | ranges from %llu bytes\n",
+                   (long long)frame - 300, (long long)frame, (double)(g_sk_hits - l[0]) * f, (double)(g_sk_hit_bytes - l[1]) / 1048576.0 * f, (double)(g_sk_queries - l[2]) * f, (double)(g_sk_changed - l[3]) * f, (double)(g_sk_unwatched - l[4]) * f,
+                   (double)(g_sk_skips - l[5]) * f, (double)(g_sk_stale - l[6]) * f, (double)(g_sk_kills - l[7]) * f, ep - lep, (unsigned long long)g_sk_min);
+            l[0] = g_sk_hits; l[1] = g_sk_hit_bytes; l[2] = g_sk_queries; l[3] = g_sk_changed; l[4] = g_sk_unwatched; l[5] = g_sk_skips; l[6] = g_sk_stale; l[7] = g_sk_kills; lep = ep;
         }
         if (g_tl_n) {
             double q = 1000.0 / (double)fq.QuadPart / (double)g_tl_n;
