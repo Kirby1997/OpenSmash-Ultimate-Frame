@@ -777,7 +777,7 @@ static void ph_point(LONG64 n, HANDLE timer) {
     precise_wait_until(at, timer);
 #endif
     InterlockedExchange64(&g_ph_n, n + 1);                              /* (published before g_defer_target is read; display_present_due reads them the other way round) */
-    LONG64 dt = g_defer_target;
+    LONG64 dt = __atomic_load_n(&g_defer_target, __ATOMIC_SEQ_CST);     /* seq_cst: the read side of that pair (a plain load may be ordered before the store) */
     if (dt && dt <= n + 1) nvn_front_post_present_flush();
 }
 /* render thread (display_present_defer): a frame held for tick tgt is ready. 1 = present it now, its phase point has
@@ -881,7 +881,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
             { LARGE_INTEGER tq; QueryPerformanceCounter(&tq); g_tick_at[n & 15] = tq.QuadPart; }      /* L1: when this tick was given */
             InterlockedExchange64(&g_vsync_n, n);
             ReleaseSRWLockExclusive(&g_vsync_lock);
-            { LONG64 dt = g_defer_target; if (dt && n >= dt) nvn_front_post_present_flush(); }      /* session 14: the frame kept for this tick goes to the window now */
+            { LONG64 dt = __atomic_load_n(&g_defer_target, __ATOMIC_SEQ_CST); if (dt && n >= dt) nvn_front_post_present_flush(); }      /* session 14: the frame kept for this tick goes to the window now */
             WakeAllConditionVariable(&g_vsync_cv);
             vsync_test_key();
 #if defined(__linux__)
@@ -1149,8 +1149,10 @@ void display_gpu_done(LONG64 gid, LONG64 tgt, LONG64 qpc) {
     else { if (e->have == 1) l1_emit(&e->f, e->fight, 0); e->f.gid = gid; e->gpu = qpc; e->have = 2; }
     ReleaseSRWLockExclusive(&g_lj_lock);
 }
-/* nvn_vk.c, at its start: run the GPU-done watcher (SSBU_L1_GPU=1, or the phase hold: SSBU_PACE_GPU_PHASE=1) */
-int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"), *p = getenv("SSBU_PACE_GPU_PHASE"); return (g && atoi(g)) || (p && atoi(p)); }
+/* nvn_vk.c, at its start (render thread, before display_init starts the vsync thread): run the GPU-done watcher when it is
+ * used: SSBU_L1_GPU=1, or the phase hold in effect (SSBU_PACE_GPU_PHASE=1 and frames are held: not with latency = lowest,
+ * SSBU_PACE_HOLD=0, vsync = on / off) */
+int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"); pace_options(); return (g && atoi(g)) || g_ph_on; }
 static void l1_csv_write(FILE *out) {
     AcquireSRWLockExclusive(&g_lj_lock);
     for (int i = 0; i < 64; i++) if (g_lj[i].have == 1) { g_lj[i].have = 0; l1_emit(&g_lj[i].f, g_lj[i].fight, 0); }      /* still waiting for their GPU time */
@@ -1343,7 +1345,7 @@ int display_present_defer(void) {
 }
 /* Render thread, after it has stored the kept present: 1 = the tick came meanwhile, present now. (The vsync thread looks
  * at g_defer_target AFTER it has published the tick, this looks at the tick AFTER the target is set: one of the two sees it.) */
-int display_present_due(void) { LONG64 t = g_defer_target; return t && (g_vsync_n >= t || g_ph_n >= t); }      /* (g_ph_n: the phase hold's point of tick t has passed; 0 without it) */
+int display_present_due(void) { LONG64 t = g_defer_target; return t && (__atomic_load_n(&g_vsync_n, __ATOMIC_SEQ_CST) >= t || __atomic_load_n(&g_ph_n, __ATOMIC_SEQ_CST) >= t); }      /* (g_ph_n: the phase hold's point of tick t has passed; 0 without it) */
 void display_present_flushed(void) { InterlockedExchange64(&g_defer_target, 0); }
 /* Render thread, right after vkQueuePresentKHR returned: what the screen gets (see the comment at the top). */
 static void pace_stat_line(FILE *out, const char *what, int i, int since) {
