@@ -8,6 +8,7 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
+#include "pace_phase.h"
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -84,6 +85,7 @@ static double g_vb_period;                             /* QPC ticks per refresh,
 static volatile LONG g_vb_state;                       /* 0 not started, 1 measuring, 2 measured, -1 no vblank source */
 static int g_pace_want = -1;                           /* 0 clock, 1 display lock when the refresh rate allows */
 static int g_hold_on = -1;                             /* present at the tick */
+static int g_ph_on;                                    /* 2026-11: the phase hold (SSBU_PACE_PHASE=1, see ph_point) */
 static volatile LONG g_lock_k;                         /* display lock: refreshes per game frame, 0 = our own clock */
 static double g_lock_phase = 0.5;                      /* the tick's place between two vblanks */
 static volatile LONG64 g_hold_target;                  /* tick the planned present waits for, 0 = present at once */
@@ -249,6 +251,11 @@ static void pace_options(void) {
     g_hold_on = h ? atoi(h) != 0 : opt != 1 && opt != 2;               /* fifo: the swapchain holds the presents itself; off: at once, by request */
     { int latency_mode(void); if (!h && latency_mode() >= 2) g_hold_on = 0; }      /* L1: latency = lowest: the frame goes to the window as soon as it is ready */
     if (p && atof(p) > 0.02 && atof(p) < 0.98) g_lock_phase = atof(p);
+    g_ph_on = p && !strcmp(p, "1") && g_hold_on;                       /* 2026-11: the phase hold (see ph_point); "1" was no lock phase before either */
+    if (p && !strcmp(p, "1"))
+        printf("display: phase hold (SSBU_PACE_PHASE=1) %s%c", g_ph_on ? "ON: a held frame is presented at max(ready, tick + P), P = 95th percentile of tick -> GPU done over the last 256 held frames + 1.0 ms, "
+                                                                          "at most one tick; at the tick (as before) until 256 are measured and with a display lock; the game's release is unchanged"
+                                                                        : "has no effect: frames are not held for the tick (SSBU_PACE_HOLD=0, vsync = on / off or latency = lowest)", 10);
     printf("display: pacing: %s; a finished frame is presented %s%c", g_pace_want ? "locked to the display when its refresh rate is k x 60 Hz within 1.1 % (vsync = display / auto)" : "our own 60.000 Hz clock (vsync = clock)",
            g_hold_on ? "at the next tick (steady cadence)" : "as soon as it is ready", 10);
 }
@@ -735,6 +742,76 @@ void display_pump(int ms) {
     menu_sdl_service();
 }
 #endif
+/* ---- 2026-11 (latency, the Frame), SSBU_PACE_PHASE=1: the PHASE HOLD (pace_phase.h). The hold of session 14 presents a
+ * finished frame at the next tick; with no vblank source (Linux) that tick is not the display's, so the hold only buys
+ * even spacing, for ~8 ms of latency. Here a held frame goes out at max(ready, tick + P) instead: P = the 95th percentile
+ * of (the tick before the one it is held for -> GPU done) over the last 256 held frames + 1 ms, at most one tick. That is
+ * still a fixed offset from our 60 Hz clock (even spacing), and after the GPU has finished 95 % of the frames (nvn_vk.c's
+ * GPU-done watcher, started for this too). The hold is the old one, at the tick, until 256 frames are measured, with a
+ * display lock (Windows: there the tick IS the display's) and whenever P comes to a whole tick: the tick stays the latest
+ * a held frame is presented. The game's release is not touched, so no frame becomes late through this.
+ * How: the render thread keeps a frame that is ready before its phase point (display_present_defer, as it keeps one for
+ * the tick), and the vsync thread wakes a second time per tick, at the next tick's phase point, and posts the kept present
+ * as it does at the tick. Off by default. (SSBU_PACE_PHASE=<0.02..0.98> stays the display lock's place in the refresh.) */
+static volatile LONG64 g_ph_slack;                     /* QPC ticks before its tick a held frame may go: period - P; 0 = at the tick */
+static volatile LONG64 g_ph_t0;                        /* the vsync thread's clock: tick k is due at g_ph_t0 + k * freq / 60 (0: none) */
+static volatile LONG64 g_ph_n;                         /* the last tick whose phase point the vsync thread has passed */
+static volatile LONG64 g_ph_p;                         /* the last P, QPC ticks (0: not measured yet) */
+static LONG64 g_ph_cnt[4], g_ph_cnt_last[4];           /* held frames: 0 ready after the phase point (presented at once), 1 kept to the phase point,
+                                                        * 2 kept to the tick (P a whole tick or not measured, display lock); 3 GPU done after the phase point */
+static PpWin g_ph_win;                                 /* the samples: watcher thread only */
+#define PH_MARGIN_MS 1.0
+#define PH_MIN_SLACK_MS 0.5                            /* less than this before the tick: kept to the tick (no second wake next to the tick's) */
+static LONG64 ph_due(LONG64 k) { return g_ph_t0 + k * g_freq.QuadPart / 60; }      /* tick k as the vsync thread aims at it */
+/* vsync thread, after tick n: wait for the phase point of tick n + 1, then post the present kept for it (if any) */
+static void ph_point(LONG64 n, HANDLE timer) {
+    LONG64 s = g_ph_slack;
+    if (!s) return;
+    LONGLONG at = ph_due(n + 1) - s;
+#if defined(__linux__)
+    (void)timer;
+    vw_wait_until_ns(vw_qpc_to_ns(at, g_freq.QuadPart), 0, NULL);      /* a sleep without a spin (timer slack 1 ns: tens of us late); the tick's own wait is unchanged */
+#else
+    precise_wait_until(at, timer);
+#endif
+    InterlockedExchange64(&g_ph_n, n + 1);                              /* (published before g_defer_target is read; display_present_due reads them the other way round) */
+    LONG64 dt = g_defer_target;
+    if (dt && dt <= n + 1) nvn_front_post_present_flush();
+}
+/* render thread (display_present_defer): a frame held for tick tgt is ready. 1 = present it now, its phase point has
+ * passed; *pp = the phase point (0: kept to the tick) */
+static int ph_now(LONG64 tgt, LONG64 *pp) {
+    LONG64 s = g_ph_slack;
+    LARGE_INTEGER now;
+    *pp = 0;
+    if (!s || g_lock_k || !g_ph_t0) { g_ph_cnt[2]++; return 0; }
+    QueryPerformanceCounter(&now);
+    *pp = ph_due(tgt) - s;
+    if (now.QuadPart >= *pp) { g_ph_cnt[0]++; return 1; }
+    g_ph_cnt[1]++;
+    return 0;
+}
+/* nvn_vk.c's watcher thread: a held frame (tick tgt) was done on the GPU at gpu */
+static void ph_sample(LONG64 tgt, LONG64 gpu) {
+    LONG64 f = g_freq.QuadPart, per = f / 60, s = g_ph_slack;
+    if (!g_ph_t0 || g_lock_k) return;
+    if (s && gpu > ph_due(tgt) - s) g_ph_cnt[3]++;
+    pp_add(&g_ph_win, gpu - ph_due(tgt - 1));
+    if (g_ph_win.n >= PP_WIN && g_ph_win.n % 8 == 0) {
+        LONG64 p = pp_offset(&g_ph_win, (LONG64)(PH_MARGIN_MS * (double)f / 1000.0), per);
+        g_ph_p = p;
+        InterlockedExchange64(&g_ph_slack, pp_slack(p, per, (LONG64)(PH_MIN_SLACK_MS * (double)f / 1000.0)));
+    }
+    if (g_ph_win.n == PP_WIN || g_ph_win.n % 1800 == 0) {
+        LONG64 d[4], all, q = pp_p95(&g_ph_win);
+        for (int i = 0; i < 4; i++) { d[i] = g_ph_cnt[i] - g_ph_cnt_last[i]; g_ph_cnt_last[i] = g_ph_cnt[i]; }
+        all = d[0] + d[1] + d[2];
+        printf("display: phase hold: P %.2f ms after the tick (95th percentile of tick -> GPU done %.2f ms + %.1f, at most %.2f): presented %.2f ms before the next tick; held frames since the last line %lld: "
+               "ready after the phase point %lld (%.1f %%), kept to the phase point %lld, kept to the tick %lld; GPU done after the phase point %lld%c",
+               (double)g_ph_p * 1000.0 / (double)f, (double)q * 1000.0 / (double)f, PH_MARGIN_MS, (double)per * 1000.0 / (double)f, (double)g_ph_slack * 1000.0 / (double)f, (long long)all,
+               (long long)d[0], all ? 100.0 * (double)d[0] / (double)all : 0.0, (long long)d[1], (long long)d[2], (long long)d[3], 10);
+    }
+}
 /* Signals the guest's vsync event 60 times per second. */
 static DWORD WINAPI vsync_thread(LPVOID arg) {
     (void)arg;
@@ -788,6 +865,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 t0.QuadPart = 0;
             } else {
             if (!t0.QuadPart) { QueryPerformanceCounter(&now); t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / 60; }
+            if (g_ph_on) g_ph_t0 = t0.QuadPart;                                    /* the phase hold reckons with the same ticks (published with g_vsync_n below) */
             LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / 60;       /* no accumulated rounding */
             VSYNC_WAIT(target, timer);
             QueryPerformanceCounter(&now);
@@ -813,6 +891,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 vw_last = g_vw;
             }
 #endif
+            if (g_ph_on && !g_lock_k) ph_point(n, timer);                          /* 2026-11: the phase hold's second wake (before the next tick) */
         }
     }
     for (;;) {
@@ -980,7 +1059,7 @@ int latency_mode(void) {
     }
     return g_lat_mode;
 }
-typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks, at, tq, gid; int polls, press; } L1Frame;      /* at: the tick it is shown at (tq: its time); gid: its GPU-done mark (0 none) */
+typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks, at, tq, gid, ph; int polls, press; } L1Frame;      /* at: the tick it is shown at (tq: its time); gid: its GPU-done mark (0 none); ph: its phase point */
 static L1Frame g_l1_ring[64], g_l1_cur;
 static volatile LONG64 g_l1_wr, g_l1_rd;
 static volatile LONG64 g_l1_poll_qpc, g_l1_polls, g_l1_ticks;
@@ -1019,8 +1098,8 @@ static LONG64 tick_qpc(LONG64 k) {
     t = g_tick_at[n & 15];
     return t ? t + (LONG64)((double)(k - n) * (g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0)) : 0;
 }
-#define L1_CSV_MAX (1 << 18)                 /* lines kept: 73 minutes at 60 fps (80 bytes each, the pages taken as written) */
-#define L1_CSV_COLS 10
+#define L1_CSV_MAX (1 << 18)                 /* lines kept: 73 minutes at 60 fps (88 bytes each, the pages taken as written) */
+#define L1_CSV_COLS 11
 static LONG64 (*g_csv)[L1_CSV_COLS], g_csv_n, g_csv_lost;
 static int g_csv_closed;
 static SRWLOCK g_lj_lock = SRWLOCK_INIT;     /* the matching below and the CSV lines; never held while waiting for anything */
@@ -1044,7 +1123,7 @@ static void l1_emit(const L1Frame *f, int fight, LONG64 gpu) {
     if (!g_csv || g_csv_closed) return;
     if (g_csv_n >= L1_CSV_MAX) { g_csv_lost++; return; }
     LONG64 *r = g_csv[g_csv_n++];
-    r[0] = f->n; r[1] = fight; r[2] = qpc_ns(f->tq); r[3] = qpc_ns(f->release); r[4] = qpc_ns(f->poll); r[5] = qpc_ns(f->call); r[6] = qpc_ns(f->ready); r[7] = qpc_ns(f->qp); r[8] = qpc_ns(gpu); r[9] = qpc_ns(f->shown);
+    r[0] = f->n; r[1] = fight; r[2] = qpc_ns(f->tq); r[3] = qpc_ns(f->release); r[4] = qpc_ns(f->poll); r[5] = qpc_ns(f->call); r[6] = qpc_ns(f->ready); r[7] = qpc_ns(f->qp); r[8] = qpc_ns(gpu); r[9] = qpc_ns(f->shown); r[10] = qpc_ns(f->ph);
 }
 /* render thread, at vkQueuePresentKHR: the frame waits here for its GPU-done time unless that came first */
 static void l1_join_frame(const L1Frame *f, int fight) {
@@ -1060,7 +1139,7 @@ static void l1_join_frame(const L1Frame *f, int fight) {
 LONG64 display_gpu_id(LONG64 *tgt) { *tgt = g_hold_target; return g_l1_gid_next = ++g_l1_gid_seq; }
 /* nvn_vk.c, its watcher thread: the GPU finished frame gid at qpc */
 void display_gpu_done(LONG64 gid, LONG64 tgt, LONG64 qpc) {
-    (void)tgt;
+    if (g_ph_on && tgt) ph_sample(tgt, qpc);
     if (!g_l1_join || !gid) return;
     AcquireSRWLockExclusive(&g_lj_lock);
     L1Join *e = &g_lj[gid & 63];
@@ -1068,8 +1147,8 @@ void display_gpu_done(LONG64 gid, LONG64 tgt, LONG64 qpc) {
     else { if (e->have == 1) l1_emit(&e->f, e->fight, 0); e->f.gid = gid; e->gpu = qpc; e->have = 2; }
     ReleaseSRWLockExclusive(&g_lj_lock);
 }
-/* nvn_vk.c, at its start: run the GPU-done watcher (SSBU_L1_GPU=1) */
-int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"); return g && atoi(g); }
+/* nvn_vk.c, at its start: run the GPU-done watcher (SSBU_L1_GPU=1, or the phase hold: SSBU_PACE_PHASE=1) */
+int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"), *p = getenv("SSBU_PACE_PHASE"); return (g && atoi(g)) || (p && !strcmp(p, "1")); }
 static void l1_csv_write(FILE *out) {
     AcquireSRWLockExclusive(&g_lj_lock);
     for (int i = 0; i < 64; i++) if (g_lj[i].have == 1) { g_lj[i].have = 0; l1_emit(&g_lj[i].f, g_lj[i].fight, 0); }      /* still waiting for their GPU time */
@@ -1077,10 +1156,10 @@ static void l1_csv_write(FILE *out) {
     ReleaseSRWLockExclusive(&g_lj_lock);
     FILE *f = fopen(g_l1_csv_path, "w");
     if (!f) { fprintf(out, "l1-csv: %s cannot be written: %lld lines lost\n", g_l1_csv_path, (long long)g_csv_n); return; }
-    fprintf(f, "frame,fight,tick,release,poll,call,ready,qp,gpu_done,presented\n");
+    fprintf(f, "frame,fight,tick,release,poll,call,ready,qp,gpu_done,presented,phase\n");
     for (LONG64 i = 0; i < g_csv_n; i++) {
         const LONG64 *r = g_csv[i];
-        fprintf(f, "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)r[0], (long long)r[1], (long long)r[2], (long long)r[3], (long long)r[4], (long long)r[5], (long long)r[6], (long long)r[7], (long long)r[8], (long long)r[9]);
+        fprintf(f, "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)r[0], (long long)r[1], (long long)r[2], (long long)r[3], (long long)r[4], (long long)r[5], (long long)r[6], (long long)r[7], (long long)r[8], (long long)r[9], (long long)r[10]);
     }
     fclose(f);
     fprintf(out, "l1-csv: %lld presented frames written to %s (ns of the host clock, 0 = not measured)%s\n", (long long)g_csv_n, g_l1_csv_path, g_csv_lost ? " (more frames than it keeps: the later ones are not in it)" : "");
@@ -1255,13 +1334,14 @@ int display_present_defer(void) {
     LONG64 tgt = InterlockedExchange64(&g_hold_target, 0);
     l1_ready(tgt);
     if (!tgt || g_vsync_n >= tgt) return 0;
+    if (g_ph_on) { LONG64 pp; int go = ph_now(tgt, &pp); g_l1_cur.ph = pp; if (go) return 0; }      /* 2026-11, the phase hold: ready after its phase point = presented now */
     InterlockedExchange64(&g_defer_target, tgt);
     g_hold_n++;
     return 1;
 }
 /* Render thread, after it has stored the kept present: 1 = the tick came meanwhile, present now. (The vsync thread looks
  * at g_defer_target AFTER it has published the tick, this looks at the tick AFTER the target is set: one of the two sees it.) */
-int display_present_due(void) { LONG64 t = g_defer_target; return t && g_vsync_n >= t; }
+int display_present_due(void) { LONG64 t = g_defer_target; return t && (g_vsync_n >= t || g_ph_n >= t); }      /* (g_ph_n: the phase hold's point of tick t has passed; 0 without it) */
 void display_present_flushed(void) { InterlockedExchange64(&g_defer_target, 0); }
 /* Render thread, right after vkQueuePresentKHR returned: what the screen gets (see the comment at the top). */
 static void pace_stat_line(FILE *out, const char *what, int i, int since) {
@@ -1461,6 +1541,8 @@ void display_report(FILE *out) {
         fprintf(out, "display-timing: presents by tenth of a refresh after the vblank before them: %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", (long long)g_ps_phase[0], (long long)g_ps_phase[1], (long long)g_ps_phase[2], (long long)g_ps_phase[3],
                 (long long)g_ps_phase[4], (long long)g_ps_phase[5], (long long)g_ps_phase[6], (long long)g_ps_phase[7], (long long)g_ps_phase[8], (long long)g_ps_phase[9]);
     }
+    if (g_ph_on) fprintf(out, "display: phase hold: held frames %lld ready after their phase point (presented at once), %lld kept to the phase point, %lld kept to the tick; GPU done after the phase point %lld; last P %.2f ms after the tick\n",
+                         (long long)g_ph_cnt[0], (long long)g_ph_cnt[1], (long long)g_ph_cnt[2], (long long)g_ph_cnt[3], (double)g_ph_p * 1000.0 / (double)g_freq.QuadPart);
     l1_report(out);
     nvn_gl_report(out);
 }
