@@ -483,13 +483,24 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
  *      zeros WITHOUT counting as written (plat_selftest "decommit is not a write"), and a released and newly reserved
  *      range starts unwritten too; so any of these anywhere makes every kept copy invalid.
  *   4. the ring has not wrapped since that copy: ring bytes are only appended within a wrap, and the copy is bound only
- *      by commands that read it.
+ *      by commands that read it. A draw or dispatch with a wrap in the middle of it takes all its ranges again (review
+ *      F1, draw_prepare step 2): a kept copy sits near the start of its wrap, the first bytes the next wrap overwrites.
  * And the GPU never writes a kept copy: only vertex, index and constant-buffer uses are kept (BU_KEEP), all read-only in
  * the translated shaders; a storage-buffer use of the same (address, size) in a draw (it may be written: such a use
  * would share the acache copy) drops the kept entry (BU_WRITE). Ranges below SSBU_VK_STREAMKEEP_MIN bytes (default
  * 16384) are copied as before: there the question (a PAGEMAP_SCAN ioctl) would cost about what the copy does. A range
  * whose bytes changed at two questions in a row is not asked again for 2^n batches (it is copied as before meanwhile).
- * Counted in the "nvn_vk_streamkeep:" line. */
+ * Counted in the "nvn_vk_streamkeep:" line.
+ *
+ * Writes the write watch does NOT see (none of them is used for guest memory today; anything that adds one must keep
+ * those ranges out of the table, or make STREAMKEEP refuse to start):
+ *   - writes through pinned pages: O_DIRECT reads, io_uring fixed buffers, vmsplice, any get_user_pages user. The pin
+ *     faults the page writable once; a later question re-protects the pte while the device keeps writing the page.
+ *   - the GPU writing guest memory: a Vulkan import of guest memory (VK_EXT_external_memory_host is enabled in nvn_vk.c
+ *     but never used to import; compute results reach guest memory only by CPU copies at landing).
+ * Before turning it on for a device: kernel 6.7 or newer, and neither "plat: no userfaultfd" nor "plat: userfaultfd
+ * without asynchronous write protection" in the log (otherwise every range is unwatched and copied as before); a
+ * picture check with ring wraps forced (SSBU_VK_RING_MB=128). */
 enum { BU_NONE = 0, BU_KEEP = 1, BU_WRITE = -1 };
 #ifdef _WIN32
 static unsigned long long plat_vm_epoch(void) { return 0; }      /* not available: no epoch of decommits (sk_on stays 0) */
@@ -538,8 +549,10 @@ static uint64_t ring_put(uint64_t addr, uint64_t size, int use) {
  * of every draw: 896 bytes plus alignment, twice a draw. It is copied only when its bytes differ from the last copy of
  * that stage; otherwise the last copy's offset is bound again. Safe without any invalidation rule: the bytes are compared
  * themselves, and ring bytes are never written again before a wrap (ring_raw only appends; a wrap waits for the GPU,
- * then starts again at 0), so the old copy is checked to be from the current wrap. The block is bound as a read-only
- * constant buffer, so the GPU never writes the shared copy. SSBU_VK_C2REUSE=0: copied every time as before. */
+ * then starts again at 0), so the old copy is checked to be from the current wrap. A reused copy can be near the START
+ * of the wrap (a block that never changes), so a wrap later in the same draw would overwrite it before the draw runs:
+ * draw_prepare and compute_dispatch_run take all ranges again after such a wrap (review F1). The block is bound as a
+ * read-only constant buffer, so the GPU never writes the shared copy. SSBU_VK_C2REUSE=0: copied every time as before. */
 static uint64_t g_c2_last[6][112], g_c2_off[6];
 static LONG64 g_c2_wrap[6] = {-1, -1, -1, -1, -1, -1};
 static int g_c2_reuse = -1;
