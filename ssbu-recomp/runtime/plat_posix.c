@@ -1744,6 +1744,11 @@ LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
     vm_unlock();
     return addr;
 }
+/* VirtualFree and UnmapViewOfFile calls so far. Pages they empty read as zeros (or are gone) without counting as written
+ * for the write watch ("decommit is not a write", plat_selftest), so a cache of guest bytes that trusts GetWriteWatch
+ * (nvn_vk_draw.c SSBU_VK_STREAMKEEP) also asks this number and drops everything when it moved. Any thread. */
+static unsigned long long g_vm_epoch;
+unsigned long long plat_vm_epoch(void) { return __atomic_load_n(&g_vm_epoch, __ATOMIC_ACQUIRE); }
 BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     uintptr_t a = (uintptr_t)addr;
     vm_lock();
@@ -1782,6 +1787,7 @@ BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
         seg_set(lo, hi, base, MEM_RESERVE, 0, aprot);
         vm_sync(lo, hi);
     }
+    __atomic_add_fetch(&g_vm_epoch, 1, __ATOMIC_RELEASE);
     vm_unlock();
     return TRUE;
 }
@@ -2062,6 +2068,7 @@ BOOL UnmapViewOfFile(LPCVOID p) {
     vm_unlock();
     if (!v.p) { t_lasterr = ERROR_INVALID_ADDRESS; return FALSE; }
     munmap(v.p, v.n);
+    __atomic_add_fetch(&g_vm_epoch, 1, __ATOMIC_RELEASE);
     return TRUE;
 }
 
