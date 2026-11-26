@@ -2338,6 +2338,10 @@ static int g_cb_hi, g_cb_scan = -1, g_cb_bound = -1;
 static struct { uint64_t lo, hi; int idx; } g_lv[256];
 static int g_lv_n;
 static void lv_add(CB *c) { if (g_lv_n < 256) { g_lv[g_lv_n].lo = c->addr; g_lv[g_lv_n].hi = c->addr + c->size; g_lv[g_lv_n].idx = (int)(c - g_cb); } g_lv_n++; }
+/* review H1 / H2: the list's length is clamped to its size, and an entry counts only while its CB is still live with the
+ * same range (a broken invariant later could then only miss a buffer, which the batch-end count reports, never bind a wrong one) */
+static inline int lv_len(void) { return g_lv_n < 256 ? g_lv_n : 256; }
+static inline CB *lv_cb(int k) { CB *c = &g_cb[g_lv[k].idx]; return c->state == 1 && c->addr == g_lv[k].lo && c->addr + c->size == g_lv[k].hi ? c : NULL; }
 /* What a guest thread may know about the CBs without a round trip through the render thread: the address ranges of every
  * CB that is not free (states 1..4), copied by the render thread after each job (nvn_vk_cb_publish, from render_loop) under
  * a sequence count. nvn_front_memory_retire (nvn_front.c) reads it: a finalized pool or buffer that meets none of them, with no
@@ -2379,8 +2383,8 @@ int nvn_vk_cb_may_overlap(uint64_t addr, uint64_t size) {     /* any thread: 1 =
 static CB *cb_inside(uint64_t addr, uint64_t size) {
     if (g_cb_scan > 0) {
         CB *best = NULL;
-        for (int k = 0; k < g_lv_n; k++)
-            if (addr >= g_lv[k].lo && addr + size <= g_lv[k].hi) { CB *c = &g_cb[g_lv[k].idx]; if (c->state == 1 && (!best || c < best)) best = c; }
+        for (int k = 0, n = lv_len(); k < n; k++)
+            if (addr >= g_lv[k].lo && addr + size <= g_lv[k].hi) { CB *c = lv_cb(k); if (c && (!best || c < best)) best = c; }
         return best;
     }
     for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr >= g_cb[i].addr && addr + size <= g_cb[i].addr + g_cb[i].size) return &g_cb[i];
@@ -2388,7 +2392,7 @@ static CB *cb_inside(uint64_t addr, uint64_t size) {
 }
 static int cb_overlap(uint64_t addr, uint64_t size) {
     if (g_cb_scan > 0) {
-        for (int k = 0; k < g_lv_n; k++) if (addr < g_lv[k].hi && g_lv[k].lo < addr + size && g_cb[g_lv[k].idx].state == 1) return 1;
+        for (int k = 0, n = lv_len(); k < n; k++) if (addr < g_lv[k].hi && g_lv[k].lo < addr + size && lv_cb(k)) return 1;
         return 0;
     }
     for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr < g_cb[i].addr + g_cb[i].size && g_cb[i].addr < addr + size) return 1;
@@ -2401,10 +2405,10 @@ static CB *cb_find(uint64_t addr, uint64_t size, int *overlap) {
     CB *best = NULL;
     int ov = 0;
     uint64_t end = addr + size;
-    for (int k = 0; k < g_lv_n; k++) {
+    for (int k = 0, n = lv_len(); k < n; k++) {
         if (!(addr < g_lv[k].hi && g_lv[k].lo < end)) continue;
-        CB *c = &g_cb[g_lv[k].idx];
-        if (c->state != 1) continue;
+        CB *c = lv_cb(k);
+        if (!c) continue;
         ov = 1;
         if (addr >= g_lv[k].lo && end <= g_lv[k].hi && (!best || c < best)) best = c;
     }
