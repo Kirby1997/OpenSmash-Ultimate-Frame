@@ -451,7 +451,7 @@ static void cb_ring_wrap(void);
  * Guest ranges copied into the ring by size class (bytes, count); the per-draw constant block c2 (copied / reused); the
  * reasons the batch's range cache (acache) was emptied (GEN_*). Counting only. */
 enum { GEN_BATCH, GEN_WRAP, GEN_LAND, GEN_GCMD, GEN_TEXREAD, GEN_N };
-static LONG64 g_gen_why[GEN_N], g_st_bytes[6], g_st_n[6], g_c2_copies, g_c2_reused;
+static LONG64 g_gen_why[GEN_N], g_st_bytes[6], g_st_n[6], g_c2_copies, g_c2_reused, g_wrap_redo;      /* g_wrap_redo: draws / dispatches whose ranges were collected again after a ring wrap in the middle (review F1) */
 #define GEN_BUMP(why) (R.gen++, g_gen_why[why]++)
 static int st_class(uint64_t n) { return n < 4096 ? 0 : n < 16384 ? 1 : n < 65536 ? 2 : n < 262144 ? 3 : n < 1048576 ? 4 : 5; }
 static uint64_t ring_raw(const void *p, uint64_t n) {
@@ -2658,8 +2658,9 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
     for (int i = 0; i < v->nsmp; i++) resolve_sampler(5, v, i);
     if (g_ncdisp == 2048 || g_cb_pending) { CB_WHY(g_ncdisp == 2048 ? CBW_FULL : CBW_OTHER, 0, 0); cb_sync(); }
     uint64_t wm_off = 0;
-    for (int attempt = 0; ; attempt++) {           /* a copy-back in here (cb_sync) frees the CBs chosen before it: everything is then chosen again */
+    for (int attempt = 0; ; attempt++) {           /* a copy-back in here (cb_sync) frees the CBs chosen before it, and a ring wrap in here (review F1, see draw_prepare) leaves the offsets taken before it to be overwritten: everything is then chosen again */
         uint32_t epoch = g_cb_epoch;
+        LONG64 w0 = R.ring_wraps;
         nbuf = 0;
         memset(wcb, 0xff, sizeof wcb);
         for (unsigned n = 0; n < 18; n++) {
@@ -2684,8 +2685,9 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             b->buf = c->buf; b->off = r.addr - c->addr; b->size = r.size; wcb[k] = (int16_t)(c - g_cb);
         }
         if (v->ssbo_w) { static const uint32_t zero[4]; wm_off = ring_raw(zero, 16); }
-        if (epoch == g_cb_epoch) break;
-        if (attempt == 3) vkd_fail("compute program #%d: its buffers cannot be bound without a copy-back in between", p->serial);
+        if (epoch == g_cb_epoch && R.ring_wraps == w0) break;
+        if (R.ring_wraps != w0) g_wrap_redo++;
+        if (attempt == 3) vkd_fail("compute program #%d: its buffers cannot be bound without a copy-back or ring wrap in between", p->serial);
     }
     nvn_front_ccmp_dispatch(R.ubo[5], R.ssbo[5], v->ssbo_w, st->code, st->code_len, gx, gy, gz);      /* SSBU_COMPUTE_CMP */
     cmd_begin();
@@ -2768,7 +2770,7 @@ static void vi_key(PKey *k, const uint64_t *voff, uint32_t ints, uint32_t sints)
     nvk_vl_set(k, nvk_vl_id(&l));
 #endif
 }
-static int draw_prepare(unsigned prim) {
+static int draw_prepare(unsigned prim, uint64_t iaddr, uint64_t isize, uint64_t ial, BufRef *ib) {
     static const int8_t topo[7] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, -1, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN};
     static const uint8_t tclass[7] = {0, 1, 1, 1, 2, 2, 2};
     if (!R.have_targets || R.render_off) return 0;
@@ -2799,46 +2801,61 @@ static int draw_prepare(unsigned prim) {
     g_ndtex = 0;
     for (int i = 0; i < vs->nsmp; i++) resolve_sampler(0, vs, i);
     if (fs) for (int i = 0; i < fs->nsmp; i++) resolve_sampler(1, fs, i);
-    /* 2. buffers: every range the draw reads, into the ring (may wrap the ring = submit) */
+    /* 2. buffers: every range the draw reads, into the ring (may wrap the ring = submit), the index buffer last, then the
+     * pass. Review F1 (perf/render-2): all ring offsets of one draw must come from ONE wrap. A wrap starts writing again at
+     * offset 0 and the draw is recorded into the command buffer after it: an offset this draw took before the wrap (a
+     * range-cache hit, a reused c2, a kept copy, or simply an earlier range of the draw) would be overwritten by the copies
+     * that follow the wrap before that command buffer runs. So a wrap anywhere in here (pass_begin too: vt_get may upload)
+     * collects everything again; the second pass starts near offset 0 and does not wrap unless one draw needs a whole ring.
+     * Again after a wrap: c2 is copied (its wrap differs), the range cache is empty (R.gen), kept copies are stale (wrap),
+     * the compute buffers have landed (cb_ring_wrap) and are looked up again. */
     static BufRef bufs[80];
     int nbuf = 0;
     uint64_t sal = V.props.limits.minStorageBufferOffsetAlignment ? V.props.limits.minStorageBufferOffsetAlignment : 1;
-    for (int s = 0; s < (fs ? 2 : 1); s++) {
-        VStage *v = s ? fs : vs;
-        Stage *st = &R.prog[s]->st[s];
-        for (unsigned n = 1; n < 18; n++) {
-            if (!(v->cbufs >> n & 1)) continue;
-            BufRef *b = &bufs[nbuf++];
-            b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = c2_put(s); b->size = sizeof R.c2[s]; }
-            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size, BU_NONE); }
-            else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b, BU_KEEP);
-            else b->zero = 1;
-        }
-        for (unsigned k = 0; k < 16; k++) {
-            if (!(v->ssbos >> k & 1)) continue;
-            BufRef *b = &bufs[nbuf++];
-            b->zero = !(R.ssbo[s][k].addr && R.ssbo[s][k].size); b->buf = R.ring;
-            if (!b->zero) buf_ref(R.ssbo[s][k].addr, R.ssbo[s][k].size, sal, b, BU_WRITE);      /* a draw's storage buffer may be written by the shader: never shares a kept copy */
-        }
-    }
-    /* vertex streams: only the ones an attribute names (a stale binding of another mesh is not read, and is not copied) */
     uint64_t voff[16];
     VkBuffer vbufs[16];
-    uint32_t streams = 0;
     int from_cb = 0;
-    for (int i = 0; i < 16 && i < R.nattr; i++) if (R.vattr[i] & 0xff) streams |= 1u << ((R.vattr[i] >> 8) & 31);
-    for (int i = 0; i < 16; i++) {
-        BufRef b;
-        voff[i] = ~0ull; vbufs[i] = R.ring;
-        if (!(streams >> i & 1) || !R.vbuf[i].addr || !R.vbuf[i].size) continue;
-        from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b, BU_KEEP);
-        voff[i] = b.off; vbufs[i] = b.buf;
+    for (int tries = 0; ; tries++) {
+        LONG64 w0 = R.ring_wraps;
+        nbuf = 0; from_cb = 0;
+        for (int s = 0; s < (fs ? 2 : 1); s++) {
+            VStage *v = s ? fs : vs;
+            Stage *st = &R.prog[s]->st[s];
+            for (unsigned n = 1; n < 18; n++) {
+                if (!(v->cbufs >> n & 1)) continue;
+                BufRef *b = &bufs[nbuf++];
+                b->zero = 0; b->buf = R.ring;
+                if (n == 2) { b->off = c2_put(s); b->size = sizeof R.c2[s]; }
+                else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size, BU_NONE); }
+                else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b, BU_KEEP);
+                else b->zero = 1;
+            }
+            for (unsigned k = 0; k < 16; k++) {
+                if (!(v->ssbos >> k & 1)) continue;
+                BufRef *b = &bufs[nbuf++];
+                b->zero = !(R.ssbo[s][k].addr && R.ssbo[s][k].size); b->buf = R.ring;
+                if (!b->zero) buf_ref(R.ssbo[s][k].addr, R.ssbo[s][k].size, sal, b, BU_WRITE);      /* a draw's storage buffer may be written by the shader: never shares a kept copy */
+            }
+        }
+        /* vertex streams: only the ones an attribute names (a stale binding of another mesh is not read, and is not copied) */
+        uint32_t streams = 0;
+        for (int i = 0; i < 16 && i < R.nattr; i++) if (R.vattr[i] & 0xff) streams |= 1u << ((R.vattr[i] >> 8) & 31);
+        for (int i = 0; i < 16; i++) {
+            BufRef b;
+            voff[i] = ~0ull; vbufs[i] = R.ring;
+            if (!(streams >> i & 1) || !R.vbuf[i].addr || !R.vbuf[i].size) continue;
+            from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b, BU_KEEP);
+            voff[i] = b.off; vbufs[i] = b.buf;
+        }
+        if (ib) buf_ref(iaddr, isize, ial, ib, BU_KEEP);      /* the index buffer (DRAW_ELEMENTS) */
+        /* 3. pass and pipeline */
+        if (R.ring_wraps == w0 && !pass_begin()) return 0;
+        if (R.ring_wraps == w0) break;             /* every ring offset of this draw is from the current wrap */
+        g_wrap_redo++;
+        if (tries == 2) vkd_fail("a draw's ranges do not fit the stream ring (%llu MB) in one wrap", (unsigned long long)(R.ring_size >> 20));
     }
     if (nvn_front_draw_tag()) { memcpy(g_dt_voff, voff, sizeof g_dt_voff); memcpy(g_dt_vb, vbufs, sizeof g_dt_vb); }      /* round 17, test (SSBU_DRAWTAG) */
     R.cb_draws += from_cb;
-    /* 3. pass and pipeline */
-    if (!pass_begin()) return 0;
     PKey k;
     memset(&k, 0, sizeof k);
     k.vs = vs->id; k.fs = fs ? fs->id : 0; k.topo_class = tclass[prim]; k.logic = R.logic; k.sshade = fs ? (uint8_t)R.prog[1]->sample_shading : 0;
@@ -3293,12 +3310,12 @@ static void dt_vk(int fight, int idx, int ok, const Cmd *m, int indexed, const B
 static int g_dp_every = -1;
 static unsigned g_dp_left, g_dp_n, g_dp_rnd = 0x2545F491u;
 static inline LONG64 dp_exact(void) { return g_tm[0] + g_tm[1] + g_tm[5] + g_tm[6]; }
-static int draw_prepare_timed(unsigned prim) {
+static int draw_prepare_timed(unsigned prim, uint64_t iaddr, uint64_t isize, uint64_t ial, BufRef *ib) {
     if (g_dp_every < 0) { const char *e = getenv("SSBU_VK_DRAWTIME"); g_dp_every = e && atoi(e) > 0;
                           printf("nvn_vk: draw preparation time (nvn_vk_perf): %s\n", g_dp_every ? "every draw timed (SSBU_VK_DRAWTIME=1)" : "one draw in about 64 timed and scaled, waits inside it added exactly (SSBU_VK_DRAWTIME=1: every draw)"); }
     int timed = g_dp_every || g_dp_left <= 1;
     LONG64 x0 = dp_exact(), t0 = timed ? tk() : 0;
-    int ok = draw_prepare(prim);                   /* one call site: the compiler keeps a single copy of it */
+    int ok = draw_prepare(prim, iaddr, isize, ial, ib);      /* one call site: the compiler keeps a single copy of it */
     LONG64 dx = dp_exact() - x0;
     if (!timed) { g_dp_left--; g_dp_n++; g_tm[8] += dx; return ok; }
     LONG64 dt = tk() - t0;
@@ -3458,7 +3475,7 @@ static void exec(const Cmd *m, int depth) {
         break;
     }
     case OP_DRAW_ARRAYS:
-        { int ok = draw_prepare_timed((unsigned)a[0]); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        { int ok = draw_prepare_timed((unsigned)a[0], 0, 0, 0, NULL); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         if (D.has_ckpt) ckpt_mark(0, (unsigned)a[0], (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], 0, 0);
         vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]);
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
@@ -3468,9 +3485,8 @@ static void exec(const Cmd *m, int depth) {
         int count = (int)a[2];
         if (count <= 0 || !a[3]) { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), 0, m, 0, NULL); R.frame_skipped++; nvn_front_count(1, 1); break; }
         if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); break; }
-        BufRef ib;
-        buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib, BU_KEEP);    /* before the draw is prepared: a ring wrap submits */
-        { int ok = draw_prepare_timed((unsigned)a[0]); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        BufRef ib = {0, 0, 1, VK_NULL_HANDLE};      /* taken by draw_prepare with the draw's other ranges, from the same ring wrap (review F1) */
+        { int ok = draw_prepare_timed((unsigned)a[0], a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         if (D.has_ckpt) ckpt_mark(1, (unsigned)a[0], (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], t);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
@@ -4204,19 +4220,19 @@ swap: ;
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0,
                (double)(R.ring_bytes - last_ringb) / 1048576.0 / 300.0, (long long)(R.ring_wraps - last_wraps), (long long)R.ring_wraps);
         {   /* perf team 2026-11-25: what the ring bytes above are (stream ring section, ring_put / c2_put) */
-            static LONG64 lb[6], ln[6], lg[GEN_N], lc2c, lc2r;
+            static LONG64 lb[6], ln[6], lg[GEN_N], lc2c, lc2r, lredo;
             const double f = 1.0 / 300.0, mb = 1.0 / 1048576.0 / 300.0;
             LONG64 rb = 0, rn = 0;
             for (int c = 0; c < 6; c++) { rb += g_st_bytes[c] - lb[c]; rn += g_st_n[c] - ln[c]; }
             LONG64 c2b = (g_c2_copies - lc2c) * (LONG64)sizeof R.c2[0], other = (R.ring_bytes - last_ringb) - rb - c2b;
-            printf("nvn_vk_stream: frames %lld..%lld per frame: guest ranges copied into the ring %.2f MB in %.0f ranges (by size, MB / ranges: <4K %.2f / %.0f, 4-16K %.2f / %.0f, 16-64K %.2f / %.0f, 64-256K %.2f / %.0f, 256K-1M %.2f / %.0f, 1M+ %.2f / %.0f) | c2 constant blocks: %.0f copied, %.0f reused (SSBU_VK_C2REUSE=%d) | other ring bytes (textures, ranges assembled from compute buffers) %.2f MB | the range cache was emptied %.2f times: %.2f batches, %.2f ring wraps, %.2f copy-backs, %.2f buffer commands (update / copy / clear), %.2f texture read-backs\n",
+            printf("nvn_vk_stream: frames %lld..%lld per frame: guest ranges copied into the ring %.2f MB in %.0f ranges (by size, MB / ranges: <4K %.2f / %.0f, 4-16K %.2f / %.0f, 16-64K %.2f / %.0f, 64-256K %.2f / %.0f, 256K-1M %.2f / %.0f, 1M+ %.2f / %.0f) | c2 constant blocks: %.0f copied, %.0f reused (SSBU_VK_C2REUSE=%d) | other ring bytes (textures, ranges assembled from compute buffers) %.2f MB | the range cache was emptied %.2f times: %.2f batches, %.2f ring wraps, %.2f copy-backs, %.2f buffer commands (update / copy / clear), %.2f texture read-backs | draws and dispatches whose ranges were taken again after a ring wrap in the middle of them: %lld in the window (%lld in all)\n",
                    (long long)frame - 300, (long long)frame, (double)rb * mb, (double)rn * f,
                    (double)(g_st_bytes[0] - lb[0]) * mb, (double)(g_st_n[0] - ln[0]) * f, (double)(g_st_bytes[1] - lb[1]) * mb, (double)(g_st_n[1] - ln[1]) * f, (double)(g_st_bytes[2] - lb[2]) * mb, (double)(g_st_n[2] - ln[2]) * f,
                    (double)(g_st_bytes[3] - lb[3]) * mb, (double)(g_st_n[3] - ln[3]) * f, (double)(g_st_bytes[4] - lb[4]) * mb, (double)(g_st_n[4] - ln[4]) * f, (double)(g_st_bytes[5] - lb[5]) * mb, (double)(g_st_n[5] - ln[5]) * f,
                    (double)(g_c2_copies - lc2c) * f, (double)(g_c2_reused - lc2r) * f, g_c2_reuse, (double)other * mb,
                    (double)((g_gen_why[0] - lg[0]) + (g_gen_why[1] - lg[1]) + (g_gen_why[2] - lg[2]) + (g_gen_why[3] - lg[3]) + (g_gen_why[4] - lg[4])) * f,
-                   (double)(g_gen_why[GEN_BATCH] - lg[GEN_BATCH]) * f, (double)(g_gen_why[GEN_WRAP] - lg[GEN_WRAP]) * f, (double)(g_gen_why[GEN_LAND] - lg[GEN_LAND]) * f, (double)(g_gen_why[GEN_GCMD] - lg[GEN_GCMD]) * f, (double)(g_gen_why[GEN_TEXREAD] - lg[GEN_TEXREAD]) * f);
-            memcpy(lb, g_st_bytes, sizeof lb); memcpy(ln, g_st_n, sizeof ln); memcpy(lg, g_gen_why, sizeof lg); lc2c = g_c2_copies; lc2r = g_c2_reused;
+                   (double)(g_gen_why[GEN_BATCH] - lg[GEN_BATCH]) * f, (double)(g_gen_why[GEN_WRAP] - lg[GEN_WRAP]) * f, (double)(g_gen_why[GEN_LAND] - lg[GEN_LAND]) * f, (double)(g_gen_why[GEN_GCMD] - lg[GEN_GCMD]) * f, (double)(g_gen_why[GEN_TEXREAD] - lg[GEN_TEXREAD]) * f, (long long)(g_wrap_redo - lredo), (long long)g_wrap_redo);
+            memcpy(lb, g_st_bytes, sizeof lb); memcpy(ln, g_st_n, sizeof ln); memcpy(lg, g_gen_why, sizeof lg); lc2c = g_c2_copies; lc2r = g_c2_reused; lredo = g_wrap_redo;
         }
         if (g_sk_on > 0) {   /* SSBU_VK_STREAMKEEP (ring_put / sk_put) */
             static LONG64 l[8]; static unsigned long long lep;
