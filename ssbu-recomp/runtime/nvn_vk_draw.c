@@ -4164,6 +4164,7 @@ swap: ;
         tp[3] = tk();
         cmd_submit(acq, rend);
         tp[4] = tk();
+        if (g_vk_gpuw && !progress) vk_gpu_mark();      /* latency (SSBU_L1_GPU): when the GPU has finished this frame, timed by nvn_vk.c */
         VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;

@@ -15,6 +15,8 @@
  *   SSBU_VK_VALIDATE=1        enable VK_LAYER_KHRONOS_validation and print its messages (says so if not installed)
  *   SSBU_VK_DEVICE=<i>        take physical device i of the printed list instead of the preferred one
  *   SSBU_VK_PRESENT=mailbox|immediate|fifo   present mode (default: mailbox, else immediate, else fifo: the pacing is ours)
+ *   SSBU_VK_IMAGES=<n>        swapchain images asked for (default: the surface's least + 1, at least 3), kept within what
+ *                             the surface allows (TEST: the latency A/B; with mailbox the count does not queue frames)
  *   SSBU_VK_MISSING=warn      development only: an operation that is not implemented is reported once, counted and
  *                             skipped instead of stopping the game (the picture is then NOT the game's)
  *
@@ -38,6 +40,7 @@ typedef char vk_min_check_barrier[sizeof(VkImageMemoryBarrier) == 72 ? 1 : -1];
 typedef char vk_min_check_submit[sizeof(VkSubmitInfo) == 72 ? 1 : -1];
 
 void nvn_render_run(void (*fn)(void *), void *arg);       /* nvn_front.c: run on the render thread and wait */
+static void gw_start(void), gw_stop(void), gw_free(void);
 void display_pace(void);                                  /* display.c */
 int display_wait_refresh(void);
 void display_before_present(void);
@@ -163,6 +166,17 @@ int swapchain_create(void) {
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     ci.surface = V.surface;
     ci.minImageCount = caps.minImageCount + 1 < 3 ? 3 : caps.minImageCount + 1;
+    {   static int want = -1;                                     /* SSBU_VK_IMAGES (test): the count asked for, within the surface's limits (and the 16 listed) */
+        if (want < 0) { const char *e = getenv("SSBU_VK_IMAGES"); want = e ? atoi(e) : 0; if (want < 0) want = 0; }
+        if (want) {
+            uint32_t n = (uint32_t)want, mx = caps.maxImageCount && caps.maxImageCount < 16 ? caps.maxImageCount : 16;
+            if (n < caps.minImageCount) n = caps.minImageCount;
+            if (n > mx) n = mx;
+            static int said;
+            if (!said++) printf("nvn_vk: SSBU_VK_IMAGES=%d: %u swapchain images asked for (the surface allows %u..%u)\n", want, (unsigned)n, (unsigned)caps.minImageCount, (unsigned)caps.maxImageCount);
+            ci.minImageCount = n;
+        }
+    }
     if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
     ci.imageFormat = V.format.format; ci.imageColorSpace = V.format.colorSpace;
     ci.imageExtent = ext;
@@ -462,7 +476,90 @@ int nvn_vk_init(void *hwnd) {
     fflush(stdout);
     V.alive = 1;
     vkd_init();
+    gw_start();
     return 1;
+}
+
+/* ---------------------------------------------------------------- the GPU-done watcher (display.c: SSBU_L1_GPU=1)
+ * Right after the present blit of a frame is submitted, the render thread submits an empty batch with a fence of a ring
+ * of 16 (vk_gpu_mark): the fence signals when everything submitted before it has finished, i.e. the frame's picture is
+ * complete on the GPU. A thread of its own waits for the fences in order (100 ms at a time), takes the time and gives it
+ * to display.c (display_gpu_done). The render thread never waits: a fence the watcher still holds means that frame is
+ * not timed (counted). Off (the default): g_vk_gpuw is 0 and nothing of this runs. Stopped before the device goes. */
+#define GW_N 16
+int g_vk_gpuw;                                        /* nvn_vk_draw.c: mark each presented frame */
+static VkFence g_gw_f[GW_N];
+static LONG64 g_gw_id[GW_N], g_gw_tgt[GW_N], g_gw_timed, g_gw_skipped, g_gw_failed;
+static volatile LONG g_gw_st[GW_N];                   /* 1: submitted, the watcher's until it sets 0 again */
+static unsigned g_gw_wr, g_gw_rd;                     /* render thread's / watcher's place in the ring */
+static volatile LONG g_gw_stop;
+static HANDLE g_gw_done;
+static SRWLOCK g_gw_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_gw_cv = CONDITION_VARIABLE_INIT;
+LONG64 display_gpu_id(LONG64 *tgt); void display_gpu_done(LONG64 gid, LONG64 tgt, LONG64 qpc); int display_gpu_wanted(void);      /* display.c */
+static DWORD WINAPI gw_thread(LPVOID arg) {
+    (void)arg;
+    VkResult r = VK_SUCCESS;
+    for (;;) {
+        unsigned i = g_gw_rd % GW_N;
+        AcquireSRWLockExclusive(&g_gw_lock);
+        while (!g_gw_st[i] && !g_gw_stop) SleepConditionVariableSRW(&g_gw_cv, &g_gw_lock, 1000, 0);
+        int have = g_gw_st[i] != 0;
+        ReleaseSRWLockExclusive(&g_gw_lock);
+        if (!have) break;                                                     /* asked to stop, nothing outstanding */
+        while ((r = vkWaitForFences(V.device, 1, &g_gw_f[i], VK_TRUE, 100000000ull)) == VK_TIMEOUT && !g_gw_stop) {}
+        if (r != VK_SUCCESS) break;                                           /* stopping (or a lost device): this fence is left to the shutdown */
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        display_gpu_done(g_gw_id[i], g_gw_tgt[i], t.QuadPart);
+        if ((r = vkResetFences(V.device, 1, &g_gw_f[i])) != VK_SUCCESS) break;
+        g_gw_timed++;
+        InterlockedExchange(&g_gw_st[i], 0);
+        g_gw_rd++;
+    }
+    if (r != VK_SUCCESS && r != VK_TIMEOUT) { g_gw_failed++; printf("nvn_vk: GPU-done watcher: %s: it stops (frames are no longer timed)\n", vk_result_name(r)); }
+    SetEvent(g_gw_done);
+    return 0;
+}
+static void gw_start(void) {
+    if (!display_gpu_wanted()) return;
+    VkFenceCreateInfo fi;
+    memset(&fi, 0, sizeof fi);
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    for (int i = 0; i < GW_N; i++) if (vkCreateFence(V.device, &fi, NULL, &g_gw_f[i]) != VK_SUCCESS) { printf("nvn_vk: GPU-done watcher: no fences: off\n"); gw_free(); return; }
+    g_gw_done = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!g_gw_done || !CreateThread(NULL, 0, gw_thread, NULL, 0, NULL)) { printf("nvn_vk: GPU-done watcher: no thread: off\n"); gw_free(); return; }
+    g_vk_gpuw = 1;
+    printf("nvn_vk: GPU-done watcher on: every presented frame is timed when the GPU has finished it (a fence of %d after its present blit, waited for on a thread of its own)\n", GW_N);
+}
+/* render thread, right after the present blit of a game frame was submitted (nvn_vk_draw.c vk_present2) */
+void vk_gpu_mark(void) {
+    unsigned i = g_gw_wr % GW_N;
+    if (InterlockedCompareExchange(&g_gw_st[i], 0, 0)) { g_gw_skipped++; return; }      /* the watcher has not finished with it: this frame is not timed */
+    if (vkQueueSubmit(V.queue, 0, NULL, g_gw_f[i]) != VK_SUCCESS) { g_gw_failed++; return; }
+    g_gw_id[i] = display_gpu_id(&g_gw_tgt[i]);
+    AcquireSRWLockExclusive(&g_gw_lock);
+    g_gw_st[i] = 1;
+    ReleaseSRWLockExclusive(&g_gw_lock);
+    WakeConditionVariable(&g_gw_cv);
+    g_gw_wr++;
+}
+/* nvn_vk_shutdown, before the device is idled: the watcher ends (within 0.1 s of the GPU finishing what it waits for) */
+static int g_gw_ended;
+static void gw_stop(void) {
+    if (!g_vk_gpuw) return;
+    g_vk_gpuw = 0;
+    InterlockedExchange(&g_gw_stop, 1);
+    AcquireSRWLockExclusive(&g_gw_lock);
+    ReleaseSRWLockExclusive(&g_gw_lock);
+    WakeAllConditionVariable(&g_gw_cv);
+    g_gw_ended = WaitForSingleObject(g_gw_done, 2000) == WAIT_OBJECT_0;
+    printf("nvn_vk: GPU-done watcher: %lld frames timed, %lld not timed (no free fence), %lld failed calls; %s\n", (long long)g_gw_timed, (long long)g_gw_skipped, (long long)g_gw_failed,
+           g_gw_ended ? "stopped" : "did NOT stop within 2 s (its fences are left)");
+}
+/* after vkDeviceWaitIdle */
+static void gw_free(void) {
+    for (int i = 0; i < GW_N; i++) if (g_gw_f[i]) { vkDestroyFence(V.device, g_gw_f[i], NULL); g_gw_f[i] = NULL; }
 }
 
 /* ---------------------------------------------------------------- frames */
@@ -543,7 +640,9 @@ void nvn_vk_flush(int finish) { if (V.alive && finish) wait_last_submit(); }
 void nvn_vk_shutdown(void) {
     if (!V.alive) return;
     V.alive = 0;
+    gw_stop();
     vk_ok("vkDeviceWaitIdle", vkDeviceWaitIdle(V.device));
+    if (g_gw_ended) gw_free();
     vkd_shutdown();
     if (V.swapchain) vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     vkDestroyFence(V.device, V.fence, NULL);

@@ -358,6 +358,7 @@ typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col
 /* nvn_vk.c */
 extern volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors;
 const char *vk_result_name(VkResult r);
+extern int g_vk_gpuw; void vk_gpu_mark(void);              /* nvn_vk.c: the GPU-done watcher is on; time this presented frame (display.c SSBU_L1_GPU) */
 void vk_fatal(const char *what, VkResult r);
 int vk_ok(const char *what, VkResult r);
 void nvn_vk_missing(const char *what);
