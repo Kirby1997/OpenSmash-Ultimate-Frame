@@ -45,6 +45,11 @@ void cxxrt_guest_region(uint64_t base, uint64_t size);
 int cxxrt_guest_region_at(int i, uint64_t *base, uint64_t *size);
 // PR #2 (jfb112697): shared prototype so a caller left with the old (void) form fails to build; size 0 = release of the region at base
 void cxxrt_mem_changed(uint64_t base, uint64_t size);
+/* os_threads.c: SSBU_CPU_PLACE, the critical threads off the slow cores of a hybrid CPU (Linux on aarch64; cpu_place.h).
+ * os_cpu_place_self places the calling thread, once; elsewhere both do nothing. */
+enum { CP_ROLE_MAIN, CP_ROLE_RENDER, CP_ROLE_DISPATCH };
+void os_cpu_place_init(void);
+void os_cpu_place_self(int role);
 
 /* Game builds (hostrt.c, docs/VERSIONS.md). 13.0.4 is the reference: every game address written in the runtime is a
  * 13.0.4 address, and GA() gives the address of the same thing in the build that runs (identity on 13.0.4). The layout

@@ -10,6 +10,15 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#if defined(__linux__) && defined(__aarch64__)
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include "cpu_place.h"                                /* os_cpu_place_self */
+#endif
 /* L1 round 3, TEST ONLY: guest sync calls during the SSBU_L1_TRACE window (display.c) */
 #ifdef _WIN32
 int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(unsigned long tid);
@@ -210,6 +219,111 @@ static int host_priority(int prio) {
     return THREAD_PRIORITY_LOWEST;
 }
 
+/* CPU placement of the critical threads, Linux on a hybrid aarch64 CPU (the Steam Frame; cpu_place.h has the why and the
+ * core detection). SSBU_CPU_PLACE (default a): the game's main thread (at its first present), the render thread (once its
+ * device exists) and the game's "render dispatch" threads (at their start) get an affinity mask without the slow tier,
+ * set by each thread on itself; b / bmain also give the render / main thread uclamp_min = the biggest CPU's capacity, so
+ * EAS prefers that CPU (and runs whichever CPU it is on at full clock) without pinning it there; 0 = off.
+ *   - Masks, not one CPU: Frame, 6 fast processors for ~1.5 busy cores; a single-processor pin would queue the thread
+ *     behind whatever else the scheduler puts there (kernel threads, the compositor, another game thread).
+ *   - What wins: SSBU_OS_CONSOLE_CORES=1 (the console core model, opt-in) pins every guest thread itself, so placement is
+ *     then off altogether. Otherwise the guest's own core masks (SetThreadCoreMask) stay what they were here: kept and
+ *     returned to the game, never given to the host (apply_sched does nothing without the console model), so they never
+ *     undo the placement. Each thread sets only its own mask, no handle of another thread is used.
+ *   - Threads that a placed thread creates with CreateThread start with the process's original mask (plat_posix.c
+ *     plat_thread_placed), the narrow one is not inherited; uclamp_min is set with SCHED_FLAG_RESET_ON_FORK, so no child
+ *     inherits it. Threads made with pthread_create directly (driver, SDL) by a placed thread keep its mask: the main and
+ *     render threads are placed after the window, audio and Vulkan device are made for that reason. */
+#if defined(__linux__) && defined(__aarch64__)
+void plat_thread_placed(const cpu_set_t *child_set);   /* plat_posix.c */
+static struct {
+    int mode, on;
+    uint64_t orig, crit;                               /* processors 0..63: allowed at start-up, allowed to the critical threads */
+    unsigned uclamp;                                   /* b / bmain: uclamp_min for the one thread, 0 = none */
+    cpu_set_t orig_set, crit_set;
+} g_cp;
+static pthread_once_t g_cp_once = PTHREAD_ONCE_INIT;
+static __thread int t_cp_done;
+static void cp_init(void) {
+    int known;
+    const char *e = getenv("SSBU_CPU_PLACE");
+    CpCaps caps; CpClass cl;
+    char capstr[1024];
+    g_cp.mode = cp_mode_from(e, &known);
+    if (!known) printf("cpu place: SSBU_CPU_PLACE=%s is not 0, a, b or bmain: a is used\n", e);
+    if (g_cp.mode == CP_OFF) { printf("cpu place: off (SSBU_CPU_PLACE=0)\n"); return; }
+    if (console_cores()) { printf("cpu place: off (SSBU_OS_CONSOLE_CORES: the console core model sets the guest threads' processors)\n"); return; }
+    CPU_ZERO(&g_cp.orig_set);
+    if (sched_getaffinity(0, sizeof g_cp.orig_set, &g_cp.orig_set)) { printf("cpu place: off (sched_getaffinity failed, errno %d)\n", errno); return; }
+    for (int i = 0; i < CP_MAX_CPU; i++) if (CPU_ISSET(i, &g_cp.orig_set)) g_cp.orig |= 1ull << i;
+    int hybrid = cp_read_caps("/sys/devices/system/cpu", &caps) ? cp_classify(&caps, &cl) : 0;
+    cp_caps_text(&caps, capstr, sizeof capstr);
+    if (!hybrid) { printf("cpu place: nothing to do: %s (capacities %s)\n", caps.over ? "more than 64 CPUs" : caps.n ? "all CPUs have the same capacity" : "no cpu_capacity in sysfs", caps.n ? capstr : "-"); return; }
+    g_cp.crit = g_cp.orig & ~cl.slow;
+    if (!g_cp.crit) g_cp.crit = g_cp.orig;             /* only slow processors are allowed (taskset): the mask is left */
+    CPU_ZERO(&g_cp.crit_set);
+    for (int i = 0; i < CP_MAX_CPU; i++) if (g_cp.crit >> i & 1) CPU_SET(i, &g_cp.crit_set);
+    if (g_cp.mode == CP_B_RENDER || g_cp.mode == CP_B_MAIN) g_cp.uclamp = cl.cap_max > 1024 ? 1024 : cl.cap_max;
+    g_cp.on = g_cp.crit != g_cp.orig || g_cp.uclamp;
+    printf("cpu place: capacities %s; slow tier %llx, biggest %llx, allowed %llx: GAME-MAIN, RENDER, render dispatch -> mask %llx%s",
+           capstr, (unsigned long long)cl.slow, (unsigned long long)cl.biggest, (unsigned long long)g_cp.orig, (unsigned long long)g_cp.crit,
+           g_cp.crit == g_cp.orig ? " (no change)" : "");
+    if (g_cp.uclamp) printf("; %s prefers %llx (uclamp_min %u)", g_cp.mode == CP_B_MAIN ? "GAME-MAIN" : "RENDER", (unsigned long long)(cl.biggest & g_cp.orig), g_cp.uclamp);
+    printf(" (SSBU_CPU_PLACE=%s; 0 off, a, b, bmain)\n", cp_mode_name(g_cp.mode));
+}
+void os_cpu_place_init(void) { pthread_once(&g_cp_once, cp_init); }
+struct cp_sched_attr {                                 /* struct sched_attr (linux/sched/types.h), SCHED_ATTR_SIZE_VER1 */
+    uint32_t size, sched_policy;
+    uint64_t sched_flags;
+    int32_t sched_nice;
+    uint32_t sched_priority;
+    uint64_t sched_runtime, sched_deadline, sched_period;
+    uint32_t sched_util_min, sched_util_max;
+};
+#define CP_SCHED_FLAG_RESET_ON_FORK 0x01
+#define CP_SCHED_FLAG_KEEP_PARAMS 0x10
+#define CP_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+/* the calling thread, once (later calls return at once) */
+void os_cpu_place_self(int role) {
+    static volatile LONG warned_aff, said_uc;
+    if (t_cp_done) return;
+    t_cp_done = 1;
+    os_cpu_place_init();
+    if (!g_cp.on) return;
+    if (g_cp.crit != g_cp.orig) {
+        if (sched_setaffinity(0, sizeof g_cp.crit_set, &g_cp.crit_set) == 0) plat_thread_placed(&g_cp.orig_set);
+        else if (!InterlockedExchange(&warned_aff, 1)) printf("cpu place: sched_setaffinity(%llx) failed, errno %d: the thread is left as it was\n", (unsigned long long)g_cp.crit, errno);
+    }
+    if (g_cp.uclamp && role == (g_cp.mode == CP_B_MAIN ? CP_ROLE_MAIN : CP_ROLE_RENDER)) {
+        /* the policy as it is (normal), nice kept (KEEP_PARAMS); RESET_ON_FORK: the threads it creates start without the
+         * clamp. (With SCHED_FLAG_KEEP_POLICY the kernel ignores RESET_ON_FORK, so the policy is passed.) RESET_ON_FORK
+         * also gives its children SCHED_OTHER instead of an RT policy, and nice 0 instead of a negative nice.
+         * The current priority and nice are passed as well, not left to KEEP_PARAMS alone: the kernel's check against
+         * lowering nice may read them from the attributes, and at nice > 0 a zero there would fail with EPERM. */
+        struct cp_sched_attr a;
+        struct sched_param sp = {0};
+        int pol = sched_getscheduler(0);
+        memset(&a, 0, sizeof a);
+        a.size = sizeof a;
+        a.sched_policy = (uint32_t)(pol < 0 ? SCHED_OTHER : pol & ~SCHED_RESET_ON_FORK);
+        if (sched_getparam(0, &sp) == 0) a.sched_priority = (uint32_t)sp.sched_priority;
+        errno = 0;
+        int nice = getpriority(PRIO_PROCESS, 0);          /* Linux: the calling thread's nice (-1 is a valid nice: errno tells) */
+        if (errno == 0) a.sched_nice = nice;
+        a.sched_flags = CP_SCHED_FLAG_RESET_ON_FORK | CP_SCHED_FLAG_KEEP_PARAMS | CP_SCHED_FLAG_UTIL_CLAMP_MIN;
+        a.sched_util_min = g_cp.uclamp;
+        int bad = syscall(SYS_sched_setattr, 0, &a, 0) ? errno : 0;
+        if (!InterlockedExchange(&said_uc, 1)) {
+            if (bad) printf("cpu place: uclamp_min %u not set (sched_setattr errno %d%s): only the mask applies\n", g_cp.uclamp, bad, bad == EOPNOTSUPP ? ", a kernel without CONFIG_UCLAMP_TASK" : "");
+            else printf("cpu place: %s (thread %lu): uclamp_min %u set\n", role == CP_ROLE_MAIN ? "GAME-MAIN" : "RENDER", (unsigned long)GetCurrentThreadId(), g_cp.uclamp);
+        }
+    }
+}
+#else
+void os_cpu_place_init(void) { }
+void os_cpu_place_self(int role) { (void)role; }
+#endif
+
 /* ---------------------------------------------------------------- threads */
 static __declspec(thread) uint64_t t_thread;          /* guest ThreadType* of the running thread */
 static __declspec(thread) uint64_t t_tls[64];
@@ -319,6 +433,7 @@ static DWORD WINAPI thread_main(LPVOID arg) {
     name_host_thread(GetCurrentThread(), o->name ? (const char *)(uintptr_t)o->name : NULL);       /* named before StartThread */
 #endif
     { void display_perf_thread(void); display_perf_thread(); }      /* track V session 14: the game's threads on the performance cores of a hybrid CPU (display.c; SSBU_PCORES=0 off) */
+    if (o->name && !strcmp((const char *)(uintptr_t)o->name, "render dispatch")) os_cpu_place_self(CP_ROLE_DISPATCH);   /* SSBU_CPU_PLACE (Linux, hybrid aarch64) */
     Ctx *c = new_ctx(o->stack + o->stack_size);
     wr64(c->tpidr + 0x1f8, o->key);                   /* Horizon thread-local region: the ThreadType pointer lives at +0x1f8 */
     LONG slot = InterlockedIncrement(&g_threads_n) - 1;
@@ -410,6 +525,7 @@ static void os_StartThread(Ctx *c) {
 }
 /* boot.c, on the main guest thread before the game starts: main.npdm gives it core 0 and priority 44 - 28 = 16 */
 void os_apply_main_sched(void) {
+    os_cpu_place_init();                              /* Linux, hybrid aarch64: the start-up line of SSBU_CPU_PLACE (the main thread is placed at its first present) */
     if (!console_cores()) return;
     apply_sched(GetCurrentThread(), 1ull << OS_DEFAULT_CORE);
     SetThreadPriority(GetCurrentThread(), host_priority(OS_DEFAULT_PRIORITY));

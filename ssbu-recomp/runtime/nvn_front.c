@@ -681,6 +681,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
         if (p > 0) { SetThreadPriority(GetCurrentThread(), p >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL); printf("nvn: render thread priority %s (SSBU_RENDER_PRIO)\n", p >= 2 ? "highest" : "above normal"); }
     }
     g_rb->init();                               /* OpenGL: the context, the shader cache, the self-test hook (nvn_gl.c); Vulkan: the device (nvn_vk.c) */
+    os_cpu_place_self(CP_ROLE_RENDER);          /* SSBU_CPU_PLACE (os_threads.c; Linux, hybrid aarch64): after the device, whose driver threads keep the full mask */
     SetEvent(g_ready_event);
     render_loop();
     return 0;
@@ -1630,6 +1631,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
     L1T("PRESENT texture %d", (int)A2);
     if (j.win && j.win->native && j.win->native == album_movie_native_window()) { gl_run(g_rb->present_movie, &j); return; }
     g_pf_main_tid = GetCurrentThreadId();
+    os_cpu_place_self(CP_ROLE_MAIN);            /* SSBU_CPU_PLACE (os_threads.c): the game's main thread, at its first present (once) */
     int ra_mode; { int r1_ra_present_mode(void); ra_mode = g_l1_pipe > 0 ? r1_ra_present_mode() : 0; }      /* R1 round 5, run-ahead: 2 = the real pass's present (nothing), 1 = presented at the speculative submission already */
     if (ra_mode == 2) return;
     if (ra_mode == 1 && g_l1_early_win == j.win) j.index = (int)g_l1_early_idx;      /* (the restore rolled the game's texture index back, the host's acquire count is not: the texture presented is the host's) */
