@@ -85,7 +85,7 @@ static double g_vb_period;                             /* QPC ticks per refresh,
 static volatile LONG g_vb_state;                       /* 0 not started, 1 measuring, 2 measured, -1 no vblank source */
 static int g_pace_want = -1;                           /* 0 clock, 1 display lock when the refresh rate allows */
 static int g_hold_on = -1;                             /* present at the tick */
-static int g_ph_on;                                    /* 2026-11: the phase hold (SSBU_PACE_PHASE=1, see ph_point) */
+static int g_ph_on;                                    /* 2026-11: the phase hold (SSBU_PACE_GPU_PHASE=1, see ph_point) */
 static volatile LONG g_lock_k;                         /* display lock: refreshes per game frame, 0 = our own clock */
 static double g_lock_phase = 0.5;                      /* the tick's place between two vblanks */
 static volatile LONG64 g_hold_target;                  /* tick the planned present waits for, 0 = present at once */
@@ -251,11 +251,13 @@ static void pace_options(void) {
     g_hold_on = h ? atoi(h) != 0 : opt != 1 && opt != 2;               /* fifo: the swapchain holds the presents itself; off: at once, by request */
     { int latency_mode(void); if (!h && latency_mode() >= 2) g_hold_on = 0; }      /* L1: latency = lowest: the frame goes to the window as soon as it is ready */
     if (p && atof(p) > 0.02 && atof(p) < 0.98) g_lock_phase = atof(p);
-    g_ph_on = p && !strcmp(p, "1") && g_hold_on;                       /* 2026-11: the phase hold (see ph_point); "1" was no lock phase before either */
-    if (p && !strcmp(p, "1"))
-        printf("display: phase hold (SSBU_PACE_PHASE=1) %s%c", g_ph_on ? "ON: a held frame is presented at max(ready, tick + P), P = 95th percentile of tick -> GPU done over the last 256 held frames + 1.0 ms, "
+    {   const char *gp = getenv("SSBU_PACE_GPU_PHASE");                   /* 2026-11: the phase hold (see ph_point) */
+        int want = gp && atoi(gp) != 0;
+        g_ph_on = want && g_hold_on;
+        if (want) printf("display: phase hold (SSBU_PACE_GPU_PHASE=1) %s%c", g_ph_on ? "ON: a held frame is presented at max(ready, tick + P), P = 95th percentile of tick -> GPU done over the last 256 held frames + 1.0 ms, "
                                                                           "at most one tick; at the tick (as before) until 256 are measured and with a display lock; the game's release is unchanged"
                                                                         : "has no effect: frames are not held for the tick (SSBU_PACE_HOLD=0, vsync = on / off or latency = lowest)", 10);
+    }
     printf("display: pacing: %s; a finished frame is presented %s%c", g_pace_want ? "locked to the display when its refresh rate is k x 60 Hz within 1.1 % (vsync = display / auto)" : "our own 60.000 Hz clock (vsync = clock)",
            g_hold_on ? "at the next tick (steady cadence)" : "as soon as it is ready", 10);
 }
@@ -742,7 +744,7 @@ void display_pump(int ms) {
     menu_sdl_service();
 }
 #endif
-/* ---- 2026-11 (latency, the Frame), SSBU_PACE_PHASE=1: the PHASE HOLD (pace_phase.h). The hold of session 14 presents a
+/* ---- 2026-11 (latency, the Frame), SSBU_PACE_GPU_PHASE=1: the PHASE HOLD (pace_phase.h). The hold of session 14 presents a
  * finished frame at the next tick; with no vblank source (Linux) that tick is not the display's, so the hold only buys
  * even spacing, for ~8 ms of latency. Here a held frame goes out at max(ready, tick + P) instead: P = the 95th percentile
  * of (the tick before the one it is held for -> GPU done) over the last 256 held frames + 1 ms, at most one tick. That is
@@ -752,7 +754,7 @@ void display_pump(int ms) {
  * a held frame is presented. The game's release is not touched, so no frame becomes late through this.
  * How: the render thread keeps a frame that is ready before its phase point (display_present_defer, as it keeps one for
  * the tick), and the vsync thread wakes a second time per tick, at the next tick's phase point, and posts the kept present
- * as it does at the tick. Off by default. (SSBU_PACE_PHASE=<0.02..0.98> stays the display lock's place in the refresh.) */
+ * as it does at the tick. Off by default. (Not SSBU_PACE_PHASE: that is the display lock's place in the refresh, Windows.) */
 static volatile LONG64 g_ph_slack;                     /* QPC ticks before its tick a held frame may go: period - P; 0 = at the tick */
 static volatile LONG64 g_ph_t0;                        /* the vsync thread's clock: tick k is due at g_ph_t0 + k * freq / 60 (0: none) */
 static volatile LONG64 g_ph_n;                         /* the last tick whose phase point the vsync thread has passed */
@@ -1147,8 +1149,8 @@ void display_gpu_done(LONG64 gid, LONG64 tgt, LONG64 qpc) {
     else { if (e->have == 1) l1_emit(&e->f, e->fight, 0); e->f.gid = gid; e->gpu = qpc; e->have = 2; }
     ReleaseSRWLockExclusive(&g_lj_lock);
 }
-/* nvn_vk.c, at its start: run the GPU-done watcher (SSBU_L1_GPU=1, or the phase hold: SSBU_PACE_PHASE=1) */
-int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"), *p = getenv("SSBU_PACE_PHASE"); return (g && atoi(g)) || (p && !strcmp(p, "1")); }
+/* nvn_vk.c, at its start: run the GPU-done watcher (SSBU_L1_GPU=1, or the phase hold: SSBU_PACE_GPU_PHASE=1) */
+int display_gpu_wanted(void) { const char *g = getenv("SSBU_L1_GPU"), *p = getenv("SSBU_PACE_GPU_PHASE"); return (g && atoi(g)) || (p && atoi(p)); }
 static void l1_csv_write(FILE *out) {
     AcquireSRWLockExclusive(&g_lj_lock);
     for (int i = 0; i < 64; i++) if (g_lj[i].have == 1) { g_lj[i].have = 0; l1_emit(&g_lj[i].f, g_lj[i].fight, 0); }      /* still waiting for their GPU time */

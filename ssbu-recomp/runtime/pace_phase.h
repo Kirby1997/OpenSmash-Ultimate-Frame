@@ -1,4 +1,4 @@
-/* pace_phase.h - display.c's phase hold (SSBU_PACE_PHASE=1, tests/port/pacephase): where after a tick of the refresh
+/* pace_phase.h - display.c's phase hold (SSBU_PACE_GPU_PHASE=1, tests/port/pacephase): where after a tick of the refresh
  * clock a finished frame is presented.
  *
  * The hold of session 14 keeps every finished frame on the render thread until the next tick of our 60 Hz clock. On a

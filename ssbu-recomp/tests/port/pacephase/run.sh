@@ -1,5 +1,5 @@
 #!/bin/sh
-# The phase hold's arithmetic (runtime/pace_phase.h, display.c SSBU_PACE_PHASE=1). No clock, no GPU, no game.
+# The phase hold's arithmetic (runtime/pace_phase.h, display.c SSBU_PACE_GPU_PHASE=1). No clock, no GPU, no game.
 # $1 = x86 (default: the PC's cc) | native (ON the Frame: $CC, default cc) | arm64 (cross-build only, tests/cspike/xenv.sh).
 set -eu
 cd "$(dirname "$0")/../../.."
