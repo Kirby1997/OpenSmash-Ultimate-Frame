@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "cpu_place.h"                                /* os_cpu_place_self */
@@ -295,12 +296,20 @@ void os_cpu_place_self(int role) {
     }
     if (g_cp.uclamp && role == (g_cp.mode == CP_B_MAIN ? CP_ROLE_MAIN : CP_ROLE_RENDER)) {
         /* the policy as it is (normal), nice kept (KEEP_PARAMS); RESET_ON_FORK: the threads it creates start without the
-         * clamp. (With SCHED_FLAG_KEEP_POLICY the kernel ignores RESET_ON_FORK, so the policy is passed.) */
+         * clamp. (With SCHED_FLAG_KEEP_POLICY the kernel ignores RESET_ON_FORK, so the policy is passed.) RESET_ON_FORK
+         * also gives its children SCHED_OTHER instead of an RT policy, and nice 0 instead of a negative nice.
+         * The current priority and nice are passed as well, not left to KEEP_PARAMS alone: the kernel's check against
+         * lowering nice may read them from the attributes, and at nice > 0 a zero there would fail with EPERM. */
         struct cp_sched_attr a;
+        struct sched_param sp = {0};
         int pol = sched_getscheduler(0);
         memset(&a, 0, sizeof a);
         a.size = sizeof a;
         a.sched_policy = (uint32_t)(pol < 0 ? SCHED_OTHER : pol & ~SCHED_RESET_ON_FORK);
+        if (sched_getparam(0, &sp) == 0) a.sched_priority = (uint32_t)sp.sched_priority;
+        errno = 0;
+        int nice = getpriority(PRIO_PROCESS, 0);          /* Linux: the calling thread's nice (-1 is a valid nice: errno tells) */
+        if (errno == 0) a.sched_nice = nice;
         a.sched_flags = CP_SCHED_FLAG_RESET_ON_FORK | CP_SCHED_FLAG_KEEP_PARAMS | CP_SCHED_FLAG_UTIL_CLAMP_MIN;
         a.sched_util_min = g_cp.uclamp;
         int bad = syscall(SYS_sched_setattr, 0, &a, 0) ? errno : 0;
