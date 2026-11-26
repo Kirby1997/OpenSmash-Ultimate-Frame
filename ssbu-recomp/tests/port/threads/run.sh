@@ -41,7 +41,7 @@ $CC $F -c runtime/os_threads.c -o "$OUT/os_threads.o"
 $CC $F -c "$OUT/libstubs.c" -o "$OUT/libstubs.o"
 $CC $F -c $T/stubs.c -o "$OUT/stubs.o"
 HAVE_CRASH=""
-TESTS="test_threads test_sync test_fls test_os_fibers test_os_threads test_setjmp"
+TESTS="test_threads test_sync test_cv_stress test_fls test_os_fibers test_os_threads test_setjmp"
 link() {                                           # link <name> <sources/objects...>: + the platform layer (paths may hold spaces)
     _n=$1; shift
     if [ -n "$HAVE_CRASH" ]; then $CC $F "$@" "$OUT/plat_posix.o" "$OUT/libstubs.o" "$OUT/plat_crash.o" $L -o "$OUT/$_n"
@@ -57,6 +57,7 @@ if $CC $F -dM -E -x c /dev/null | grep -q __aarch64__; then              # test_
 fi
 link test_threads $T/test_threads.c
 link test_sync $T/test_sync.c
+link test_cv_stress $T/test_cv_stress.c
 link test_fls $T/test_fls.c
 link test_os_fibers $T/test_os_fibers.c "$OUT/os_threads.o" "$OUT/stubs.o"
 # test_cxxrt: nncxxrt.c is #included by the test; the C++ runtime units see the game's tables through pointers (game_tables.h)

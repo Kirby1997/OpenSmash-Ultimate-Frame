@@ -184,6 +184,10 @@ static void load_dynamic(void) {
 }
 
 static ImportFn *g_handlers;
+/* host_import's fast path: per import, the handler and the name, filled by host_import_real once the import is past its
+ * counted calls (NULL until then, and again whenever g_handlers changes for it): one 16-byte entry and an indirect call. */
+typedef struct { ImportFn fn; const char *name; } ImpFast;
+static ImpFast *g_imp_fast;
 static unsigned long long *g_import_calls;
 static int *g_import_order, g_import_order_count;
 static FILE *g_trace;
@@ -255,6 +259,7 @@ uint64_t guest_function_of(uint64_t rip) {
 typedef struct { char name[72]; ImportFn fn; volatile LONG64 calls; LONG64 first; void (*fnu)(Ctx *, void *); void *user; } HostFn;
 #define MAX_HOSTFN 16384
 static HostFn g_hostfn[MAX_HOSTFN];
+static int g_import_count_all;                    /* (with the imports below: SSBU_IMPORT_COUNTS / SSBU_AUDIT_COUNTS) */
 static volatile LONG g_hostfn_count;
 static volatile LONG64 g_hostfn_seq;
 static SRWLOCK g_hostfn_lock = SRWLOCK_INIT;
@@ -312,7 +317,8 @@ void print_hostfn_summary(FILE *out) {
     for (int i = 0; i < n; i++) if (g_hostfn[i].calls) order[used++] = i;
     for (int i = 1; i < used; i++)
         for (int j = i; j > 0 && g_hostfn[order[j]].first < g_hostfn[order[j - 1]].first; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
-    fprintf(out, "\nrun-time host functions: %d handed out, %d called, in order of first call:\n", n, used);
+    fprintf(out, "\nrun-time host functions: %d handed out, %d called, in order of first call%s:\n", n, used,
+            g_import_count_all ? "" : " (counted up to 4 calls; SSBU_IMPORT_COUNTS=1 counts every call)");
     for (int i = 0; i < used; i++) fprintf(out, "  %8lld  %s\n", (long long)g_hostfn[order[i]].calls, g_hostfn[order[i]].name);
     free(order);
 }
@@ -405,9 +411,11 @@ static __attribute__((noinline)) void call_hostfn(Ctx *c, int i) {
     HostFn *h = &g_hostfn[i];
     /* the call count is a diagnostic (print_hostfn_summary, the audit): a plain increment after the first call, which may
      * lose a count when two threads call the same function at once. The first call is still counted exactly once (the
-     * atomic increment from 0), and only it does the first-call work. No locked read-modify-write per call. */
+     * atomic increment from 0), and only it does the first-call work. No locked read-modify-write per call. As for the
+     * imports, the count stops at 4 unless SSBU_IMPORT_COUNTS or SSBU_AUDIT_COUNTS is set (nvn_stub.c traces the first
+     * 3 calls): no store per call into a line that two threads calling the same function would pass back and forth. */
     LONG64 n = __atomic_load_n(&h->calls, __ATOMIC_RELAXED);
-    if (n) __atomic_store_n(&h->calls, n + 1, __ATOMIC_RELAXED);
+    if (n) { if (n < 4 || g_import_count_all) __atomic_store_n(&h->calls, n + 1, __ATOMIC_RELAXED); }
     else if (InterlockedIncrement64(&h->calls) == 1) {
         h->first = InterlockedIncrement64(&g_hostfn_seq);
         if (audit_path_hostfn(h->name)) audit_path_hit("run-time host function", h->name, c->x[30] - 4);
@@ -528,7 +536,11 @@ void register_imports(const ImportDef *defs, int count) {
     for (int d = 0; d < count; d++) {
         int found = 0;
         for (int i = 0; i < dyn_sym_count; i++) {
-            if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, defs[d].name) == 0) { g_handlers[i] = defs[d].fn; found = 1; }
+            if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, defs[d].name) == 0) {
+                __atomic_store_n(&g_handlers[i], defs[d].fn, __ATOMIC_SEQ_CST);
+                if (g_imp_fast) __atomic_store_n(&g_imp_fast[i].fn, (ImportFn)NULL, __ATOMIC_SEQ_CST);      /* host_import_real fills it again */
+                found = 1;
+            }
         }
         if (!found) extra_add(defs[d].name, defs[d].fn);
     }
@@ -579,6 +591,7 @@ int hostentry_hook(uint64_t addr, void (*fn)(Ctx *, void *), void *user, uint64_
         g_imphk[k].fn = fn; g_imphk[k].user = user;
         g_import_calls[sym] = 3;                    /* the fast path in host_import_real (no first-call trace for a hooked import) */
         InterlockedExchangePointer((void *volatile *)&g_handlers[sym], (void *)g_imphk_fn[k]);
+        if (g_imp_fast) __atomic_store_n(&g_imp_fast[sym].fn, (ImportFn)NULL, __ATOMIC_SEQ_CST);      /* host_import_real fills it again */
         return 1;
     }
     if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16 && (addr - HOSTFN_BASE) % 16 == 0) {
@@ -651,7 +664,39 @@ void guest_freeze_wait(void) { while (g_guest_frozen) Sleep(5); }
  * return addresses called it. Off: one compare per import call. */
 static void host_import_real(Ctx *c, int sym);
 static int g_watch_sym = -2;
+static __attribute__((noinline)) void host_import_slow(Ctx *c, int sym);
+/* Every import call of the lifted code. The fast path: an import past its counted calls (g_imp_fast, filled by
+ * host_import_real) is called directly, as host_import_real's own fast branch did, without that call, the counter, the
+ * watch compare and three more cache lines (g_import_calls, g_handlers, dyn_syms). Everything else: host_import_slow. */
 void host_import(Ctx *c, int sym) {
+    if (g_imp_fast && !g_guest_frozen) {
+        const ImpFast *f = &g_imp_fast[sym];
+        ImportFn fn = __atomic_load_n(&f->fn, __ATOMIC_ACQUIRE);
+        if (__builtin_expect(fn != NULL, 1)) {
+            const char *saved_name = c->in_import;
+            uint64_t saved_from = c->import_from;
+            c->in_import = __atomic_load_n(&f->name, __ATOMIC_RELAXED);
+            c->import_from = c->x[30] - 4;
+            fn(c);
+            c->in_import = saved_name;
+            c->import_from = saved_from;
+            if (g_guest_frozen) guest_freeze_wait();
+            return;
+        }
+    }
+    host_import_slow(c, sym);
+}
+/* The fast entry of `sym` (not the watched import: its calls are timed in host_import_slow). The handler is read again
+ * after the entry is published, all sequentially consistent, as the writers of g_handlers store it and then clear the
+ * entry: an entry that raced with a change of the handler is cleared, here or by the writer. */
+static void imp_fast_fill(int sym) {
+    ImportFn h = __atomic_load_n(&g_handlers[sym], __ATOMIC_SEQ_CST);
+    if (!h || sym == g_watch_sym) return;
+    __atomic_store_n(&g_imp_fast[sym].name, dyn_syms[sym].name, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_imp_fast[sym].fn, h, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_handlers[sym], __ATOMIC_SEQ_CST) != h) __atomic_store_n(&g_imp_fast[sym].fn, (ImportFn)NULL, __ATOMIC_SEQ_CST);
+}
+static __attribute__((noinline)) void host_import_slow(Ctx *c, int sym) {
     if (g_watch_sym == -2) {
         const char *e = getenv("SSBU_IMPORT_WATCH");
         int w = -1;
@@ -692,6 +737,7 @@ static void host_import_real(Ctx *c, int sym) {
     static volatile LONG order_count;
     if (g_guest_frozen) guest_freeze_wait();
     if (!g_import_count_all && g_import_calls[sym] >= 3 && g_handlers[sym]) {
+        if (g_imp_fast) imp_fast_fill(sym);        /* the next calls take host_import's fast path */
         const char *saved_name = c->in_import;
         uint64_t saved_from = c->import_from;
         c->in_import = dyn_syms[sym].name;
@@ -1314,6 +1360,7 @@ static void install_crash_handler(void) {
 /* ---------------------------------------------------------------- loader */
 void runtime_init(const char *elf, const char *trace_path) {
     g_handlers = calloc((size_t)dyn_sym_count, sizeof *g_handlers);
+    g_imp_fast = calloc((size_t)dyn_sym_count, sizeof *g_imp_fast);
     g_import_calls = calloc((size_t)dyn_sym_count, sizeof *g_import_calls);
     g_import_order = calloc((size_t)dyn_sym_count, sizeof *g_import_order);
     g_by_host = malloc((size_t)fn_table_count * sizeof *g_by_host);

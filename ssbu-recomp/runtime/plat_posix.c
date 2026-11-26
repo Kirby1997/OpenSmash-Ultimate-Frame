@@ -194,11 +194,20 @@ void Sleep(DWORD ms) {
 
 /* ================================================================ condition variables, init-once */
 /* CONDITION_VARIABLE: a futex on a wake counter. As on Windows a waiter can return without a Wake (callers loop on their
- * condition), and a timeout returns FALSE with ERROR_TIMEOUT. */
+ * condition), and a timeout returns FALSE with ERROR_TIMEOUT.
+ * A Wake makes the futex call only when a thread is waiting (waiters): 240-740 ns of kernel time per Wake with nobody
+ * waiting on the Frame, which is most of them. It is the Dekker pattern, everything sequentially consistent: the waiter
+ * counts itself and then reads seq, the waker counts seq up and then reads waiters. If the waker reads waiters == 0, its
+ * seq increment came before the waiter's own count, so before the waiter's read of seq: that Wake came before the wait
+ * began (as before this change, where the wait compares against the seq it read). A waker whose increment came after the
+ * waiter's read of seq sees waiters >= 1 and makes the call (the futex then sees the changed seq, or wakes the waiter).
+ * This holds with or without the lock held by the waker, as Windows allows both. The waiter counts itself down on every
+ * way out of the wait (woken, timed out, a signal), after its last futex call, in this one function. */
 #ifndef __APPLE__                                 /* (macOS: above) */
 static long futex(volatile uint32_t *a, int op, uint32_t v, const struct timespec *ts) { return syscall(SYS_futex, a, op, v, ts, NULL, 0); }
 #endif
 static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), void (*lock)(void *), void *l) {
+    __atomic_add_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);             /* before the read of seq (see above) */
     uint32_t seq = __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST);
     unlock(l);
     long r; int e = 0;
@@ -216,6 +225,7 @@ static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), vo
         if (r == -1 && e == EINTR && __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST) == seq) continue;
         break;
     }
+    __atomic_sub_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);             /* every way out of the loop: woken, timed out, a signal */
     lock(l);
     /* A wait that did not wake is a timeout, and both errno values mean exactly that: Linux's futex answers a
      * zero timeout with ETIMEDOUT, macOS's os_sync_wait_on_address_with_timeout with EINVAL (measured on 27.0.1 /
@@ -298,8 +308,15 @@ BOOL SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWOR
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags) {
     return cv_wait(cv, ms, srw_unlock, (flags & CONDITION_VARIABLE_LOCKMODE_SHARED) ? srw_lock_s : srw_lock_x, l);
 }
-void WakeConditionVariable(CONDITION_VARIABLE *cv) { __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST); futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL); }
-void WakeAllConditionVariable(CONDITION_VARIABLE *cv) { __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST); futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL); }
+/* seq first, then waiters (see cv_wait): no futex call when nobody waits */
+void WakeConditionVariable(CONDITION_VARIABLE *cv) {
+    __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&cv->waiters, __ATOMIC_SEQ_CST)) futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL);
+}
+void WakeAllConditionVariable(CONDITION_VARIABLE *cv) {
+    __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&cv->waiters, __ATOMIC_SEQ_CST)) futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
+}
 #ifndef PLAT_LINUX_SYNC                           /* (Linux: above) */
 void InitializeCriticalSection(CRITICAL_SECTION *cs) {         /* a CRITICAL_SECTION is re-entrant on Windows: a recursive mutex */
     pthread_mutexattr_t a;
