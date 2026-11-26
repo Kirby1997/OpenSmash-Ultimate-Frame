@@ -3,6 +3,9 @@
  * Guest synchronisation objects (MutexType, EventType, ...) are opaque here:
  * each one is identified by its guest address and backed by a host object
  * kept in a side table, so the guest layout never has to be known. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE                                   /* CPU_SET, sched_getaffinity, SCHED_RESET_ON_FORK (cpu placement, aarch64 Linux) */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
